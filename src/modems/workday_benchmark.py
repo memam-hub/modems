@@ -860,9 +860,12 @@ def _requests_latex_table_block(
         "\n"
         r"\end{tabular}"
         "\n"
-        r"\caption{Compiled workday request results for MILP3 and ALNS"
+        r"\caption{Request-level rolling-horizon results for a simulated workday"
         + continuation_note
-        + r".}"
+        + r". Pickup and delivery times represent the realized service-start times. "
+        r"Delay denotes pickup tardiness, while excess ride time is measured relative "
+        r"to the direct trip duration. Accepted and rejected requests are denoted by "
+        r"$\checkmark$ and $\times$, respectively.}"
         "\n"
         r"\end{table*}"
         "\n"
@@ -1006,7 +1009,6 @@ def _latex_table_block(rows: list[dict[str, Any]], continuation_note: str = "") 
         r"\centering"
         "\n"
         r"\begin{tabular}{l c "
-        r"c c c "
         r"c c "
         r"c c "
         r"c c "
@@ -1015,16 +1017,14 @@ def _latex_table_block(rows: list[dict[str, Any]], continuation_note: str = "") 
         "\n"
         r"\hline"
         "\n"
-        r"Key & |R| & "
-        r"\multicolumn{2}{c}{{Accept\%}} & {$\Delta$Accept} & "
+        r"Key & $|R|$ & "
+        r"\multicolumn{2}{c}{{Acceptance\%}} & "
         r"\multicolumn{2}{c}{{Delay (min)}} & "
         r"\multicolumn{2}{c}{{Excess ride (min)}} & "
-        r"\multicolumn{2}{c}{{SolveTime (s)}} &"
         r"\multicolumn{2}{c}{{Consumed Energy}} &"
         r"\multicolumn{2}{c}{{Recovered Energy}} \\"
         "\n"
         r" & & "
-        r"{MILP3} & {ALNS} & & "
         r"{MILP3} & {ALNS} & "
         r"{MILP3} & {ALNS} & "
         r"{MILP3} & {ALNS} & "
@@ -1046,13 +1046,10 @@ def _latex_table_block(rows: list[dict[str, Any]], continuation_note: str = "") 
                     ),
                     _latex_fmt_pct(row["accept_milp3"]),
                     _latex_fmt_pct(row["accept_alns"]),
-                    _latex_fmt(row["accept_delta_pp"], "{:.1f}"),
                     _latex_fmt_min(row["tardiness_milp3"], "{:.1f}"),
                     _latex_fmt_min(row["tardiness_alns"], "{:.1f}"),
                     _latex_fmt_min(row["excess_ride_time_milp3"], "{:.1f}"),
                     _latex_fmt_min(row["excess_ride_time_alns"], "{:.1f}"),
-                    _latex_fmt(row["solve_time_milp3"], "{:.1f}"),
-                    _latex_fmt(row["solve_time_alns"], "{:.1f}"),
                     _latex_fmt(row["energy_consumed_milp3"], "{:.2f}"),
                     _latex_fmt(row["energy_consumed_alns"], "{:.2f}"),
                     _latex_fmt(row["energy_recovered_milp3"], "{:.2f}"),
@@ -1066,13 +1063,12 @@ def _latex_table_block(rows: list[dict[str, Any]], continuation_note: str = "") 
         "\n"
         r"\end{tabular}"
         "\n"
-        r"\caption{Full-day rolling-horizon comparison" + continuation_note + r". "
-        r"Each row contains the aggregated results for one simulated workday, which "
-        r"was solved once with MILP3 and once with ALNS. Accept\% is completed/total; "
-        r"$\Delta$Accept is ALNS minus MILP3 in percentage points, with positive "
-        r"favoring ALNS. Delay and excess ride are per-request means in minutes, while "
-        r"SolveTime is per-epoch mean in seconds. Consumed/recovered energy denote "
-        r"workday-cumulative SoC change.}"
+        r"\caption{Aggregated rolling-horizon results" + continuation_note + r". "
+        r"Each row contains one simulated workday, which was solved end-to-end "
+        r"independently using MILP3 and ALNS. Acceptance is the total percentage "
+        r"of completed requests at the end of the workday. Delay and excess ride are "
+        r"per-request means, while consumed and recovered energy denote cumulative "
+        r"SoC changes over the workday.}"
         "\n"
         r"\end{table*}"
         "\n"

@@ -1,0 +1,87 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "modems"
+version = "0.1.0"
+description = "MODEMS: on-campus passenger mobility routing service, with MILP, ALNS, and a dynamic rolling-horizon simulator"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [ { name = "Mostafa Emam" } ]
+requires-python = ">=3.12"
+keywords = [
+    "vehicle-routing-problem",
+    "dial-a-ride-problem",
+    "electric-autonomous-vehicles",
+    "mixed-integer-programming",
+    "adaptive-large-neighborhood-search",
+    "operations-research",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+
+# CBC (via pulp `cbc` extra) is the default, license-free solver, no more installs
+# are needed beyond this dependency list. HiGHS and Gurobi are both optional;
+# check the [highs]/[gurobi] extras and README.md
+#
+# (Gurobi additionally needs a license -- see the free academic option there)
+dependencies = [
+    "numpy>=1.24",
+    "matplotlib>=3.7",
+    "pyomo>=6.7",
+    "pulp[cbc]>=2.8,<4",
+    "alns>=6.0",
+]
+
+[project.optional-dependencies]
+gurobi = [
+    "gurobipy>=11.0",  # requires a Gurobi license
+]
+highs = [
+    "highspy>=1.15",  # HiGHS via pyomo appsi_highs interface
+]
+dev = [
+    "pytest>=7.4",
+    "ruff>=0.9",
+    "vulture>=2.14",
+]
+
+[project.urls]
+Homepage = "TODO"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/modems"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Run everything with `pytest`;  fast unit tests with `pytest -m "not integration"`;
+# only solver-validation tests with `pytest -m integration`
+markers = [
+    "integration: exercises a real solver backend (CBC/HiGHS) and the alns package",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/modems/__init__.py" = ["F401"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.vulture]
+paths = ["src/modems", "scripts"]
+min_confidence = 80
+sort_by_size = true

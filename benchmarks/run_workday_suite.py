@@ -1,0 +1,238 @@
+"""
+Run the complete MODEMS workday (dynamic rolling-horizon) benchmark suite in one
+command: by default, (i) generates a fixed 3-agent, mixed-spatial-type fleet across all
+8 combinations of start_time (N: all agents start together at t=0; S: staggered,
+agent i starts at i * workday/5) x base_rate (5, 8 requests/hour) x timing (loose,
+tight: drive the surge parameters); (ii) solve every pending workday: a full simulated
+day is solved twice against the identical request submission/arrival stream using
+compare_solvers_one_workday (MILP3 vs. ALNS); (iii) build the paired comparison table
+(summary_table.{csv,json,tex}). Prints live progress during operation.
+
+Safe to interrupt (Ctrl-C) and re-run: already-generated workdays and already-solved
+rows are skipped. Use --phase to run just one part instead of the full pipeline. Call
+--smoke for a small scale full pipeline to finish in a couple of minutes.
+
+Usage:
+    python3 run_workday_suite.py
+    python3 run_workday_suite.py --smoke
+    python3 run_workday_suite.py --phase solve --retry-failed
+    python3 run_workday_suite.py --solver-name appsi_highs --solver-config-type highs
+"""
+
+import argparse
+import json
+import os
+
+from _cli_common import (
+    ParserArgumentName,
+    add_cli_arguments,
+    make_progress_printer,
+    resolve_cli_phase,
+    resolve_cli_timings,
+)
+
+from modems import (
+    SolverConfigType,
+    WorkdayLog,
+    build_workday_summary_table,
+    generate_workday_suite,
+    plot_workday_soc_acceptance,
+    read_workday_manifest,
+    solve_workday_suite,
+)
+from modems.benchmark import ManifestPhase, ManifestStatus
+from modems.core import ScenarioSize, ScenarioTiming, ScenarioType
+from modems.generator import (
+    DEFAULT_BASE_RATE_PER_HOUR,
+    DEFAULT_WORKDAY_BUFFER,
+    DEFAULT_WORKDAY_LENGTH,
+)
+from modems.workday_benchmark import WorkdayStartTime, build_workday_requests_table
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    shared_args = [
+        ParserArgumentName.outdir,
+        ParserArgumentName.smoke,
+        ParserArgumentName.seed,
+        ParserArgumentName.phase,
+        ParserArgumentName.timings,
+        ParserArgumentName.retry_failed,
+        ParserArgumentName.nr_repeats,
+        ParserArgumentName.solver_name,
+        ParserArgumentName.solver_config_type,
+        ParserArgumentName.milp_timelimit,
+        ParserArgumentName.alns_max_iter,
+        ParserArgumentName.latex_rows_per_block,
+    ]
+    add_cli_arguments(parser, shared_args)
+    parser.set_defaults(
+        outdir=os.path.join(os.path.dirname(__file__), "results_workday")
+    )
+    parser.set_defaults(nr_repeats=1)
+    start_times = [n.value for n in WorkdayStartTime]
+    parser.add_argument(
+        "--start-times",
+        nargs="+",
+        default=start_times,
+        choices=start_times,
+        help="N: all agents start at t=0. S: staggered, agent i starts at i*workday/5",
+    )
+    parser.add_argument(
+        "--base-rates",
+        type=float,
+        nargs="+",
+        default=[DEFAULT_BASE_RATE_PER_HOUR, 8.0],
+        help="Baseline request arrivals per hour (before surges)",
+    )
+    parser.add_argument(
+        "--workday",
+        type=float,
+        default=DEFAULT_WORKDAY_LENGTH,
+        help="Simulated workday length in minutes over which requests are drawn",
+    )
+    parser.add_argument(
+        "--workday-buffer",
+        type=float,
+        default=DEFAULT_WORKDAY_BUFFER,
+        help=(
+            "Extra minutes the simulator runs past the full workday, so that "
+            "late-submitted requests (near the end of workday) still resolve"
+        ),
+    )
+    parser.add_argument(
+        "--table-name",
+        default="summary_table",
+        help="Output file basename for the workday summary",
+    )
+    parser.add_argument(
+        "--requests-table-name",
+        default="requests_table",
+        help="Output file basename for the compiled workday requests data",
+    )
+    parser.add_argument(
+        "--clock-display-start",
+        default="08:00",
+        help="Workday starting clock time for formatting clock-time columns",
+    )
+    parser.add_argument(
+        "--plots",
+        action="store_true",
+        help=(
+            "Generate the dual-axis (cumulative accept/reject rate vs. agent SoC) "
+            "plot for every solved workday, one per (workday, solver), as part "
+            "of the build phase"
+        ),
+    )
+    args = parser.parse_args()
+
+    if args.smoke:
+        args.timings = [ScenarioTiming.loose]
+        args.start_times = [WorkdayStartTime.normal, WorkdayStartTime.staggered]
+        args.base_rates = [DEFAULT_BASE_RATE_PER_HOUR]
+        args.nr_repeats = 1
+        args.workday = 90.0
+        args.workday_buffer = 30.0
+        args.milp_timelimit = 8.0
+        args.alns_max_iter = 100
+    else:
+        args.timings = resolve_cli_timings(args.timings)
+        args.start_times = [WorkdayStartTime(s) for s in args.start_times]
+    args.phases = resolve_cli_phase(args.phase)
+
+    on_progress = make_progress_printer()
+
+    if ManifestPhase.generate in args.phases:
+        summary = generate_workday_suite(
+            outdir=args.outdir,
+            scenario_sizes=[ScenarioSize.large],
+            scenario_types=[ScenarioType.mixed],
+            scenario_timings=args.timings,
+            start_times=args.start_times,
+            base_rates=args.base_rates,
+            nr_repeats=args.nr_repeats,
+            base_seed=args.seed,
+            workday_length=args.workday,
+            on_progress=on_progress,
+        )
+        nr_generated = nr_skipped = nr_failed = 0
+        for row in summary:
+            status = ManifestStatus(row["status"])
+            if status == ManifestStatus.created:
+                nr_generated += 1
+            elif ManifestStatus.is_skipped(status):
+                nr_skipped += 1
+            elif ManifestStatus.is_infeasible(status):
+                nr_failed += 1
+        print(
+            f"\n{nr_generated} generated, {nr_skipped} exist (skipped), "
+            f"{nr_failed} infeasible (ignored)\n"
+        )
+
+    if ManifestPhase.solve in args.phases:
+        outcomes = solve_workday_suite(
+            outdir=args.outdir,
+            milp_timelimit=args.milp_timelimit,
+            alns_max_iter=args.alns_max_iter,
+            workday_buffer=args.workday_buffer,
+            retry_failed=args.retry_failed,
+            solver_name=args.solver_name,
+            solver_config_type=SolverConfigType(args.solver_config_type),
+            on_progress=on_progress,
+        )
+        nr_done = nr_failed = 0
+        for row in outcomes:
+            status = ManifestStatus(row["status"])
+            if status == ManifestStatus.done:
+                nr_done += 1
+            elif status == ManifestStatus.failed:
+                nr_failed += 1
+        print(
+            f"\n{nr_done} solved, {nr_failed} failed. "
+            "Run again to resume any that were interrupted.\n"
+        )
+
+    if ManifestPhase.build in args.phases:
+        rows = build_workday_summary_table(
+            args.outdir, table_name=args.table_name, rows_per_block=args.rows_per_block
+        )
+        print(
+            f"{len(rows)} rows written to "
+            f"{args.outdir}/{args.table_name}.{{csv,json,tex}}"
+        )
+        manifest = read_workday_manifest(args.outdir)
+        for workday_name, row in sorted(manifest.items()):
+            status = ManifestStatus(row["status"])
+            if status != ManifestStatus.done:
+                continue
+            rows = build_workday_requests_table(
+                args.outdir,
+                workday_name,
+                table_name=args.requests_table_name,
+                rows_per_block=args.rows_per_block,
+                clock_display_start=args.clock_display_start,
+            )
+            print(
+                f"{len(rows)} rows written to {args.outdir}/requests_tables/"
+                f"{workday_name}_{args.requests_table_name}.{{csv,json,tex}}"
+            )
+
+        if args.plots:
+            plots_dir = os.path.join(args.outdir, "plots")
+            manifest = read_workday_manifest(args.outdir)
+            done_rows = [
+                row
+                for row in manifest.values()
+                if ManifestStatus(row["status"]) == ManifestStatus.done
+                and row.get("workday_log_file")
+            ]
+            for row in done_rows:
+                workday_name = row["workday_name"]
+                with open(row["workday_log_file"]) as f:
+                    raw = json.load(f)
+                for solver_key, log_dict in raw.items():
+                    wlog = WorkdayLog.from_dict(log_dict)
+                    plot_workday_soc_acceptance(
+                        wlog, plots_dir, f"{workday_name}_{solver_key}"
+                    )
+            print(f"plots for {len(done_rows)} workdays written to {plots_dir}/")

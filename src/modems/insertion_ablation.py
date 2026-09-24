@@ -54,6 +54,7 @@ from .benchmark import (
     _latex_begin_doc_block,
     _latex_end_doc_block,
     _latex_fmt,
+    _latex_fmt_s_to_ms,
     stable_seed,
 )
 from .core import (
@@ -814,6 +815,7 @@ def build_ablation_table(
                 {
                     **base,
                     "nr_probes": None,
+                    "nr_measure_repeats": None,
                     "nr_accepted": None,
                     "mean_route_length": None,
                     **{m.value: None for m in InsertionAblationMetric},
@@ -846,6 +848,7 @@ def build_ablation_table(
             {
                 **base,
                 "nr_probes": data.get("nr_probes"),
+                "nr_measure_repeats": data.get("nr_measure_repeats"),
                 "nr_accepted": data.get("nr_accepted"),
                 "mean_route_length": data.get("mean_route_length"),
                 metric.t_exe_V0: t_exe_variants[0],
@@ -866,6 +869,7 @@ def build_ablation_table(
             "point_name",
             "status",
             "nr_probes",
+            "nr_measure_repeats",
             "nr_accepted",
             "mean_route_length",
         ]
@@ -921,14 +925,14 @@ def _latex_table_block(rows: list[dict[str, Any]], continuation_note: str = "") 
         "\n"
         r"\begin{tabular}{l c c "
         r"c c c c "
-        r"c c"
+        r"c c "
         r"c c c}"
         "\n"
         r"\hline"
         "\n"
         r"Key & {$|R_a|$} & Route & "
-        r"{V0 (s)} & {V1 (s)} & {V2 (s)} & {V3 (s)} & "
-        r"{V0/V3} & {V2/V3} &"
+        r"{$V0$ (ms)} & {$V1$ (ms)} & {$V2$ (ms)} & {$V3$ (ms)} & "
+        r"{$V0$/$V3$} & {$V2$/$V3$} &"
         r"Pruned & Prefix & Suffix\\"
         "\n"
         r"\hline"
@@ -939,10 +943,10 @@ def _latex_table_block(rows: list[dict[str, Any]], continuation_note: str = "") 
                 str(r["point_name"]).replace("_", r"\_"),
                 _latex_fmt(r["nr_accepted"], "{:.0f}"),
                 _latex_fmt(r["mean_route_length"], "{:.0f}"),
-                _latex_fmt(r[InsertionAblationMetric.t_exe_V0.value], "{:.3f}"),
-                _latex_fmt(r[InsertionAblationMetric.t_exe_V1.value], "{:.3f}"),
-                _latex_fmt(r[InsertionAblationMetric.t_exe_V2.value], "{:.3f}"),
-                _latex_fmt(r[InsertionAblationMetric.t_exe_V3.value], "{:.3f}"),
+                _latex_fmt_s_to_ms(r[InsertionAblationMetric.t_exe_V0.value]),
+                _latex_fmt_s_to_ms(r[InsertionAblationMetric.t_exe_V1.value]),
+                _latex_fmt_s_to_ms(r[InsertionAblationMetric.t_exe_V2.value]),
+                _latex_fmt_s_to_ms(r[InsertionAblationMetric.t_exe_V3.value]),
                 _latex_fmt(r[InsertionAblationMetric.speedup_V0_V3.value], "{:.1f}"),
                 _latex_fmt(r[InsertionAblationMetric.speedup_V2_V3.value], "{:.1f}"),
                 _latex_fmt(r["V3_pairs_pruned"], "{:.0f}"),
@@ -953,23 +957,25 @@ def _latex_table_block(rows: list[dict[str, Any]], continuation_note: str = "") 
         + r" \\"
         for r in rows
     ]
+    nr_probes_str = _latex_fmt(rows[0]["nr_probes"], "{:.0f}")
+    nr_measure_repeats_str = _latex_fmt(rows[0]["nr_measure_repeats"], "{:.0f}")
     footer = (
         r"\hline"
         "\n"
         r"\end{tabular}"
         "\n"
-        r"\caption{Comparing different approaches to identify feasible insertion "
-        r"candidates" + continuation_note + r". "
-        r"V0=naive (every precedence-feasible pair, full re-propagation), "
-        r"V1=+capacity pre-filter, V2=+incremental prefix reuse, "
-        r"V3=production (\texttt{alns\_feasible\_insertions}). Route is the "
-        r"mean number of route nodes (across agents) after insertion. Runtimes are "
-        r"averaged over the number of request probes and measurement repetitions. "
-        r"V0/V1 are skipped for requests over the naive-variant size "
-        r"threshold. V0/V3 and V2/V3 are speedup ratios. "
-        r"V3 metrics: Pruned is the mean number of pruned position pairs, "
-        r"Prefix and Suffix denote the mean number of prefix and suffix node "
-        r"propagation counts, respectively.}"
+        r"\caption{Feasible-insertion ablation" + continuation_note + r". "
+        r"Route denotes the mean number of route nodes across agents after insertion. "
+        r"Runtimes are measured in milliseconds and averaged over "
+        + nr_probes_str
+        + r" request probes and "
+        + nr_measure_repeats_str
+        + r" measurement repetitions, "
+        r"while speedups are computed from unrounded runtimes. "
+        r"For $V3$, Pruned denotes the mean number of eliminated "
+        r"insertion pairs, whereas Prefix and Suffix denote the mean numbers of "
+        r"propagated nodes. $\mathrm{-}$ indicates that no feasible candidate "
+        r"survived pruning before the corresponding propagation stage.}"
         "\n"
         r"\end{table*}"
         "\n"

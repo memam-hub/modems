@@ -703,6 +703,11 @@ def _latex_fmt_min(value: Any, spec: str = "{:.1f}") -> str:
     return chk_value if chk_value is not None else spec.format(max(0.0, value))
 
 
+def _latex_fmt_s_to_ms(value: Any, spec: str = "{:.2f}") -> str:
+    chk_value = _latex_fmt_is_nan(value)
+    return chk_value if chk_value is not None else spec.format(max(0.0, value * 1_000))
+
+
 def build_benchmark_table(
     outdir: str,
     table_name: str = "benchmark_table",

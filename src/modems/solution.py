@@ -1005,7 +1005,7 @@ class ModemsSolution:
         """
         ctx = self.ctx
         network = ctx.scenario.network
-        fig, ax = network._setup_fig_axis("Time (min)", "SoC (%)", alpha=False)
+        fig, ax = network._setup_fig_axis("Time (min)", "SoC", alpha=False)
         ax.grid(True, axis="x", alpha=0.5)
 
         series, t_max, _ = self._agent_soc_load_series()

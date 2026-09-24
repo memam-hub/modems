@@ -675,7 +675,7 @@ STATUS_SYMBOL = {
     SolutionStatus.unknown: "?",
 }
 
-MAX_ROWS_PER_BLOCK = 40
+MAX_ROWS_PER_BLOCK = 36
 
 
 def _latex_fmt_is_nan(value: Any) -> str | None:
@@ -878,7 +878,7 @@ def _latex_table_block(rows: list[dict[str, Any]], continuation_note: str = "") 
         r"\scriptsize"
         "\n"
         r"\begin{tabular}{l c c "
-        r"c c c c c c"
+        r"c c c c c c "
         r"c c c "
         r"c c}"
         "\n"
@@ -887,12 +887,12 @@ def _latex_table_block(rows: list[dict[str, Any]], continuation_note: str = "") 
         r"Key & ${|K|}$ & ${|R|}$ & "
         r"Solver & Status& ${|R_a|}$ & \multicolumn{3}{c}{Objective} & "
         r"{LB} & {UB} & {Gap (\%)} & "
-        r"\multicolumn{2}{c}{Time (s)} \\"
+        r"\multicolumn{2}{c}{Time} \\"
         "\n"
         r" &  &  & "
         r" & & & Base & Solver & {$\Delta$(\%)} & "
         r" & & & "
-        r" Base & Solver \\"
+        r" Base (ms) & Solver (s) \\"
         "\n"
         r"\hline"
     )
@@ -913,7 +913,7 @@ def _latex_table_block(rows: list[dict[str, Any]], continuation_note: str = "") 
                     _latex_fmt(r["lower_bound"], "{:.1f}"),
                     _latex_fmt(r["upper_bound"], "{:.1f}"),
                     _latex_fmt(r["gap_pct"], "{:.1f}"),
-                    _latex_fmt(r["baseline_time"]),
+                    _latex_fmt_s_to_ms(r["baseline_time"]),
                     _latex_fmt(r["time"]),
                 ]
             )
@@ -925,10 +925,11 @@ def _latex_table_block(rows: list[dict[str, Any]], continuation_note: str = "") 
         r"\end{tabular}"
         "\n"
         r"\caption{Benchmark results" + continuation_note + r". "
-        r"$\star$ = optimal, $\dagger$ = feasible (limit reached, gap shown), "
-        r"$\times$ = infeasible, ? = no incumbent found before the time limit. "
-        r"Improvement $\Delta$ is relative to the strategy-specific constructive "
-        r"heuristic baseline.}"
+        r"Status: $\star$ denotes a proven optimal solution while $\dagger$ is a "
+        r"feasible solution without an optimality certificate. "
+        r"Constructive-heuristic time is displayed in milliseconds, while solver "
+        r"runtime is in seconds. Improvement $\Delta$ is measured relative to the "
+        r"base heuristic.}"
         "\n"
         r"\end{table*}"
         "\n"

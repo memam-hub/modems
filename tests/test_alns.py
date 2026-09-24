@@ -10,7 +10,7 @@ from modems.algorithms import greedy_complete, preprocess
 from modems.core import ProblemContext, ProblemType, SolverStrategy
 from modems.solution import ModemsSolution, SolutionStatus
 
-PARAMS_OBJ: dict = {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 2.5}
+PARAMS_OBJ: dict = {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 2.5, "omega": 5.0}
 PARAMS_RW: dict = {"scores": [5, 2, 1, 0.5], "decay": 0.8}
 PARAMS_SA: dict = {"start_temp": 1000, "end_temp": 0.1, "cooling_rate": 0.995}
 
@@ -258,7 +258,7 @@ def test_destroy_sort_keys_are_total_orders_even_with_ties() -> None:
     """
     generator = ModemsScenarioGenerator(seed=5)
     scenario = generator.generate_random_scenario(nr_agents=2, nr_requests=10)
-    params = {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 2.0}
+    params = {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 2.0, "omega": 5.0}
     ctx = ProblemContext(
         scenario, ProblemType.closed_selective, SolverStrategy.alns, params
     )

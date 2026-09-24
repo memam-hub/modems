@@ -445,7 +445,7 @@ def test_problem_context_rejects_invalid_penalty_ordering(
             small_scenario,
             ProblemType.closed_selective,
             SolverStrategy.alns,
-            {"eps": 1.0, "zeta": 1.0, "eta": 100.0, "rho": 2.0},
+            {"eps": 1.0, "zeta": 1.0, "eta": 100.0, "rho": 2.0, "omega": 5.0},
         )
 
 
@@ -458,5 +458,5 @@ def test_problem_context_rejects_rho_below_one(
             small_scenario,
             ProblemType.closed_selective,
             SolverStrategy.alns,
-            {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 0.5},
+            {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 0.5, "omega": 5.0},
         )

@@ -16,8 +16,14 @@ DEFAULT_TIME_WINDOW = 5.0
 # default base seed for all stochastic elements/processes
 DEFAULT_BASE_SEED = 42
 
-# default parameters for objective caculation and maximum ride-time
-DEFAULT_PARAMS_OBJ = {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 2.5}
+# default parameters for objective caculation, time windows, and maximum ride-time
+DEFAULT_PARAMS_OBJ = {
+    "eps": 0.01,
+    "zeta": 2.0,
+    "eta": 100.0,
+    "rho": 2.5,
+    "omega": DEFAULT_TIME_WINDOW,
+}
 
 
 class RequestStatus(StrEnum):
@@ -609,6 +615,7 @@ class ProblemContext:
     zeta: float
     eta: float
     rho: float
+    omega: float
     agent_names: list[str]
     request_names: list[str]
     agents: dict[str, ModemsAgent]
@@ -643,10 +650,13 @@ class ProblemContext:
         self.zeta = self.model_params["zeta"]
         self.eta = self.model_params["eta"]
         self.rho = self.model_params["rho"]
+        self.omega = self.model_params["omega"]
         if not 0.0 < self.eps < self.zeta < self.eta:
             raise ValueError("model penalties must satisfy 0 < eps < zeta < eta")
         if self.rho < 1.0:
             raise ValueError("rho must be at least 1")
+        if self.omega < 1.0:
+            raise ValueError("omega must be at least 1")
 
         self.agent_names = [
             a.make_agent_name(i) for i, a in enumerate(scenario.agents, start=1)

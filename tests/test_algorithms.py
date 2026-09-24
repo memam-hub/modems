@@ -17,7 +17,7 @@ from modems.core import ModemsScenario, ProblemContext, ProblemType, SolverStrat
 from modems.insertion_ablation import variant_v0_naive
 from modems.solution import ModemsJourney, ModemsSolution
 
-PARAMS: dict = {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 2.0}
+PARAMS: dict = {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 2.0, "omega": 5.0}
 
 
 def _preprocess(

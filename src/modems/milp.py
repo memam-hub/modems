@@ -273,6 +273,7 @@ class ModemsMilp:
         m.param_zeta = pyo.Param(initialize=ctx.zeta, within=pyo.NonNegativeReals)
         m.param_eta = pyo.Param(initialize=ctx.eta, within=pyo.NonNegativeReals)
         m.param_rho = pyo.Param(initialize=ctx.rho, within=pyo.NonNegativeReals)
+        m.param_omega = pyo.Param(initialize=ctx.omega, within=pyo.NonNegativeReals)
         m.param_big_m = pyo.Param(
             initialize=ctx.model_params["big_m"], within=pyo.NonNegativeReals
         )
@@ -581,12 +582,17 @@ class ModemsMilp:
                 p = m.param_request_pickup[r]
                 return m.var_t[p] >= m.param_pickup_e[p] - m.var_tau[p]
 
+            def cstr_tw_new_lb_max(m: Any, r: str) -> Any:
+                p = m.param_request_pickup[r]
+                return m.var_t[p] >= m.param_pickup_e[p] - m.param_omega
+
             def cstr_tw_new_ub(m: Any, r: str) -> Any:
                 p = m.param_request_pickup[r]
                 return m.var_t[p] <= m.param_pickup_l[p] + m.var_tau[p]
 
             if new_reqs:
                 m.cstr_tw_new_lb = pyo.Constraint(new_reqs, rule=cstr_tw_new_lb)
+                m.cstr_tw_new_lb_max = pyo.Constraint(new_reqs, rule=cstr_tw_new_lb_max)
                 m.cstr_tw_new_ub = pyo.Constraint(new_reqs, rule=cstr_tw_new_ub)
 
             def cstr_tw_sch_lb(m: Any, r: str) -> Any:
@@ -625,6 +631,13 @@ class ModemsMilp:
                     rhs -= m.param_big_m * (1 - m.var_y[r])
                 return m.var_t[p] >= rhs
 
+            def cstr_tw_new_lb_max(m: Any, r: str) -> Any:
+                p = m.param_request_pickup[r]
+                rhs = m.param_pickup_e[p] - m.param_omega
+                if self.has_selectivity:
+                    rhs -= m.param_big_m * (1 - m.var_y[r])
+                return m.var_t[p] >= rhs
+
             def cstr_tw_new_ub(m: Any, r: str) -> Any:
                 p = m.param_request_pickup[r]
                 rhs = m.param_pickup_l[p] + m.var_tau[p]
@@ -634,6 +647,7 @@ class ModemsMilp:
 
             if new_reqs:
                 m.cstr_tw_new_lb = pyo.Constraint(new_reqs, rule=cstr_tw_new_lb)
+                m.cstr_tw_new_lb_max = pyo.Constraint(new_reqs, rule=cstr_tw_new_lb_max)
                 m.cstr_tw_new_ub = pyo.Constraint(new_reqs, rule=cstr_tw_new_ub)
 
             def cstr_tw_sch_lb(m: Any, r: str) -> Any:

@@ -14,7 +14,7 @@ Quickstart:
                        problem_type=ProblemType.closed_selective,
                        milp_params={"eps": 0.01, "zeta": 1.0,
                                     "eta": 100.0, "rho": 2.5,
-                                    "big_m": 150.0})
+                                    "omega": 5.0, "big_m": 150.0})
     milp.solve(solver_name="cbc", solver_config_type=SolverConfigType.cbc,
                solver_options={"timelimit": 60.0})
 

@@ -556,7 +556,7 @@ def test_preprocess_fails_on_incompatible_partial_plan_agents() -> None:
     scenario = generator.generate_random_scenario(
         nr_agents=2, nr_requests=3, nr_scheduled=1
     )
-    params = {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 2.0}
+    params = {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 2.0, "omega": 5.0}
 
     partial_plan = _scheduled_partial_plan(scenario)
     partial_plan.journeys.pop("agent_2")
@@ -572,7 +572,7 @@ def test_preprocess_fails_on_incompatible_partial_plan_agents() -> None:
 
 def test_rolling_excerpt_shifts_and_preserves_milp3_service_times() -> None:
     """_build_next_scenario() shifts time by t_elapsed and preprocess() accepts it"""
-    params = {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 2.0}
+    params = {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 2.0, "omega": 5.0}
     scenario = ModemsScenarioGenerator(seed=5).generate_random_scenario(
         nr_agents=1,
         nr_requests=1,
@@ -777,7 +777,7 @@ def test_collect_request_metrics_matches_manual_calc() -> None:
         scenario,
         ProblemType.closed_selective,
         SolverStrategy.alns,
-        {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 2.0},
+        {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 2.0, "omega": 5.0},
     )
     agent_name = ctx.agent_names[0]
     r = ctx.request_names[0]
@@ -806,7 +806,7 @@ def test_collect_request_metrics_none_for_unrelated_request() -> None:
         scenario,
         ProblemType.closed_selective,
         SolverStrategy.alns,
-        {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 2.0},
+        {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 2.0, "omega": 5.0},
     )
     agent_name = ctx.agent_names[0]
     journey = ModemsJourney(ctx, agent_name)._append_request_direct(

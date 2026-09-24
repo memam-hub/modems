@@ -34,7 +34,7 @@ from modems.insertion_ablation import (
     write_corpus_comparison,
 )
 
-PARAMS: dict = {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 2.0}
+PARAMS: dict = {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 2.0, "omega": 5.0}
 
 
 def _candidate_key(candidate: Any) -> tuple[str, tuple[str, ...]]:

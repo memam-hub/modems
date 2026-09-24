@@ -53,7 +53,7 @@ def test_stable_seed_differs_for_different_inputs() -> None:
 
 def _make_result(tiny_scenario: ModemsScenario) -> ModemsBenchmarkResult:
     """Build a ModemsBenchmarkResult from a constructive baseline (no real solve)"""
-    params = {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 2.0}
+    params = {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 2.0, "omega": 5.0}
     ctx = ProblemContext(
         tiny_scenario, ProblemType.closed_selective, SolverStrategy.alns, params
     )
@@ -181,7 +181,7 @@ def test_milp_still_solves_when_constructive_fails(
     result = benchmark._solve_one(
         tiny_scenario,
         SolverStrategy("milp3"),
-        {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 2.5},
+        {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 2.5, "omega": 5.0},
         milp_timelimit=1.0,
         alns_max_iter=1,
         seed=1,

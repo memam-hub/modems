@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: >-
+  If you use this software, please cite it using as below.
+  A citation for the accompanying paper will be added here once it is
+  published -- see the "preferred-citation" field (currently TODO).
+type: software
+title: "MODEMS: Munich On-Demand Electric Mobility Service"
+authors:
+  - family-names: "Emam"
+    given-names: "Mostafa"
+    orcid: "https://orcid.org/0000-0003-4942-1183"
+url: "https://github.com/memam-hub/modems"
+doi: 10.5281/zenodo.21843681
+license: MIT
+keywords:
+  - Electric Vehicle Routing Problem
+  - Electric Autonomoud Dial-a-Ride Problem
+  - Mixed-Integer Linear Programming
+  - Adaptive Large Neighborhood Search
+  - Operations Research
+# preferred-citation:
+#   type: article
+#   authors:
+#   - family-names: "Emam"
+#     given-names: "Mostafa"
+#     orcid: "https://orcid.org/0000-0003-4942-1183"
+#   doi: TODO
+#   title: TODO
+#   year: 2026

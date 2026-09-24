@@ -200,10 +200,11 @@ python3 run_workday_suite.py \
   --base-rates 5 8 \
   --nr-repeats 1 \
   --solver-name gurobi \
-  --solver-config-type gurobi   # workday
+  --solver-config-type gurobi \
+  --plots     # multiple workdays with plots
 
 python3 run_suite.py \
-  --outdir plots \
+  --outdir results_plots \
   --sizes L \
   --types M \
   --timings T \

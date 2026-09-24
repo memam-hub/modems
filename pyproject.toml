@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "modems"
-version = "0.1.0"
+version = "0.1.1"
 description = "MODEMS: on-campus passenger mobility routing service, with MILP, ALNS, and a dynamic rolling-horizon simulator"
 readme = "README.md"
 license = { text = "MIT" }
@@ -54,7 +54,7 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "TODO"
+Homepage = "https://github.com/memam-hub/modems"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/modems"]

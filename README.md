@@ -172,6 +172,48 @@ python3 run_workday_suite.py --smoke
 python3 run_ablation_suite.py --smoke
 ```
 
+To generate the exact results reported in the paper, run the following commands
+(note: this can span several hours depending on the hardware specs):
+
+```bash
+cd benchmarks
+
+python3 run_ablation_suite.py \
+  --request-counts 10 30 60 \
+  --agent-counts 1 2 \
+  --types R C M \
+  --timings L T \
+  --nr-repeats 1    # insertion ablation
+
+python3 run_suite.py \
+  --sizes S M L \
+  --types R C M \
+  --timings L T \
+  --soc-test normal \
+  --nr-repeats 2 \
+  --solver-name gurobi \
+  --solver-config-type gurobi   # suite
+
+python3 run_workday_suite.py \
+  --timings L \
+  --start-times N S \
+  --base-rates 5 8 \
+  --nr-repeats 1 \
+  --solver-name gurobi \
+  --solver-config-type gurobi   # workday
+
+python3 run_suite.py \
+  --outdir plots \
+  --sizes L \
+  --types M \
+  --timings T \
+  --soc-test stress \
+  --nr-repeats 1 \
+  --solver-name gurobi \
+  --solver-config-type gurobi \
+  --plots     # single scenario with plots
+```
+
 
 ## License
 
@@ -181,4 +223,6 @@ MIT -- see [`LICENSE`](LICENSE).
 ## Citation
 
 Code archived at DOI:
-[TODO](TODO).
+
+[https://doi.org/10.5281/zenodo.22927939](https://doi.org/10.5281/zenodo.22927939)
+

@@ -964,62 +964,6 @@ class ModemsMilp:
     # Solve / results
     # ---------------------------------------------------------------------------------
 
-    def _check_solution_status(self) -> tuple[int, str]:
-        """
-        Returns (flag, message):
-          0  = proven optimal
-          1  = feasible incumbent found (time limit reached before proof)
-         -1  = proven infeasible
-         -2  = no incumbent found before the time limit (status genuinely
-               unknown -- NOT the same as proven infeasible)
-        """
-        if not self.problem_done:
-            raise NameError("Problem not solved. Solve problem first!")
-        term_cond = self.results.solver.termination_condition
-
-        if (self.results.solver.status == pyo.SolverStatus.ok) and (
-            term_cond == pyo.TerminationCondition.optimal
-        ):
-            return 0, "Optimal solution found!"
-
-        if term_cond == pyo.TerminationCondition.infeasible:
-            return -1, "Proven infeasible."
-
-        if term_cond == pyo.TerminationCondition.intermediateNonInteger:
-            return (
-                -2,
-                "Time limit reached before any integer-feasible solution was found",
-            )
-
-        if term_cond in (
-            pyo.TerminationCondition.maxTimeLimit,
-            pyo.TerminationCondition.feasible,
-        ) or (self.results.solver.status == pyo.SolverStatus.aborted):
-            # An aborted/time-limited run can still have zero found incumbents
-            # (rare, but cbc does strange things sometimes) and pyo.value() alone is
-            # not indicative enough, so check the reported upper bound
-            has_incumbent = True
-            try:
-                ub = self.results.problem.upper_bound
-                has_incumbent = ub is not None and abs(ub) < FLOAT_INF
-            except Exception:
-                pass
-            if not has_incumbent:
-                return (
-                    -2,
-                    "Time limit reached before any integer-feasible solution was found",
-                )
-            try:
-                pyo.value(self.model.objective)
-                return 1, "Time limit reached / feasible solution."
-            except Exception:
-                return (
-                    -2,
-                    "Time limit reached before any integer-feasible solution was found",
-                )
-
-        return -2, f"Solver terminated without a proven result ({term_cond})"
-
     def solve(
         self,
         solver_name: str,
@@ -1166,43 +1110,36 @@ class ModemsMilp:
 
     def _build_instance(self, solution_time: float) -> None:
         """Build the canonical (scenario, solution, solver-details) ModemsInstance"""
-        flag, _ = self._check_solution_status()
+        if not self.problem_done:
+            raise NameError("Problem not solved. Solve problem first!")
 
-        if flag >= 0 and not self._loaded_solution_is_valid():
-            # The solver reported an incumbent, but the loaded variable values do NOT
-            # actually satisfy the model constraints, treat as no incumbent found
-            flag = -2
-
-        status = {
-            0: SolutionStatus.optimal,
-            1: SolutionStatus.feasible,
-            -1: SolutionStatus.infeasible,
-            # Timed out before a valid incumbent; not proven infeasible
-            -2: SolutionStatus.unknown,
-        }[flag]
-
-        lower_bound = upper_bound = objective = None
-        if flag >= 0:
-            objective = pyo.value(self.model.objective)
-        if flag == 0:
-            lower_bound = objective
-            upper_bound = objective
+        objective = pyo.value(self.model.objective, exception=False)
+        lower_bound = pyo.value(self.results.problem.lower_bound, exception=False)
+        upper_bound = pyo.value(self.results.problem.upper_bound, exception=False)
+        if self.results.solver.status == pyo.SolverStatus.ok:
+            if self._loaded_solution_is_valid():
+                if not ((lower_bound is None) or (upper_bound is None)):
+                    if abs(lower_bound - upper_bound) > FLOAT_TOL:
+                        status = SolutionStatus.feasible
+                    else:
+                        status = SolutionStatus.optimal
+            else:
+                status = SolutionStatus.infeasible
+        elif self.results.solver.status == pyo.SolverStatus.warning:
+            status = SolutionStatus.infeasible
         else:
-            try:
-                lower_bound = self.results.problem.lower_bound
-            except Exception:
-                pass
-            try:
-                upper_bound = self.results.problem.upper_bound
-            except Exception:
-                pass
+            status = SolutionStatus.unknown
 
-        solution = self._extract_solution() if flag >= 0 else ModemsSolution(self.ctx)
+        solution = (
+            self._extract_solution()
+            if status in (SolutionStatus.feasible, SolutionStatus.optimal)
+            else ModemsSolution(self.ctx)
+        )
 
         solution_info = ModemsSolutionInfo(
             status=status,
             solution_time=solution_time,
-            objective=objective if objective is not None else FLOAT_INF,
+            objective=objective,
             lower_bound=lower_bound,
             upper_bound=upper_bound,
             solver_name=self.solver_type,

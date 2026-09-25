@@ -1176,7 +1176,7 @@ class ModemsSolutionInfo:
 
     status: SolutionStatus | str = SolutionStatus.unknown
     solution_time: float = 0.0
-    objective: float = FLOAT_INF
+    objective: float | None = None
     lower_bound: float | None = None
     upper_bound: float | None = None
     solver_name: str = ""

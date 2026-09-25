@@ -1013,6 +1013,7 @@ def _latex_table_block(rows: list[dict[str, Any]], continuation_note: str = "") 
         r"c c "
         r"c c "
         r"c c "
+        r"c c "
         r"c c}"
         "\n"
         r"\hline"
@@ -1021,10 +1022,12 @@ def _latex_table_block(rows: list[dict[str, Any]], continuation_note: str = "") 
         r"\multicolumn{2}{c}{{Acceptance\%}} & "
         r"\multicolumn{2}{c}{{Delay (min)}} & "
         r"\multicolumn{2}{c}{{Excess ride (min)}} & "
-        r"\multicolumn{2}{c}{{Consumed Energy}} &"
-        r"\multicolumn{2}{c}{{Recovered Energy}} \\"
+        r"\multicolumn{2}{c}{{Consumed energy}} & "
+        r"\multicolumn{2}{c}{{Recovered energy}} & "
+        r"\multicolumn{2}{c}{{Solver time (s)}} \\"
         "\n"
         r" & & "
+        r"{MILP3} & {ALNS} & "
         r"{MILP3} & {ALNS} & "
         r"{MILP3} & {ALNS} & "
         r"{MILP3} & {ALNS} & "
@@ -1046,14 +1049,16 @@ def _latex_table_block(rows: list[dict[str, Any]], continuation_note: str = "") 
                     ),
                     _latex_fmt_pct(row["accept_milp3"]),
                     _latex_fmt_pct(row["accept_alns"]),
-                    _latex_fmt_min(row["tardiness_milp3"], "{:.1f}"),
-                    _latex_fmt_min(row["tardiness_alns"], "{:.1f}"),
-                    _latex_fmt_min(row["excess_ride_time_milp3"], "{:.1f}"),
-                    _latex_fmt_min(row["excess_ride_time_alns"], "{:.1f}"),
-                    _latex_fmt(row["energy_consumed_milp3"], "{:.2f}"),
-                    _latex_fmt(row["energy_consumed_alns"], "{:.2f}"),
-                    _latex_fmt(row["energy_recovered_milp3"], "{:.2f}"),
-                    _latex_fmt(row["energy_recovered_alns"], "{:.2f}"),
+                    _latex_fmt_min(row["tardiness_milp3"]),
+                    _latex_fmt_min(row["tardiness_alns"]),
+                    _latex_fmt_min(row["excess_ride_time_milp3"]),
+                    _latex_fmt_min(row["excess_ride_time_alns"]),
+                    _latex_fmt(row["energy_consumed_milp3"]),
+                    _latex_fmt(row["energy_consumed_alns"]),
+                    _latex_fmt(row["energy_recovered_milp3"]),
+                    _latex_fmt(row["energy_recovered_alns"]),
+                    _latex_fmt(row["solve_time_milp3"]),
+                    _latex_fmt(row["solve_time_alns"]),
                 ]
             )
             + r" \\"
@@ -1064,11 +1069,11 @@ def _latex_table_block(rows: list[dict[str, Any]], continuation_note: str = "") 
         r"\end{tabular}"
         "\n"
         r"\caption{Aggregated rolling-horizon results" + continuation_note + r". "
-        r"Each row contains one simulated workday, which was solved end-to-end "
-        r"independently using MILP3 and ALNS. Acceptance is the total percentage "
-        r"of completed requests at the end of the workday. Delay and excess ride are "
-        r"per-request means, while consumed and recovered energy denote cumulative "
-        r"SoC changes over the workday.}"
+        r"Each row represents one simulated workday, solved end-to-end with MILP3 and "
+        r"ALNS independently. Acceptance is the total percentage of completed "
+        r"requests at the end of the workday. Delay and excess ride are per-request "
+        r"means, while consumed and recovered energy denote cumulative SoC changes "
+        r"over the workday. Solver time is per-epoch mean.}"
         "\n"
         r"\end{table*}"
         "\n"

@@ -1116,13 +1116,16 @@ class ModemsMilp:
         objective = pyo.value(self.model.objective, exception=False)
         lower_bound = pyo.value(self.results.problem.lower_bound, exception=False)
         upper_bound = pyo.value(self.results.problem.upper_bound, exception=False)
-        if self.results.solver.status == pyo.SolverStatus.ok:
+        if (
+            objective is not None
+            and lower_bound is not None
+            and upper_bound is not None
+        ):
             if self._loaded_solution_is_valid():
-                if not ((lower_bound is None) or (upper_bound is None)):
-                    if abs(lower_bound - upper_bound) > FLOAT_TOL:
-                        status = SolutionStatus.feasible
-                    else:
-                        status = SolutionStatus.optimal
+                if abs(lower_bound - upper_bound) > FLOAT_TOL:
+                    status = SolutionStatus.feasible
+                else:
+                    status = SolutionStatus.optimal
             else:
                 status = SolutionStatus.infeasible
         elif self.results.solver.status == pyo.SolverStatus.warning:

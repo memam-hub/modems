@@ -226,8 +226,19 @@ if __name__ == "__main__":
                 if ManifestStatus(row["status"]) == ManifestStatus.done
                 and row.get("workday_log_file")
             ]
-            for row in done_rows:
+            nr_done_rows = len(done_rows)
+            for idx, row in enumerate(done_rows):
                 workday_name = row["workday_name"]
+                if on_progress:
+                    on_progress(
+                        {
+                            "phase": ManifestPhase.build,
+                            "index": idx,
+                            "total": nr_done_rows,
+                            "workday_name": workday_name,
+                            "status": ManifestStatus.starting,
+                        }
+                    )
                 with open(row["workday_log_file"]) as f:
                     raw = json.load(f)
                 for solver_key, log_dict in raw.items():
@@ -235,4 +246,14 @@ if __name__ == "__main__":
                     plot_workday_soc_acceptance(
                         wlog, plots_dir, f"{workday_name}_{solver_key}"
                     )
-            print(f"plots for {len(done_rows)} workdays written to {plots_dir}/")
+                if on_progress:
+                    on_progress(
+                        {
+                            "phase": ManifestPhase.build,
+                            "index": idx,
+                            "total": nr_done_rows,
+                            "workday_name": workday_name,
+                            "status": ManifestStatus.done,
+                        }
+                    )
+            print(f"plots for {nr_done_rows} workdays written to {plots_dir}/")

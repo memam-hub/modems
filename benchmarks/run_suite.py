@@ -193,8 +193,19 @@ if __name__ == "__main__":
                 for row in manifest.values()
                 if ManifestStatus(row["status"]) == ManifestStatus.done
             ]
-            for row in done_rows:
+            nr_done_rows = len(done_rows)
+            for idx, row in enumerate(done_rows):
                 scenario_name = row["scenario_name"]
+                if on_progress:
+                    on_progress(
+                        {
+                            "phase": ManifestPhase.build,
+                            "index": idx,
+                            "total": nr_done_rows,
+                            "scenario_name": scenario_name,
+                            "status": ManifestStatus.starting,
+                        }
+                    )
                 solver_strategy = SolverStrategy(row["solver_strategy"])
                 prefix = f"{scenario_name}_{solver_strategy}"
                 result = ModemsBenchmarkResult.from_json(row["result_file"])
@@ -210,4 +221,14 @@ if __name__ == "__main__":
                         with open(alns_stats_file) as f:
                             alns_stats = json.load(f)
                         plot_alns_metrics_from_stats(alns_stats, plots_dir, prefix)
-            print(f"plots for {len(done_rows)} results written to {plots_dir}/")
+                if on_progress:
+                    on_progress(
+                        {
+                            "phase": ManifestPhase.build,
+                            "index": idx,
+                            "total": nr_done_rows,
+                            "scenario_name": scenario_name,
+                            "status": ManifestStatus.done,
+                        }
+                    )
+            print(f"plots for {nr_done_rows} results written to {plots_dir}/")

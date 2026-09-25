@@ -126,6 +126,16 @@ class NetworkNodeName:
         return f"{NetworkNodeType.hub}_{index}"
 
     @staticmethod
+    def make_station_name(index: int) -> str:
+        """
+        Create a node name from the service station index
+
+        Args:
+            index: 1-based index of the service station
+        """
+        return f"{NetworkNodeType.station}_{index}"
+
+    @staticmethod
     def get_node_index(node_name: str) -> int:
         """
         Read the (1-based) node index from the node name

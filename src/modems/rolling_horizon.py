@@ -1201,27 +1201,55 @@ class WorkdayLog:
     requests: list[RequestRecord] = field(default_factory=list)
     agent_node_visits: dict[str, list[AgentNodeVisit]] = field(default_factory=dict)
 
+    @staticmethod
+    def _clean_visits(visits: list[AgentNodeVisit]) -> list[AgentNodeVisit]:
+        """resolve redundant visits across multiple epochs using consistent names"""
+        if not visits:
+            return []
+
+        def _make_consistent_name(node: str) -> str:
+            """make an epoch-agnositc visit name using physical hub/station entities"""
+            n_idx = NetworkNodeName.get_node_index(node)
+            n_type = NetworkNodeName.get_node_type(node)
+            return (
+                NetworkNodeName.make_hub_name(n_idx)
+                if (NetworkNodeType.is_hub(n_type))
+                else NetworkNodeName.make_station_name(n_idx)
+            )  # name follows the format <h/s>_<idx>
+
+        new_visits: list[AgentNodeVisit] = [visits[0]]
+        new_visits[0].node = _make_consistent_name(visits[0].node)
+        for visit in visits[1:]:
+            n_name = _make_consistent_name(visit.node)
+            if n_name != new_visits[-1].node:
+                new_visits.append(visit)  # new visit detected
+                new_visits[-1].node = n_name
+            else:
+                new_visits[-1].departure_time = visit.departure_time  # update t_dep
+        return new_visits
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "clock_start": self.clock_start,
             "clock_end": self.clock_end,
             "requests": [r.to_dict() for r in self.requests],
             "agent_node_visits": {
-                agent_name: [v.to_dict() for v in visits]
+                agent_name: [v.to_dict() for v in self._clean_visits(visits)]
                 for agent_name, visits in self.agent_node_visits.items()
             },
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> WorkdayLog:
+        agent_node_visits: dict[str, list[AgentNodeVisit]] = {}
+        for a_name, visits in data["agent_node_visits"].items():
+            node_visits = [AgentNodeVisit.from_dict(v) for v in visits]
+            agent_node_visits[a_name] = WorkdayLog._clean_visits(node_visits)
         return cls(
             clock_start=data["clock_start"],
             clock_end=data["clock_end"],
             requests=[RequestRecord.from_dict(r) for r in data["requests"]],
-            agent_node_visits={
-                agent_name: [AgentNodeVisit.from_dict(v) for v in visits]
-                for agent_name, visits in data["agent_node_visits"].items()
-            },
+            agent_node_visits=agent_node_visits,
         )
 
 

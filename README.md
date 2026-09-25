@@ -179,6 +179,7 @@ To generate the exact results reported in the paper, run the following commands
 cd benchmarks
 
 python3 run_ablation_suite.py \
+  --outdir ablation_suite \
   --request-counts 10 30 60 \
   --agent-counts 1 2 \
   --types R C M \
@@ -186,15 +187,17 @@ python3 run_ablation_suite.py \
   --nr-repeats 1    # insertion ablation
 
 python3 run_suite.py \
+  --outdir single_suite \
   --sizes S M L \
   --types R C M \
   --timings L T \
   --soc-test normal \
   --nr-repeats 2 \
   --solver-name gurobi \
-  --solver-config-type gurobi   # suite
+  --solver-config-type gurobi   # single scenario suite
 
 python3 run_workday_suite.py \
+  --outdir workday_suite \
   --timings L T \
   --start-times N S \
   --base-rates 5 8 \
@@ -204,7 +207,7 @@ python3 run_workday_suite.py \
   --plots     # multiple workdays with plots
 
 python3 run_suite.py \
-  --outdir results_plots \
+  --outdir single_plots \
   --sizes L \
   --types M \
   --timings T \

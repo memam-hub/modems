@@ -188,7 +188,7 @@ class SocRangeSpec:
     @property
     def suffix(self) -> str:
         """Scenario/point name suffix, e.g., "80_100" """
-        return f"{int(self.lb * 100)}_{int(self.ub * 100)}"
+        return f"{round(self.lb * 100)}_{round(self.ub * 100)}"
 
     @property
     def label(self) -> str:

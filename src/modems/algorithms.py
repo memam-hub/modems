@@ -213,10 +213,11 @@ def milp_feasible_insertions(
     extended_soc = ctx.strategy.has_extended_soc()
     for journey in compatible_journeys:
         if not soft_tw:
-            # assert hard pickup arrival time
+            # assert hard pickup deadline; arriving early is fine (the agent waits
+            # until earliest_pickup during propagation)
             last_d = journey.states[-2]
             t_arr_p = last_d.t_dep + ctx.t_travel(last_d.node, p_name)
-            if not (request.earliest_pickup <= t_arr_p <= request.latest_pickup):
+            if t_arr_p > request.latest_pickup:
                 continue
         # copy journey, replace the final depot with (p, d, re-opt depot)
         candidate = journey.copy()
@@ -787,7 +788,16 @@ def alns_feasible_insertions(
     used by the insertion-ablation harness (modems.insertion_ablation) to compare
     this implementation against less-optimized variants. Does not impact the results
     nor incurs cost when left as the default None
+
+    Only valid for SolverStrategy.alns: the propagation encodes ALNS timing rules
+    (no service before e^r, tardiness-only tau). Raises ValueError otherwise; use
+    milp_feasible_insertions() for the MILP strategies
     """
+    if solution.ctx.strategy != SolverStrategy.alns:
+        raise ValueError(
+            "alns_feasible_insertions() requires SolverStrategy.alns, got "
+            f"{solution.ctx.strategy}"
+        )
     return _InsertionEnumerator(
         solution,
         unassigned_name,

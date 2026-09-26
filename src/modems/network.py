@@ -398,8 +398,8 @@ class RoadNetwork:
             "tab:red",
             "tab:purple",
             "tab:orange",
-            "tab:darkgreen",
-            "tab:darkblue",
+            "darkgreen",
+            "darkblue",
         ]
         return a_colors[idx % len(a_colors)]
 
@@ -729,7 +729,7 @@ class RoadNetwork:
                 edgecolor="k",
                 facecolor="w",
             )
-        if outfile is not None:
+        if outfile:
             plt.savefig(outfile, bbox_inches="tight", dpi=300)
         if show:
             plt.show()

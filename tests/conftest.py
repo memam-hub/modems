@@ -1,38 +1,55 @@
 """
-Shared pytest fixtures used across the test suite.
-
-Scenario fixtures are intentionally tiny (1-2 agents, 2-5 requests): solver-facing
-tests (test_milp.py, test_alns.py, test_benchmark.py, test_rolling_horizon.py)
-run the real CBC/HiGHS/alns backends, so keeping instances small is what makes the
-integration-marked tests fast enough to run routinely rather than only in CI.
+Shared fixtures. Solver-facing tests keep instances tiny (1-2 agents, 2-5 requests)
+so the integration-marked tests (real CBC/HiGHS/alns backends) stay fast enough to
+run on every change. Deterministic builders live in tests/builders.py
 """
 
 from __future__ import annotations
 
-from typing import Any
+import os
 
-import pytest
+os.environ.setdefault("MPLBACKEND", "Agg")  # headless plotting, before pyplot loads
 
-from modems.core import ModemsScenario
-from modems.generator import ModemsScenarioGenerator
-from modems.solution import DEFAULT_PARAMS_MILP
+from typing import Any  # noqa: E402
+
+import pytest  # noqa: E402
+
+from modems.core import ModemsScenario  # noqa: E402
+from modems.solution import DEFAULT_PARAMS_MILP  # noqa: E402
+
+from .builders import generated  # noqa: E402
 
 
 @pytest.fixture
 def default_model_params() -> dict[str, Any]:
-    """Return a fresh copy of the shared model-penalty parameter dict"""
+    """Fresh copy of the default MILP parameter dict"""
     return dict(DEFAULT_PARAMS_MILP)
 
 
 @pytest.fixture
 def small_scenario() -> ModemsScenario:
-    """Build a small (2 agents, 3 requests) seeded scenario for unit tests"""
-    gen = ModemsScenarioGenerator(seed=1)
-    return gen.generate_random_scenario(nr_agents=2, nr_requests=3)
+    """Seeded scenario with 2 agents and 3 requests"""
+    return generated(seed=1, nr_agents=2, nr_requests=3)
 
 
 @pytest.fixture
 def tiny_scenario() -> ModemsScenario:
-    """Build a minimal (1 agent, 2 requests) seeded scenario for solver tests"""
-    gen = ModemsScenarioGenerator(seed=1)
-    return gen.generate_random_scenario(nr_agents=1, nr_requests=2)
+    """Seeded scenario with 1 agent and 2 requests, for real solver calls"""
+    return generated(seed=1, nr_agents=1, nr_requests=2)
+
+
+@pytest.fixture(autouse=True)
+def fast_plots(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Figures are saved at 300 dpi in production; tests only need the file"""
+    import matplotlib.figure
+    import matplotlib.pyplot as plt
+
+    save_plt, save_fig = plt.savefig, matplotlib.figure.Figure.savefig
+    monkeypatch.setattr(
+        plt, "savefig", lambda *a, **k: save_plt(*a, **{**k, "dpi": 10})
+    )
+    monkeypatch.setattr(
+        matplotlib.figure.Figure,
+        "savefig",
+        lambda self, *a, **k: save_fig(self, *a, **{**k, "dpi": 10}),
+    )

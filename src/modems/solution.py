@@ -230,7 +230,7 @@ class ModemsJourney:
         v_k = ctx.agent_initial_node[agent_name]
         if v_k != route[0]:
             raise ValueError(
-                f"Inconsistent starting nodes agent {agent_name} should start at {v_k}"
+                f"inconsistent starting nodes agent {agent_name} should start at {v_k}"
                 f"but the route starts at {route[0]}"
             )
         agent = ctx.agents[agent_name]

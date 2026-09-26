@@ -1,291 +1,328 @@
+"""
+Tests for modems.alns. Operator tests call each destroy/repair operator directly on
+a greedy solution and check what every ALNS state must keep: feasible journeys, with 
+routed requests equal to the accepted set, and accepted/rejected request partitioning. 
+Integration tests run the full search through the alns package
+"""
+
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 
+import numpy as np
 import pytest
 
-from modems import ModemsAlns, ModemsInstance, ModemsScenario, ModemsScenarioGenerator
-from modems.algorithms import greedy_complete, preprocess
-from modems.core import ProblemContext, ProblemType, SolverStrategy
-from modems.solution import ModemsSolution, SolutionStatus
+from modems.alns import ModemsAlns
+from modems.core import ModemsAgent, ModemsRequest, ModemsScenario
+from modems.solution import (
+    ModemsInstance,
+    ModemsJourney,
+    ModemsSolution,
+    SolutionStatus,
+)
 
-PARAMS_OBJ: dict = {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 2.5, "omega": 5.0}
-PARAMS_RW: dict = {"scores": [5, 2, 1, 0.5], "decay": 0.8}
-PARAMS_SA: dict = {"start_temp": 1000, "end_temp": 0.1, "cooling_rate": 0.995}
+from .builders import generated, line_network, line_scenario, make_ctx
 
-
-def _solve(
-    scenario: ModemsScenario,
-    seed: int = 1,
-    max_iter: int = 300,
-    partial_plan: ModemsSolution | None = None,
-    problem_type: ProblemType = ProblemType.closed_selective,
-) -> ModemsAlns:
-    """Build and run a ModemsAlns search end to end via the real alns package."""
-    model_alns = ModemsAlns(
-        scenario, problem_type=problem_type, model_params=PARAMS_OBJ
-    )
-    model_alns.solve(
-        params_rw=PARAMS_RW,
-        params_sa=PARAMS_SA,
-        seed=seed,
-        max_iter=max_iter,
-        partial_plan=partial_plan,
-    )
-    return model_alns
+DESTROY_OPS = [
+    "destroy_random",
+    "destroy_random_zone",
+    "destroy_lowest_demand",
+    "destroy_worst_cost",
+    "destroy_worst_waiting",
+    "destroy_worst_energy",
+]
+REPAIR_OPS = [
+    "repair_random",
+    "repair_greedy",
+    "repair_regret_2",
+    "repair_longest_trip",
+    "repair_most_constrained",
+]
 
 
-def _scheduled_partial_plan(scenario: ModemsScenario) -> ModemsSolution:
-    """Place every scheduled request via direct insertion to build a partial plan."""
-    ctx = ProblemContext(
-        scenario,
-        ProblemType.closed_selective,
-        SolverStrategy.alns,
-        PARAMS_OBJ,
-    )
-    base_sol = ModemsSolution(ctx)
-    for r_name in ctx.request_names:
-        if not ctx.requests[r_name].is_scheduled():
-            continue
-        for agent_name in ctx.agent_names:
-            candidate = base_sol.journeys[agent_name]._append_request_direct(r_name)
-            if candidate is not None:
-                base_sol.journeys[agent_name] = candidate
-                base_sol.accepted.add(r_name)
-                break
-        else:
-            raise AssertionError("test fixture could not place scheduled request")
-    return base_sol
+def assert_consistent(state: ModemsSolution) -> None:
+    ctx = state.ctx
+    assert all(journey._is_feasible() for journey in state.journeys.values())
+    routed = [r for journey in state.journeys.values() for r in journey.request_pickup]
+    assert len(routed) == len(set(routed))
+    assert set(routed) == state.accepted
+    assert state.accepted.isdisjoint(state.rejected)
+    assert state.accepted | state.rejected == set(ctx.request_names)
 
 
 @pytest.fixture
-def small_scenario() -> ModemsScenario:
-    """Override conftest's small_scenario: ALNS needs more requests to have
-    real destroy/repair room to work with (2 agents, 5 requests, seed=1)."""
-    generator = ModemsScenarioGenerator(seed=1)
-    return generator.generate_random_scenario(nr_agents=2, nr_requests=5)
+def alns_and_state() -> tuple[ModemsAlns, ModemsSolution]:
+    """ALNS wrapper and its greedy initial state on a 2-agent, 10-request scenario"""
+    alns = ModemsAlns(generated(5, nr_agents=2, nr_requests=10))
+    state = alns._create_initial_solution()
+    assert len(state.accepted) >= 5
+    return alns, state
 
 
 # --------------------------------------------------------------------------------------
-# Basic solve correctness
+# Construction and argument validation
 # --------------------------------------------------------------------------------------
 
 
-@pytest.mark.integration
-def test_alns_solves_and_produces_feasible_solution(
-    small_scenario: ModemsScenario,
+@pytest.mark.parametrize("ptype", ["closed_non_selective", "open_non_selective"])
+def test_alns_rejects_non_selective_problems(ptype: str) -> None:
+    with pytest.raises(ValueError, match="selective"):
+        ModemsAlns(line_scenario([ModemsRequest(1, 2)]), ptype)
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"params_rd": {"min_pct": 0.5, "max_pct": 0.4}}, "destroy percentages"),
+        ({"params_rd": {"min_pct": 0.0}}, "destroy percentages"),
+        ({"params_rd": {"max_pct": 1.0}}, "destroy percentages"),
+        ({"max_iter": 0}, "iterations"),
+    ],
+)
+def test_solve_rejects_invalid_search_parameters(kwargs: dict, match: str) -> None:
+    alns = ModemsAlns(line_scenario([ModemsRequest(1, 2)]))
+    with pytest.raises(ValueError, match=match):
+        alns.solve(seed=1, **kwargs)
+
+
+def test_scheduled_requests_require_a_partial_plan() -> None:
+    scenario = line_scenario([ModemsRequest(1, 2, status="scheduled")])
+    with pytest.raises(RuntimeError, match="Infeasible base plan"):
+        ModemsAlns(scenario).solve(seed=1)
+
+
+def test_solve_before_plotting_raises() -> None:
+    alns = ModemsAlns(line_scenario([ModemsRequest(1, 2)]))
+    with pytest.raises(NameError):
+        alns.plot_routes(show=False)
+    with pytest.raises(NameError):
+        alns.plot_metrics("unused", "unused")
+
+
+# --------------------------------------------------------------------------------------
+# Trivial instances (the search is never run)
+# --------------------------------------------------------------------------------------
+
+
+def test_no_requests_returns_the_idle_fleet_without_searching() -> None:
+    alns = ModemsAlns(line_scenario([]))
+    assert alns.solve(seed=1) is None
+    info = alns.instance.solution_info
+    assert (info.status, info.objective) == (SolutionStatus.optimal, 0.0)
+    assert info.solver_diagnostics == {"iterations": 0}
+    assert alns.result is None
+
+
+def test_no_agents_rejects_every_request_without_searching() -> None:
+    requests = [
+        ModemsRequest(1, 2, request_id="a"),
+        ModemsRequest(2, 3, request_id="b"),
+    ]
+    alns = ModemsAlns(ModemsScenario([], requests, line_network([0.0, 1.0, 2.0, 3.0])))
+    assert alns.solve(seed=1) is None
+    assert alns.instance.solution.rejected == {"request_1", "request_2"}
+    assert alns.instance.solution_info.objective == 2 * alns.ctx.eta
+
+
+# --------------------------------------------------------------------------------------
+# Destroy operators
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("pct", [(0.1, 0.2), (0.2, 0.4), (0.5, 0.9)])
+def test_destroy_size_is_a_fraction_of_accepted_at_least_one(pct: tuple) -> None:
+    alns = ModemsAlns(line_scenario([ModemsRequest(1, 2)]))
+    alns._destroy_min_pct, alns._destroy_max_pct = pct
+    rng = np.random.default_rng(0)
+    state = ModemsSolution(alns.ctx)
+    assert alns._destroy_size(state, rng) == 0
+    state.accepted = {f"request_{i}" for i in range(10)}
+    sizes = {alns._destroy_size(state, rng) for _ in range(200)}
+    assert min(sizes) >= max(1, int(pct[0] * 10)) and max(sizes) <= int(pct[1] * 10)
+
+
+@pytest.mark.parametrize("operator", DESTROY_OPS)
+def test_destroy_removes_requests_and_keeps_the_state_consistent(
+    alns_and_state: tuple[ModemsAlns, ModemsSolution], operator: str
 ) -> None:
-    """A full ALNS search on the real alns package yields a feasible solution."""
-    model_alns = _solve(small_scenario)
-    best_sol = model_alns.best_solution
-    assert best_sol.accepted | best_sol.rejected == set(best_sol.ctx.request_names)
-    for j in best_sol.journeys.values():
-        assert j._is_feasible()
+    alns, state = alns_and_state
+    snapshot = state.to_dict()
+    for seed in range(5):
+        rng = np.random.default_rng(seed)
+        expected = alns._destroy_size(state, np.random.default_rng(seed))
+        destroyed = getattr(alns, operator)(state, rng)
+        removed = state.accepted - destroyed.accepted
+        assert destroyed.accepted <= state.accepted
+        assert len(removed) >= expected  # random-zone can remove a whole station
+        assert_consistent(destroyed)
+    assert state.to_dict() == snapshot  # operators never mutate their input
 
 
-@pytest.mark.integration
-def test_alns_reports_no_bounds() -> None:
-    """ALNS proves no lower/upper bound, so both stay None (never 0.0/objective --
-    that would misreport a specific, meaningless duality gap for every result)."""
-    scenario = ModemsScenarioGenerator(seed=1).generate_random_scenario(
-        nr_agents=1, nr_requests=2
-    )
-    model_alns = _solve(scenario, max_iter=20)
-    info = model_alns.instance.solution_info
-    assert info.lower_bound is None
-    assert info.upper_bound is None
+@pytest.mark.parametrize("operator", DESTROY_OPS)
+def test_destroy_on_an_empty_solution_is_a_copy(operator: str) -> None:
+    alns = ModemsAlns(line_scenario([ModemsRequest(1, 2)]))
+    state = ModemsSolution(alns.ctx)
+    state.recompute_rejected()
+    destroyed = getattr(alns, operator)(state, np.random.default_rng(0))
+    assert destroyed is not state and destroyed.to_dict() == state.to_dict()
 
 
-@pytest.mark.integration
-def test_alns_never_regresses_below_constructive(
-    small_scenario: ModemsScenario,
+def test_lowest_demand_removes_the_smallest_loads_first() -> None:
+    requests = [
+        ModemsRequest(i, i + 1, load=load, earliest_pickup=10.0 * i, request_id=str(i))
+        for i, load in zip(range(1, 5), [3, 1, 2, 1])
+    ]
+    alns = ModemsAlns(line_scenario(requests, positions=[float(i) for i in range(7)]))
+    state = alns._create_initial_solution()
+    assert state.accepted == set(alns.ctx.request_names)
+    alns._destroy_min_pct, alns._destroy_max_pct = 0.5, 0.6  # removes exactly 2
+    destroyed = alns.destroy_lowest_demand(state, np.random.default_rng(0))
+    assert state.accepted - destroyed.accepted == {"request_2", "request_4"}
+
+
+# --------------------------------------------------------------------------------------
+# Repair operators
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("repair", REPAIR_OPS)
+@pytest.mark.parametrize("destroy", ["destroy_random", "destroy_worst_cost"])
+def test_repair_restores_a_consistent_state_without_loosing_insertable_requests(
+    alns_and_state: tuple[ModemsAlns, ModemsSolution], destroy: str, repair: str
 ) -> None:
-    """The best ALNS objective never exceeds the constructive objective."""
-    model_alns = _solve(small_scenario, max_iter=300)
-    ctx = ProblemContext(
-        small_scenario,
-        ProblemType.closed_selective,
-        SolverStrategy.alns,
-        PARAMS_OBJ,
-    )
-    base_plan, r_unassigned = preprocess(ctx)
-    assert base_plan is not None
-    sol, _, _ = greedy_complete(base_plan, r_unassigned)
-    sol_obj = sol.objective()
-    assert model_alns.best_solution.objective() <= sol_obj + 1e-9
+    alns, state = alns_and_state
+    for seed in range(3):
+        destroyed = getattr(alns, destroy)(state, np.random.default_rng(seed))
+        repaired = getattr(alns, repair)(destroyed, np.random.default_rng(seed))
+        assert_consistent(repaired)
+        assert destroyed.accepted <= repaired.accepted
+        # repair stops only when no pending request has a feasible insertion (left)
+        for r in repaired.rejected:
+            assert not alns_feasible(repaired, r)
 
 
-# --------------------------------------------------------------------------------------
-# Determinism
-# --------------------------------------------------------------------------------------
+def alns_feasible(state: ModemsSolution, request_name: str) -> bool:
+    from modems.algorithms import alns_feasible_insertions
+
+    return bool(alns_feasible_insertions(state, request_name))
 
 
-@pytest.mark.integration
-def test_alns_is_deterministic_given_fixed_seed(
-    small_scenario: ModemsScenario,
+@pytest.mark.parametrize("repair", REPAIR_OPS)
+def test_repair_restores_scheduled_requests_or_marks_state_infeasible(
+    repair: str,
 ) -> None:
-    """Two runs with the same seed produce the same objective and routes."""
-    model_alns_1 = _solve(small_scenario, seed=7, max_iter=300)
-    model_alns_2 = _solve(small_scenario, seed=7, max_iter=300)
-    assert (
-        model_alns_1.best_solution.objective() == model_alns_2.best_solution.objective()
-    )
-    assert (
-        model_alns_1.best_solution.get_agent_routes()
-        == model_alns_2.best_solution.get_agent_routes()
-    )
+    """Scheduled requests must be re-inserted; otherwise, the state is discarded"""
+    requests = [
+        ModemsRequest(
+            1, 3, load=2, earliest_pickup=5.0, status="scheduled", request_id="s"
+        ),
+        ModemsRequest(2, 4, earliest_pickup=6.0, request_id="n"),
+    ]
+    alns = ModemsAlns(line_scenario(requests))
+    route = ["a_1_h_1", "r_1_p_1", "r_1_d_3", "h_1"]
+    plan = ModemsSolution(alns.ctx)
+    plan.journeys["agent_1"] = ModemsJourney.from_route(alns.ctx, "agent_1", route)
+    plan.accepted = {"request_1"}
+    state = alns._create_initial_solution(partial_plan=plan)
+
+    destroyed = alns._remove_requests(state, ["request_1"])
+    repaired = getattr(alns, repair)(destroyed, np.random.default_rng(0))
+    assert "request_1" in repaired.accepted and not repaired._infeasible
+
+    blocked = destroyed.copy()  # the agent can no longer seat the scheduled rider
+    blocked.journeys["agent_1"].agent = ModemsAgent("h", 1, load_max=1)
+    repaired = getattr(alns, repair)(blocked, np.random.default_rng(0))
+    assert repaired._infeasible and repaired.objective() >= 1e37
 
 
 # --------------------------------------------------------------------------------------
-# Empty agents/requests -- optimizer must not be invoked
-# --------------------------------------------------------------------------------------
-
-
-def test_alns_empty_requests_never_runs_search(small_scenario: ModemsScenario) -> None:
-    """A scenario with zero requests short-circuits without running alns.iterate()."""
-    empty_scenario = ModemsScenario(
-        agents=small_scenario.agents, requests=[], network=small_scenario.network
-    )
-    model_alns = _solve(empty_scenario)
-    assert model_alns.instance.solution_info.status == SolutionStatus.optimal
-    assert model_alns.instance.solution_info.objective == 0.0
-
-
-def test_alns_empty_agents_rejects_everyone(small_scenario: ModemsScenario) -> None:
-    """A scenario with zero agents rejects every request without running the search."""
-    empty_scenario = ModemsScenario(
-        agents=[], requests=small_scenario.requests, network=small_scenario.network
-    )
-    model_alns = _solve(empty_scenario)
-    assert model_alns.instance.solution_info.status == SolutionStatus.optimal
-    assert model_alns.instance.solution_info.objective == PARAMS_OBJ["eta"] * len(
-        small_scenario.requests
-    )
-
-
-# --------------------------------------------------------------------------------------
-# timed partial-plan excerpt
+# Integration: full search
 # --------------------------------------------------------------------------------------
 
 
 @pytest.mark.integration
-def test_alns_solves_with_scheduled_requests_given_partial_plan() -> None:
-    """A scheduled request carried via partial_plan remains accepted after solving."""
-    generator = ModemsScenarioGenerator(seed=5)
-    scenario = generator.generate_random_scenario(
-        nr_agents=2, nr_requests=3, nr_scheduled=1
+def test_search_finds_the_single_request_optimum() -> None:
+    """Same hand-built instance as the MILP optimum test: 20.24 (closed)"""
+    alns = ModemsAlns(
+        line_scenario([ModemsRequest(2, 5, load=2, earliest_pickup=10.0)])
     )
-    a = _solve(scenario, partial_plan=_scheduled_partial_plan(scenario))
-    assert "request_1" in a.best_solution.accepted
-
-
-def test_alns_fails_without_partial_plan_when_scheduled_present() -> None:
-    """solve() raises RuntimeError if scheduled requests exist with no partial_plan."""
-    generator = ModemsScenarioGenerator(seed=5)
-    scenario = generator.generate_random_scenario(
-        nr_agents=2, nr_requests=3, nr_scheduled=1
-    )
-    with pytest.raises(RuntimeError):
-        _solve(scenario, partial_plan=None)
-
-
-# ---------------------------------------------------------------------------
-# JSON round-trip
-# ---------------------------------------------------------------------------
+    alns.solve(seed=1, max_iter=20)
+    assert alns.instance.solution_info.objective == pytest.approx(20.24)
 
 
 @pytest.mark.integration
-def test_alns_instance_round_trips_exactly(small_scenario: ModemsScenario) -> None:
-    """to_dict()/from_dict() on a solved instance preserve objective and routes."""
-    a = _solve(small_scenario)
-    d = a.instance.to_dict()
-    inst2 = ModemsInstance.from_dict(d)
-    assert inst2.solution.objective() == pytest.approx(
-        a.best_solution.objective(), abs=1e-9
-    )
-    assert inst2.solution.get_agent_routes() == a.best_solution.get_agent_routes()
-
-
-# --------------------------------------------------------------------------------------
-# Determinism regression: destroy operators sorting by a tie-prone key directly on the
-# the raw (hash-ordered) accepted set, without a total-order tie-breaker, silently
-# reintroduced hash-randomization-dependent behavior despite using sorted()
-# --------------------------------------------------------------------------------------
+@pytest.mark.parametrize("objective", ["closed", "open"])
+def test_search_improves_on_construction_and_stays_consistent(objective: str) -> None:
+    scenario = generated(5, nr_agents=2, nr_requests=10)
+    alns = ModemsAlns(scenario, make_ctx(scenario, objective=objective).problem_type)
+    initial = alns._create_initial_solution().objective()
+    alns.solve(seed=3, max_iter=100)
+    info = alns.instance.solution_info
+    assert_consistent(alns.best_solution)
+    assert info.status is SolutionStatus.feasible
+    assert info.objective == pytest.approx(alns.best_solution.objective())
+    assert info.objective <= initial + 1e-9
+    assert info.lower_bound is info.upper_bound is None
+    assert info.solver_diagnostics["iterations"] >= 100
+    assert info.solver_options["seed"] == 3 and info.solver_options["max_iter"] == 100
 
 
 @pytest.mark.integration
-def test_alns_full_solve_is_deterministic_across_process_launches() -> None:
-    """
-    Runs the exact same ModemsAlns.solve() in fresh subprocesses (not just
-    within one Python process) and asserts identical routes every time --
-    this is the only way to actually catch PYTHONHASHSEED-dependent bugs,
-    since hash randomization only varies BETWEEN process launches.
-    """
+def test_search_keeps_scheduled_requests_from_the_partial_plan() -> None:
+    scenario = generated(5, nr_agents=2, nr_requests=6, nr_scheduled=2)
+    ctx = make_ctx(scenario)
+    plan = ModemsSolution(ctx)
+    for r in ("request_1", "request_2"):
+        for k in ctx.agent_names:
+            candidate = plan.journeys[k]._append_request_direct(r)
+            if candidate is not None:
+                plan.journeys[k] = candidate
+                plan.accepted.add(r)
+                break
+    assert plan.accepted == {"request_1", "request_2"}
+    alns = ModemsAlns(scenario)
+    alns.solve(seed=1, max_iter=50, partial_plan=plan)
+    assert {"request_1", "request_2"} <= alns.best_solution.accepted
+    assert_consistent(alns.best_solution)
+
+
+@pytest.mark.integration
+def test_search_is_seed_reproducible_and_round_trips(tmp_path) -> None:
+    scenario = generated(42, nr_agents=2, nr_requests=8)
+    runs = []
+    for _ in range(2):
+        alns = ModemsAlns(scenario)
+        alns.solve(seed=7, max_iter=60)
+        runs.append(alns)
+    assert runs[0].best_solution.to_dict() == runs[1].best_solution.to_dict()
+    instance = runs[0].instance
+    restored = ModemsInstance.from_json(instance.to_json(str(tmp_path / "alns.json")))
+    assert restored.to_dict() == instance.to_dict()
+    runs[0].plot_metrics(str(tmp_path), "run")
+    assert (tmp_path / "run_objectives.png").exists()
+
+
+@pytest.mark.integration
+def test_search_is_independent_of_the_python_hash_seed() -> None:
+    """Set iteration order varies with PYTHONHASHSEED, only across processes"""
     script = (
-        "from modems import ModemsScenarioGenerator, ModemsAlns\n"
-        "generator = ModemsScenarioGenerator(seed=42)\n"
-        "scenario = generator.generate_random_scenario(nr_agents=2, nr_requests=8)\n"
-        "a = ModemsAlns(scenario, model_params="
-        "{'eps':0.01,'zeta':1.0,'eta':100.0,'rho':2.0})\n"
-        "a.solve("
-        " params_rw={'scores':[5,2,1,0.5],'decay':0.8},"
-        " params_sa={'start_temp':1000,'end_temp':0.1,'cooling_rate':0.995},"
-        " seed=42, max_iter=400)\n"
-        "for k in sorted(a.best_solution.journeys.keys()):\n"
-        "    print(k, a.best_solution.journeys[k].route)\n"
+        "from modems import ModemsAlns, ModemsScenarioGenerator\n"
+        "s = ModemsScenarioGenerator(seed=42).generate_random_scenario(2, 8)\n"
+        "a = ModemsAlns(s)\n"
+        "a.solve(seed=42, max_iter=60)\n"
+        "print(sorted(a.best_solution.get_agent_routes().items()))\n"
     )
-    outputs = set()
-    for _ in range(4):
-        result = subprocess.run(
+    outputs = {
+        subprocess.run(
             [sys.executable, "-c", script],
             capture_output=True,
             text=True,
-            timeout=60,
-        )
-        assert result.returncode == 0, result.stderr
-        outputs.add(result.stdout)
-    assert len(outputs) == 1, f"non-deterministic across process launches: {outputs}"
-
-
-def test_destroy_sort_keys_are_total_orders_even_with_ties() -> None:
-    """
-    destroy_lowest_demand/destroy_worst_waiting sort state.accepted (a set) directly
-    by a key that plausibly ties (small integer load range; wait is often exactly 0.0).
-    Abare sorted(some_set, key=...) without a tie-breaker is only deterministic if the
-    key never ties, since sorted()'s stability otherwise falls back to the set
-    hash-randomized iteration order
-    """
-    generator = ModemsScenarioGenerator(seed=5)
-    scenario = generator.generate_random_scenario(nr_agents=2, nr_requests=10)
-    params = {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 2.0, "omega": 5.0}
-    ctx = ProblemContext(
-        scenario, ProblemType.closed_selective, SolverStrategy.alns, params
-    )
-    base_plan, r_unassigned = preprocess(ctx)
-    assert base_plan is not None
-    ctx = base_plan.ctx
-    sol, _, _ = greedy_complete(base_plan, r_unassigned)
-
-    # deliberately force real ties: two requests with identical load
-    loads = [ctx.requests[r].load for r in sol.accepted]
-    assert len(set(loads)) < len(
-        loads
-    ), "fixture needs at least one load tie to be meaningful"
-
-    load_keys = [(ctx.requests[r].load, r) for r in sol.accepted]
-    assert len(set(load_keys)) == len(
-        load_keys
-    ), "load+name key must be a total order (no duplicates)"
-
-    def wait_of(r: str) -> float:
-        """Return this request's pickup waiting time in the current solution."""
-        k = sol.agent_of(r)
-        j = sol.journeys[k]
-        p_idx = j.request_pickup[r]
-        return j.states[p_idx].t_wait
-
-    wait_keys = [(wait_of(r), r) for r in sol.accepted]
-    assert len(set(wait_keys)) == len(
-        wait_keys
-    ), "wait+name key must be a total order (no duplicates)"
+            timeout=120,
+            env={**os.environ, "PYTHONHASHSEED": hash_seed},
+            check=True,
+        ).stdout
+        for hash_seed in ("0", "1", "2")
+    }
+    assert len(outputs) == 1

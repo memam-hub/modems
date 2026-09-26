@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from typing import Any
 
 import pytest
@@ -15,17 +14,28 @@ from modems import (
     compare_solvers_over_workdays,
 )
 from modems.algorithms import greedy_complete, preprocess
-from modems.core import ModemsRequest, ProblemContext, RequestStatus, SolverStrategy
+from modems.core import (
+    ModemsRequest,
+    ObjectiveType,
+    ProblemContext,
+    RequestStatus,
+    SolverStrategy,
+)
 from modems.network import NetworkNodeType
 from modems.rolling_horizon import (
     PLANNING_HORIZON_P,
     REPLANNING_THRESHOLD_W,
     SOC_CHARGE_TARGET,
     AgentAdvanceResult,
+    AgentNodeVisit,
     AgentOperationalState,
     EpochLog,
+    RequestOutcome,
+    WorkdayLog,
+    _append_merge_visit,
     _collect_request_metrics,
     advance_agent_state,
+    build_workday_log,
     charging_duration_min,
     summarize_workday,
 )
@@ -33,7 +43,6 @@ from modems.solution import (
     DEFAULT_PARAMS_MILP,
     ModemsInstance,
     ModemsJourney,
-    ModemsSolution,
     ModemsSolutionInfo,
     NodeState,
     SolutionStatus,
@@ -44,36 +53,22 @@ from modems.solution import (
 # --------------------------------------------------------------------------------------
 
 
-def test_agent_operational_state_is_string_enum() -> None:
-    """AgentOperationalState members equal and stringify to literal values"""
-    assert AgentOperationalState.available == "available"
-    assert str(AgentOperationalState.charging) == "charging"
-
-
-def test_charging_full_cycle_is_five_hours() -> None:
-    """A full 0%->100% charge takes exactly the calibrated 5 hours"""
-    assert math.isclose(charging_duration_min(0.0, 1.0), 300.0, abs_tol=1e-6)
-
-
-def test_charging_cc_segment() -> None:
-    """The constant-current segment (below 80%) uses the higher charge rate"""
-    assert math.isclose(charging_duration_min(0.4, 0.8), 100.0, abs_tol=1e-6)
-
-
-def test_charging_cv_segment() -> None:
-    """The constant-voltage segment (above 80%) uses the lower charge rate"""
-    assert math.isclose(charging_duration_min(0.8, 1.0), 100.0, abs_tol=1e-6)
-
-
-def test_charging_mixed_segment() -> None:
-    """A charge spanning both segments sums both charge rate durations"""
-    assert math.isclose(charging_duration_min(0.0, 0.8), 200.0, abs_tol=1e-6)
-
-
-def test_charging_no_op_when_already_there() -> None:
-    """charging_duration_min() is 0 whenever soc_to is at or below soc_from"""
-    assert charging_duration_min(0.8, 0.8) == 0.0
-    assert charging_duration_min(0.9, 0.5) == 0.0
+@pytest.mark.parametrize(
+    "soc_from, soc_to, minutes",
+    [
+        (0.0, 1.0, 300.0),  # full cycle: 0.8 / 0.24 h + 0.2 / 0.12 h = 5 h
+        (0.2, 0.5, 75.0),  # below 80%: 0.24 SoC/h
+        (0.85, 0.95, 50.0),  # above 80%: 0.12 SoC/h
+        (0.7, 0.9, 75.0),  # 25 min + 50 min across the split
+        (0.9, 0.9, 0.0),
+        (0.9, 0.5, 0.0),
+        (-0.5, 1.5, 300.0),  # clamped to [0, 1]
+    ],
+)
+def test_charging_duration_follows_the_two_rate_model(
+    soc_from: float, soc_to: float, minutes: float
+) -> None:
+    assert charging_duration_min(soc_from, soc_to) == pytest.approx(minutes)
 
 
 # --------------------------------------------------------------------------------------
@@ -431,143 +426,8 @@ def test_waiting_decision_uses_remaining_not_original_wait(
 
 
 # --------------------------------------------------------------------------------------
-# preprocess() with a timed partial-plan excerpt
+# Epoch-to-epoch scenario excerpt
 # --------------------------------------------------------------------------------------
-
-
-def _scheduled_partial_plan(
-    scenario: Any, strategy: SolverStrategy = SolverStrategy.alns
-) -> ModemsSolution:
-    """Place every scheduled request via direct insertion to build a partial plan"""
-    ctx = ProblemContext(
-        scenario,
-        ProblemType.closed_selective,
-        strategy,
-        DEFAULT_PARAMS_MILP,
-    )
-    plan = ModemsSolution(ctx)
-    for request_name in ctx.request_names:
-        if not ctx.requests[request_name].is_scheduled():
-            continue
-        for agent_name in ctx.agent_names:
-            candidate = plan.journeys[agent_name]._append_request_direct(request_name)
-            if candidate is not None:
-                plan.journeys[agent_name] = candidate
-                plan.accepted.add(request_name)
-                break
-        else:
-            raise AssertionError("test fixture could not place scheduled request")
-    return plan
-
-
-def test_preprocess_requires_partial_plan_when_scheduled_present() -> None:
-    """preprocess() returns solution=None if a scheduled request has no partial_plan"""
-    generator = ModemsScenarioGenerator(seed=5)
-    scenario = generator.generate_random_scenario(
-        nr_agents=2, nr_requests=3, nr_scheduled=1
-    )
-
-    ctx = ProblemContext(
-        scenario, ProblemType.open_selective, SolverStrategy.alns, DEFAULT_PARAMS_MILP
-    )
-    solution, unassigned = preprocess(ctx)
-    assert solution is None
-    assert unassigned == {"request_2", "request_3"}
-
-
-def test_preprocess_inserts_scheduled_request_via_partial_plan() -> None:
-    """A scheduled request carried via partial_plan is accepted by preprocess()"""
-    generator = ModemsScenarioGenerator(seed=5)
-    scenario = generator.generate_random_scenario(
-        nr_agents=2, nr_requests=3, nr_scheduled=1
-    )
-
-    partial_plan = _scheduled_partial_plan(scenario)
-    ctx = ProblemContext(
-        scenario,
-        ProblemType.closed_selective,
-        SolverStrategy.alns,
-        DEFAULT_PARAMS_MILP,
-    )
-    sol, unassigned = preprocess(ctx, partial_plan=partial_plan)
-    assert sol is not None
-    assert "request_1" in sol.accepted
-    assert unassigned == {"request_2", "request_3"}
-
-    sol2, rejected, ok2 = greedy_complete(sol, list(unassigned))
-    assert ok2 is True
-    assert "request_1" in sol2.accepted  # still accepted after Algorithm 2 runs
-
-
-def test_preprocess_preserves_partial_route_and_milp3_timing() -> None:
-    """preprocess() preserves exact service-start times/slack from an inherited route"""
-    generator = ModemsScenarioGenerator(seed=5)
-    scenario = generator.generate_random_scenario(
-        nr_agents=1,
-        nr_requests=2,
-        nr_scheduled=1,
-    )
-    partial_plan = _scheduled_partial_plan(scenario, SolverStrategy.milp3)
-    inherited = partial_plan.journeys["agent_1"]
-    request_name = "request_1"
-    pickup_index = inherited.request_pickup[request_name]
-    delivery_index = inherited.request_delivery[request_name]
-    pickup = inherited.route[pickup_index]
-    delivery = inherited.route[delivery_index]
-    pickup_start = partial_plan.ctx.node_latest_p[pickup] + 2.0
-    delivery_start = (
-        pickup_start
-        + partial_plan.ctx.node_t_service[pickup]
-        + partial_plan.ctx.t_travel(pickup, delivery)
-    )
-    delayed_starts = {pickup: pickup_start, delivery: delivery_start}
-    partial_plan.journeys["agent_1"] = ModemsJourney.from_route(
-        partial_plan.ctx,
-        "agent_1",
-        inherited.route,
-        tau_of={pickup: 2.0},
-        t_start_of=delayed_starts,
-    )
-
-    ctx = ProblemContext(
-        scenario,
-        ProblemType.closed_selective,
-        SolverStrategy.milp3,
-        DEFAULT_PARAMS_MILP,
-    )
-    rebuilt, unassigned = preprocess(ctx, partial_plan=partial_plan)
-
-    assert rebuilt is not None
-    rebuilt_journey = rebuilt.journeys["agent_1"]
-    assert rebuilt_journey.route == partial_plan.journeys["agent_1"].route
-    assert rebuilt_journey.states[pickup_index].t_start == pytest.approx(
-        delayed_starts[pickup]
-    )
-    assert rebuilt_journey.states[delivery_index].t_start == pytest.approx(
-        delayed_starts[delivery]
-    )
-    assert rebuilt_journey.states[pickup_index].tau == pytest.approx(2.0)
-    assert unassigned == {"request_2"}
-
-
-def test_preprocess_fails_on_incompatible_partial_plan_agents() -> None:
-    """preprocess() returns solution=None if partial_plan is missing an agent"""
-    generator = ModemsScenarioGenerator(seed=5)
-    scenario = generator.generate_random_scenario(
-        nr_agents=2, nr_requests=3, nr_scheduled=1
-    )
-    params = {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 2.0, "omega": 5.0}
-
-    partial_plan = _scheduled_partial_plan(scenario)
-    partial_plan.journeys.pop("agent_2")
-    ctx = ProblemContext(
-        scenario,
-        ProblemType.closed_selective,
-        SolverStrategy.alns,
-        params,
-    )
-    solution, _ = preprocess(ctx, partial_plan=partial_plan)
-    assert solution is None
 
 
 def test_rolling_excerpt_shifts_and_preserves_milp3_service_times() -> None:
@@ -685,8 +545,7 @@ def test_simulator_advances_one_epoch_successfully() -> None:
         generator.generate_random_request(
             load_lb=1,
             load_ub=3,
-            time_lb=15.0,
-            time_ub=55.0,
+            earliest_pickup=35.0,
             tw_length=5.0,
             status=RequestStatus.new,
         )
@@ -714,8 +573,7 @@ def test_simulator_fallback_keeps_old_plan_and_rejects_new(
         generator.generate_random_request(
             load_lb=1,
             load_ub=3,
-            time_lb=15.0,
-            time_ub=55.0,
+            earliest_pickup=35.0,
             tw_length=5.0,
             status=RequestStatus.new,
         )
@@ -739,6 +597,7 @@ def test_workday_urgent_arrival_is_not_hidden_by_earlier_nonurgent_arrival() -> 
         def __init__(self) -> None:
             self.epoch_log: list[EpochLog] = []
             self.calls: list[tuple[float, list[ModemsRequest]]] = []
+            self.lingering_request_ids: set[str] = set()
 
         def advance_epoch(
             self, requests: list[ModemsRequest], t_elapsed: float
@@ -915,7 +774,7 @@ def test_completed_and_rejected_requests_keyed_by_persistent_request_id() -> Non
         alns_max_iter=100,
     )
     arrivals = generator.generate_workday_requests(
-        workday_length=40.0, base_rate_per_hour=6.0, nr_surges=0
+        workday_length=40.0, base_rate_per_hour=6, nr_surges=0
     )
     generated_ids = {r.request_id for _, r in arrivals}
 
@@ -1072,8 +931,7 @@ def test_single_solver_mode_only_calls_the_chosen_solver() -> None:
         generator.generate_random_request(
             load_lb=1,
             load_ub=3,
-            time_lb=15.0,
-            time_ub=55.0,
+            earliest_pickup=35.0,
             tw_length=5.0,
             status=RequestStatus.new,
         )
@@ -1099,7 +957,7 @@ def test_compare_solvers_one_workday_uses_identical_arrivals() -> None:
     ]
     # generous duration relative to the 15-45min lead so arrivals have time to resolve
     request_submissions = generator.generate_workday_requests(
-        workday_length=20.0, base_rate_per_hour=6.0, nr_surges=0
+        workday_length=20.0, base_rate_per_hour=6, nr_surges=0
     )
 
     summaries = compare_solvers_one_workday(
@@ -1137,7 +995,7 @@ def test_compare_solvers_over_workdays_is_seeded_reproducible() -> None:
         nr_workdays=2,
         workday_length=20.0,
         base_seed=7,
-        generator_kwargs={"base_rate_per_hour": 6.0, "nr_surges": 0},
+        generator_kwargs={"base_rate_per_hour": 6, "nr_surges": 0},
         milp_timelimit=10.0,
         alns_max_iter=100,
     )
@@ -1174,7 +1032,7 @@ def test_compare_solvers_over_workdays_checkpoint_callback() -> None:
         nr_workdays=2,
         workday_length=20.0,
         base_seed=3,
-        generator_kwargs={"base_rate_per_hour": 6.0, "nr_surges": 0},
+        generator_kwargs={"base_rate_per_hour": 6, "nr_surges": 0},
         milp_timelimit=8.0,
         alns_max_iter=80,
         on_workday_done=lambda i, record: seen.append(i),
@@ -1254,10 +1112,9 @@ def test_excluded_agent_is_parked_then_rejoins(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Regression test: an agent needing more than PLANNING_HORIZON_P of charging used
-    to be dropped from new_agents and never introduced again. Instead, it must be
-    parked and, once enough real time elapses for its SoC to fit within the planning
-    horizon, rejoin the active fleet as the same physical agent (same agent_id)
+    An agent needing more than PLANNING_HORIZON_P of charging is parked and, once
+    enough real time elapses for its charge to fit within the planning horizon,
+    rejoins the active fleet as the same physical agent (same agent_id)
     """
     generator = ModemsScenarioGenerator(seed=1)
     scenario = generator.generate_random_scenario(nr_agents=2, nr_requests=1)
@@ -1297,7 +1154,9 @@ def test_excluded_agent_is_parked_then_rejoins(
     simulator.time_since_last_adoption = 0.0
     simulator.rejected_log = []
     simulator.epoch_log = []
-    simulator._last_confirmed_node = {}
+    simulator.objective = ObjectiveType.closed
+    simulator._visit_checkpoint = {}
+    simulator._travel_checkpoint = {}
     simulator._energy_checkpoint = {
         agent_1.agent_id: agent_1.soc_initial,
         agent_2.agent_id: agent_2.soc_initial,
@@ -1350,10 +1209,9 @@ def test_energy_consumed_is_incremental_not_cumulative_across_no_adoption_epochs
     ctx_and_agent: ProblemContext, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    Regression test: energy_consumed must report the delta since the last epoch with
-    the agent itself, independent of when the active plan was last adopted. A plan
-    can persist across several no-adoption epochs (every solver failing, or nothing
-    usable); reporting the since-plan-adoption total re-counts the same distance
+    energy_consumed reports the delta since the agent's previous epoch, independent
+    of when the active plan was adopted: a plan persisting across no-adoption epochs
+    (every solver failing) is never counted twice
     """
     ctx = ctx_and_agent
     agent_name = ctx.agent_names[0]
@@ -1387,7 +1245,9 @@ def test_energy_consumed_is_incremental_not_cumulative_across_no_adoption_epochs
     simulator.time_since_last_adoption = 0.0
     simulator.rejected_log = []
     simulator.epoch_log = []
-    simulator._last_confirmed_node = {}
+    simulator.objective = ObjectiveType.closed
+    simulator._visit_checkpoint = {}
+    simulator._travel_checkpoint = {}
     simulator._energy_checkpoint = {agent.agent_id: agent.soc_initial}
 
     def _fail_all(next_scenario: Any, partial_plan: Any) -> dict:
@@ -1416,3 +1276,430 @@ def test_energy_consumed_is_incremental_not_cumulative_across_no_adoption_epochs
 
     assert record1.energy_consumed.get(agent.agent_id, 0.0) > 1e-6
     assert total_reported == pytest.approx(expected_total, abs=1e-9)
+
+
+# --------------------------------------------------------------------------------------
+# Open objective: an available agent never drives its final hub leg
+# --------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def open_ctx() -> ProblemContext:
+    """Same scenario as ctx_and_agent, with an open objective"""
+    generator = ModemsScenarioGenerator(seed=1)
+    scenario = generator.generate_random_scenario(nr_agents=1, nr_requests=2)
+    return ProblemContext(
+        scenario,
+        ProblemType.open_selective,
+        SolverStrategy.alns,
+        DEFAULT_PARAMS_MILP,
+    )
+
+
+def _one_trip_journey(
+    ctx: ProblemContext, phi_hub: float = 0.9, phi_d: float = 0.95
+) -> tuple[ModemsJourney, list[str], str]:
+    """Hand-built [v_k, p1, d1, hf] journey: p1 5-6, d1 10-11, hub arrival 15"""
+    agent_name = ctx.agent_names[0]
+    r1 = ctx.request_names[0]
+    p1, d1 = ctx.pickup_node[r1], ctx.delivery_node[r1]
+    v_k = ctx.agent_initial_node[agent_name]
+    hf = ctx.nearest_final_depot(d1)
+    route = [v_k, p1, d1, hf]
+    states = [
+        _mk_state(v_k, t_arr=0.0, t=0.0, t_dep=0.0),
+        _mk_state(p1, t_arr=5.0, t=5.0, t_dep=6.0, z_dep=2, phi_arr=0.97, phi_dep=0.97),
+        _mk_state(d1, t_arr=10.0, t=10.0, t_dep=11.0, phi_arr=phi_d, phi_dep=phi_d),
+        _mk_state(hf, t_arr=15.0, t=15.0, t_dep=15.0, phi_arr=phi_hub, phi_dep=phi_hub),
+    ]
+    return _mk_journey(ctx, agent_name, route, states), route, r1
+
+
+def _travel(ctx: ProblemContext, route: list[str], idx_end: int) -> float:
+    return sum(ctx.t_travel(route[i], route[i + 1]) for i in range(idx_end))
+
+
+def test_open_available_agent_stays_at_last_delivery(open_ctx: ProblemContext) -> None:
+    """After its last delivery, an available open-objective agent stays there"""
+    ctx = open_ctx
+    journey, route, r1 = _one_trip_journey(ctx)
+    result = advance_agent_state(ctx, ctx.agent_names[0], journey, t_elapsed=12.0)
+    assert result.operation_state == AgentOperationalState.available
+    assert result.node == route[2]
+    assert result.delta == pytest.approx(0.0)
+    assert result.sigma == pytest.approx(0.95)  # SoC at the delivery, not the hub
+    assert result.absorbed == {r1}
+    assert result.replan == set()
+    assert result.travel_time == pytest.approx(_travel(ctx, route, 2))
+    # the stay node migrates to a station agent at the delivery station
+    agent = result.to_agent(ctx.agents[ctx.agent_names[0]])
+    assert agent.node_type == NetworkNodeType.station
+    assert agent.node_index == ctx.requests[r1].node_delivery_index
+
+
+def test_open_agent_with_riders_stays_after_dropoff(open_ctx: ProblemContext) -> None:
+    """Riders on board are walked to the drop-off; delta counts down to its t_dep"""
+    ctx = open_ctx
+    journey, route, r1 = _one_trip_journey(ctx)
+    result = advance_agent_state(ctx, ctx.agent_names[0], journey, t_elapsed=7.0)
+    assert result.node == route[2]
+    assert result.delta == pytest.approx(11.0 - 7.0)
+    assert result.absorbed == {r1}
+
+
+def test_closed_available_agent_still_advances_to_hub(
+    ctx_and_agent: ProblemContext,
+) -> None:
+    """The closed objective behavior is unchanged: the agent is committed to the hub"""
+    ctx = ctx_and_agent
+    journey, route, _ = _one_trip_journey(ctx)
+    result = advance_agent_state(ctx, ctx.agent_names[0], journey, t_elapsed=12.0)
+    assert result.node == route[3]
+    assert result.delta == pytest.approx(3.0)
+    assert result.sigma == pytest.approx(0.9)
+    assert result.travel_time == pytest.approx(_travel(ctx, route, 3))
+
+
+def test_open_low_soc_agent_goes_to_hub_and_charges(open_ctx: ProblemContext) -> None:
+    """An open-objective agent that needs to recharge is advanced to the hub"""
+    ctx = open_ctx
+    journey, route, _ = _one_trip_journey(ctx, phi_hub=0.3)
+    result = advance_agent_state(ctx, ctx.agent_names[0], journey, t_elapsed=12.0)
+    assert result.operation_state == AgentOperationalState.charging
+    assert result.node == route[3]
+    assert result.sigma == SOC_CHARGE_TARGET
+    assert result.delta == pytest.approx(3.0 + charging_duration_min(0.3, 0.8))
+
+
+def test_open_charging_decision_uses_soc_at_hub_arrival(
+    open_ctx: ProblemContext,
+) -> None:
+    """Available-vs-charging uses the hub-arrival SoC, even if the station SoC is ok"""
+    ctx = open_ctx
+    threshold = ctx.agents[ctx.agent_names[0]].soc_min_operational + 0.10
+    journey, route, _ = _one_trip_journey(
+        ctx, phi_d=threshold + 0.05, phi_hub=threshold - 0.01
+    )
+    result = advance_agent_state(ctx, ctx.agent_names[0], journey, t_elapsed=12.0)
+    assert result.operation_state == AgentOperationalState.charging
+    assert result.node == route[3]
+
+
+def test_open_idle_agent_stays_at_start_and_keeps_staggered_start(
+    open_ctx: ProblemContext,
+) -> None:
+    """An idle open-objective agent stays put; a future start time is preserved"""
+    ctx = open_ctx
+    agent_name = ctx.agent_names[0]
+    v_k = ctx.agent_initial_node[agent_name]
+    hf = ctx.nearest_final_depot(v_k)
+    c_hub = ctx.t_travel(v_k, hf)
+    journey = _mk_journey(
+        ctx,
+        agent_name,
+        [v_k, hf],
+        [
+            _mk_state(v_k, t_arr=30.0, t=30.0, t_dep=30.0, phi_dep=0.9),
+            _mk_state(hf, t_arr=30.0 + c_hub, t_dep=30.0 + c_hub, phi_arr=0.88),
+        ],
+    )
+    result = advance_agent_state(ctx, agent_name, journey, t_elapsed=10.0)
+    assert result.operation_state == AgentOperationalState.available
+    assert result.node == v_k
+    assert result.delta == pytest.approx(20.0)
+    assert result.sigma == pytest.approx(0.9)
+    assert result.travel_time == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize("t_elapsed", [5.5, 10.95, 11.05, 14.0, 1000.0])
+def test_travel_time_is_committed_travel_independent_of_t_elapsed_split(
+    ctx_and_agent: ProblemContext, t_elapsed: float
+) -> None:
+    """
+    travel_time is the journey committed travel from its first node up to the
+    resulting node, including arcs already driven, regardless of where t_elapsed
+    falls
+    """
+    ctx = ctx_and_agent
+    journey, route, _ = _one_trip_journey(ctx)
+    result = advance_agent_state(ctx, ctx.agent_names[0], journey, t_elapsed=t_elapsed)
+    idx_end = route.index(result.node)
+    assert result.travel_time == pytest.approx(_travel(ctx, route, idx_end))
+    if t_elapsed > 6.0:  # riders picked up at p1 commit the agent through the hub
+        assert result.node == route[3]
+
+
+# --------------------------------------------------------------------------------------
+# Plan-progress checkpoints: visits/travel are never re-logged across no-adoption
+# epochs; visits use physical node names
+# --------------------------------------------------------------------------------------
+
+
+def test_agent_node_visit_physical_node_names() -> None:
+    """Virtual (epoch-local) node names map to their physical hub/station names"""
+    assert AgentNodeVisit.make_physical_name("a_1_s_5") == "s_5"
+    assert AgentNodeVisit.make_physical_name("r_3_d_5") == "s_5"
+    assert AgentNodeVisit.make_physical_name("r_3_p_12") == "s_12"
+    assert AgentNodeVisit.make_physical_name("a_2_h_2") == "h_2"
+    assert AgentNodeVisit.make_physical_name("h_2") == "h_2"
+
+
+def test_append_visit_merges_same_physical_node_without_mutation() -> None:
+    """Consecutive visits to one physical node merge into a new object"""
+    first = AgentNodeVisit("s_5", 10.0, 11.0, 0.9, 0.9)
+    visits = [first]
+    _append_merge_visit(visits, AgentNodeVisit("s_5", 11.0, 14.0, 0.9, 0.88))
+    _append_merge_visit(visits, AgentNodeVisit("s_7", 18.0, 19.0, 0.85, 0.85))
+    assert [v.physical_node for v in visits] == ["s_5", "s_7"]
+    assert visits[0].arrival_time == 10.0
+    assert visits[0].departure_time == 14.0
+    assert visits[0].soc_departure == 0.88
+    assert first.departure_time == 11.0  # the original object is untouched
+
+
+def _manual_simulator(
+    ctx: ProblemContext, journey: ModemsJourney
+) -> RollingHorizonSimulator:
+    """A one-agent simulator wired around a given context/journey (no solver)"""
+    agent_name = ctx.agent_names[0]
+    agent = ctx.agents[agent_name]
+    simulator = RollingHorizonSimulator.__new__(RollingHorizonSimulator)
+    simulator.network = ctx.scenario.network
+    simulator.model_params = DEFAULT_PARAMS_MILP
+    simulator.objective = ProblemType.objective_of(ctx.problem_type)
+    simulator.agents = {agent_name: agent}
+    simulator.agent_templates = {agent.agent_id: agent.copy()}
+    simulator.parked_agents = {}
+    simulator.previous_ctx = ctx
+    simulator.journeys = {agent_name: journey}
+    simulator.time_since_last_adoption = 0.0
+    simulator.rejected_log = []
+    simulator.epoch_log = []
+    simulator._visit_checkpoint = {}
+    simulator._travel_checkpoint = {}
+    simulator._energy_checkpoint = {agent.agent_id: agent.soc_initial}
+    return simulator
+
+
+@pytest.mark.parametrize("problem_type", ["closed_selective", "open_selective"])
+def test_no_adoption_epochs_do_not_relog_visits_or_recount_travel(
+    monkeypatch: pytest.MonkeyPatch, problem_type: str
+) -> None:
+    """
+    A plan persisting across no-adoption epochs is logged incrementally: summed over
+    epochs, visits and travel match the plan committed progress exactly once
+    """
+    generator = ModemsScenarioGenerator(seed=1)
+    scenario = generator.generate_random_scenario(nr_agents=1, nr_requests=2)
+    ctx = ProblemContext(
+        scenario, problem_type, SolverStrategy.alns, DEFAULT_PARAMS_MILP
+    )
+    journey, route, _ = _one_trip_journey(ctx)
+    simulator = _manual_simulator(ctx, journey)
+
+    def _fail_all(next_scenario: Any, partial_plan: Any) -> dict:
+        simulator.last_solver_errors = {}
+        return {}
+
+    monkeypatch.setattr(simulator, "_solve_all", _fail_all)
+    records = [simulator.advance_epoch([], t_elapsed=t) for t in (5.5, 6.5, 20.0)]
+    assert all(r.adopted_strategy is None for r in records)
+
+    agent_id = ctx.agents[ctx.agent_names[0]].agent_id
+    total_travel = sum(r.agent_travel_time.get(agent_id, 0.0) for r in records)
+    direct = advance_agent_state(ctx, ctx.agent_names[0], journey, t_elapsed=32.0)
+    assert total_travel == pytest.approx(direct.travel_time)
+
+    logged = [
+        v.physical_node for r in records for v in r.agent_node_visits.get(agent_id, [])
+    ]
+    idx_end = route.index(direct.node)
+    expected = [AgentNodeVisit.make_physical_name(n) for n in route[: idx_end + 1]]
+    assert logged == expected  # each node exactly once, in route order
+    if problem_type == "open_selective":
+        assert all(not n.startswith("h_") for n in logged[1:])
+
+
+def test_workday_log_merges_a_stay_spanning_two_plans() -> None:
+    """An agent staying at a station across a re-plan is one visit in the day log"""
+    epoch_1 = EpochLog(
+        plan_reference_clock=0.0,
+        agent_node_visits={"a": [AgentNodeVisit("s_5", 10.0, 11.0, 0.9, 0.9)]},
+    )
+    # new plan adopted at clock 20, the agent starts it at s_5 and leaves at 3.0
+    epoch_2 = EpochLog(
+        plan_reference_clock=20.0,
+        agent_node_visits={
+            "a": [
+                AgentNodeVisit("s_5", 0.0, 3.0, 0.9, 0.9),
+                AgentNodeVisit("s_8", 7.0, 8.0, 0.85, 0.85),
+            ]
+        },
+    )
+    log = build_workday_log([epoch_1, epoch_2], [])
+    visits = log.agent_node_visits["a"]
+    assert [v.physical_node for v in visits] == ["s_5", "s_8"]
+    assert visits[0].arrival_time == pytest.approx(10.0)
+    assert visits[0].departure_time == pytest.approx(23.0)
+    assert WorkdayLog.from_dict(log.to_dict()).to_dict() == log.to_dict()
+
+
+# --------------------------------------------------------------------------------------
+# Simulator objective plumbing
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("objective", list(ObjectiveType))
+def test_simulator_resolves_every_solver_problem_type_from_objective(
+    monkeypatch: pytest.MonkeyPatch, objective: ObjectiveType
+) -> None:
+    """benchmarking mode builds each solver with its objective-matched problem type"""
+    import modems.rolling_horizon as rh
+
+    observed: dict[str, ProblemType] = {}
+
+    class _FakeSolver:
+        def __init__(self, scenario: Any, *args: Any, **kwargs: Any) -> None:
+            milp_type = kwargs.get("milp_type")
+            key = str(milp_type) if milp_type is not None else "alns"
+            observed[key] = ProblemType(kwargs["problem_type"])
+
+        def solve(self, *args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("fake solver, nothing to adopt")
+
+    monkeypatch.setattr(rh, "ModemsAlns", _FakeSolver)
+    monkeypatch.setattr(rh, "ModemsMilp", _FakeSolver)
+    generator = ModemsScenarioGenerator(seed=1)
+    agent = ModemsAgent(node_type=NetworkNodeType.hub, node_index=1, soc_initial=0.9)
+    simulator = RollingHorizonSimulator(
+        generator.network, [agent], solver_mode="benchmarking", objective=objective
+    )
+    assert simulator.previous_ctx.is_open() == (objective == ObjectiveType.open)
+    simulator.advance_epoch([], t_elapsed=0.0)
+
+    open_ = objective.value
+    assert observed == {
+        "milp1": ProblemType(f"{open_}_non_selective"),
+        "milp2": ProblemType(f"{open_}_selective"),
+        "milp3": ProblemType(f"{open_}_selective"),
+        "alns": ProblemType(f"{open_}_selective"),
+    }
+
+
+@pytest.mark.integration
+def test_open_workday_agents_only_visit_hubs_to_start_or_charge() -> None:
+    """
+    End-to-end (real ALNS): with an open objective and a healthy fleet, agents never
+    drive to a hub except their own start node (or when charging), unlike closed
+    """
+    from modems.workday_benchmark import _build_fleet
+
+    hub_visits: dict[ObjectiveType, int] = {}
+    for objective in ObjectiveType:
+        generator = ModemsScenarioGenerator(seed=7)
+        agents = _build_fleet(generator, 2)
+        submissions = generator.generate_workday_requests(workday_length=90.0)
+        simulator = RollingHorizonSimulator(
+            generator.network,
+            agents,
+            solver_mode="single",
+            single_solver="alns",
+            alns_max_iter=30,
+            objective=objective,
+        )
+        epoch_log = WorkdaySimulation(simulator, submissions, 120.0).run()
+        assert all(not e.charging_events for e in epoch_log)
+        day = build_workday_log(epoch_log, submissions)
+        hub_visits[objective] = sum(
+            v.physical_node.startswith("h_")
+            for visits in day.agent_node_visits.values()
+            for v in visits[1:]
+        )
+    assert hub_visits[ObjectiveType.open] == 0
+    assert hub_visits[ObjectiveType.closed] > 0
+
+
+# --------------------------------------------------------------------------------------
+# WorkdaySimulation drain: run past the workday until every accepted request is
+# delivered, capped at max_drain
+# --------------------------------------------------------------------------------------
+
+
+class _DrainingSimulator:
+    """Fake simulator whose lingering requests clear after a set number of epochs"""
+
+    def __init__(self, busy_epochs: int) -> None:
+        self.epoch_log: list[EpochLog] = []
+        self.calls: list[tuple[float, list[ModemsRequest]]] = []
+        self.lingering_request_ids: set[str] = {"accepted"}
+        self._busy_epochs = busy_epochs
+
+    def advance_epoch(
+        self, requests: list[ModemsRequest], t_elapsed: float
+    ) -> EpochLog:
+        self.calls.append((t_elapsed, requests))
+        if len(self.calls) >= self._busy_epochs:
+            self.lingering_request_ids = set()
+        record = EpochLog(adopted_strategy=None)
+        self.epoch_log.append(record)
+        return record
+
+
+def test_workday_drains_past_workday_until_requests_are_delivered() -> None:
+    """Epochs continue periodically after the workday until nothing is lingering"""
+    simulator = _DrainingSimulator(busy_epochs=6)
+    workday = WorkdaySimulation(simulator, [], workday_length=20.0)
+    log = workday.run()
+    # epochs at 10, 20 (workday end), then drain epochs at 30, 40, 50, 60
+    assert [e.clock_end for e in log] == [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+    assert workday.is_drained()
+
+
+def test_workday_drain_releases_requests_pending_at_workday_end() -> None:
+    """A request submitted before the end, with a pickup beyond P, is still released"""
+    simulator = _DrainingSimulator(busy_epochs=1)
+    late = ModemsRequest(1, 2, earliest_pickup=85.0, request_id="late")
+    workday = WorkdaySimulation(simulator, [(5.0, late)], workday_length=20.0)
+    workday.run()
+    released = [
+        (sum(c[0] for c in simulator.calls[: i + 1]), [r.request_id for r in c[1]])
+        for i, c in enumerate(simulator.calls)
+        if c[1]
+    ]
+    # pickup at 85 is within P = 60 from clock 30 on, after the workday ended
+    assert released == [(30.0, ["late"])]
+
+
+def test_workday_drain_is_capped_by_max_drain() -> None:
+    """With requests that never clear, the simulation stops at workday + max_drain"""
+    simulator = _DrainingSimulator(busy_epochs=10_000)
+    workday = WorkdaySimulation(simulator, [], workday_length=20.0, max_drain=30.0)
+    log = workday.run()
+    assert log[-1].clock_end == pytest.approx(50.0)
+    assert not workday.is_drained()
+
+
+@pytest.mark.integration
+def test_real_workday_leaves_no_accepted_request_unresolved() -> None:
+    """End-to-end (ALNS): with draining, every accepted request is completed"""
+    generator = ModemsScenarioGenerator(seed=3)
+    agents = [
+        ModemsAgent(node_type=NetworkNodeType.hub, node_index=1, soc_initial=1.0),
+        ModemsAgent(node_type=NetworkNodeType.hub, node_index=2, soc_initial=1.0),
+    ]
+    submissions = generator.generate_workday_requests(
+        workday_length=60.0, base_rate_per_hour=12, nr_surges=1
+    )
+    simulator = RollingHorizonSimulator(
+        generator.network,
+        agents,
+        solver_mode="single",
+        single_solver="alns",
+        alns_max_iter=30,
+    )
+    epoch_log = WorkdaySimulation(simulator, submissions, 60.0).run()
+    day = build_workday_log(epoch_log, submissions)
+    outcomes = [record.outcome for record in day.requests]
+    assert RequestOutcome.unresolved not in outcomes
+    assert day.clock_end >= 60.0
+    assert not simulator.lingering_request_ids

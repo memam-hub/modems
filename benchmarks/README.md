@@ -1,15 +1,16 @@
 # Benchmark suite
 
 Four core scripts, backed by `modems.benchmark`, `modems.workday_benchmark`, and
-`modems.insertion_ablation`. `run_*.py` each run generate + solve + build-table in
-one command by default (`--phase` isolates one part), printing live progress, and
-are safe to interrupt/resume.
+`modems.insertion_ablation`, plus two comparison scripts. `run_*.py` each run 
+generate + solve + build-table in one command by default (`--phase` isolates one part), 
+printing live progress, and is safe to interrupt/resume.
 
 ```bash
 python3 run_suite.py            # static: one scenario, all 4 solvers
 python3 run_workday_suite.py    # dynamic: full simulated day, MILP3 vs ALNS
 python3 run_ablation_suite.py   # V0-V3 insertion ablation, two SoC corpora + comparison
 python3 compare_ablation_corpora.py --corpus-a A --corpus-b B  # compare two runs
+python3 compare_workday_objectives.py --closed C --open O      # closed vs open workdays
 ```
 
 `_cli_common.py` is utility to handle shared arguments and progress printing.
@@ -185,6 +186,33 @@ solving/generating the two corpora.
 | `--table-name` | `corpus_comparison` | Output file basename (`.csv`/`.json`/`.tex`) |
 
 Plus `--bucket-size` and `--metric` as `run_ablation_suite.py`.
+
+## compare_workday_objectives.py
+
+Compares two solved workday suites, one run with `--objective closed` and one with
+`--objective open`, which were generated with identical arguments and `--seed`.
+Objective type does not impact request generation, so workdays have identical request 
+streams across suites. Each workday is observed four times (MILP3/ALNS x closed/open).
+
+Writes `combined_manifest.json` and `combined_summary.{csv,json,tex}` (each workday's
+closed row directly followed by its open row, with demand load and per-served-request 
+travel time/energy) and three figures:
+
+| Figure | Content |
+|---|---|
+| `var_decision_impact.png` | Rows: acceptance, mean delay, mean excess ride, travel time and energy per served request. Columns: objective (open - closed, per solver), solver (ALNS - MILP3, per objective), start time (staggered - normal, per solver). Mean difference with its 95% CI |
+| `demand_vs_accept_delay.png` | Acceptance and mean delay against the demand load (requests per agent-hour): binned means with 95% CI bands per solver x objective, one marker per workday (hollow: with surges) |
+| `most_demand_<name>.png` | The representative workday (highest demand load among workdays with surges): rolling acceptance and agent SoC for its four runs, above the shared demand |
+
+Delay and excess ride time are means over served requests only.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--closed` / `--open` | required | Outdirs of the closed and open suites |
+| `--outdir` | `results_workday_comparison/` | Output directory |
+| `--table-name` | `combined_summary` | Combined table basename (`.csv`/`.json`/`.tex`) |
+| `--all-workdays` | off | Also plot every paired workday into `<outdir>/workdays/` |
+| `--window` | `30` | Minutes of submissions behind each rolling acceptance point |
 
 
 ## Manifest format

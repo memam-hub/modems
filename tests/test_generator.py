@@ -1,271 +1,338 @@
+"""Unit tests for modems.generator: static scenarios, workday streams, SoC ranges"""
+
 from __future__ import annotations
 
 import numpy as np
 import pytest
 
-from modems import ModemsScenarioGenerator
-from modems.core import DEFAULT_TIME_WINDOW, ModemsRequest, ScenarioTiming, ScenarioType
+from modems.core import DEFAULT_TIME_WINDOW, ScenarioTiming, ScenarioType
 from modems.generator import (
+    DEFAULT_MIN_LEAD,
     NORMAL_SOC_RANGE,
+    STATIC_HORIZON,
     STRESS_SOC_RANGE,
+    SURGE_DURATION,
+    SURGE_GAP_BY_TIMING,
+    ModemsScenarioGenerator,
     ScenarioSocRange,
     SocRangeSpec,
+    _peaks_plateaus,
+    max_surges,
+    surge_spans,
+    timing_profile,
 )
+from modems.network import NetworkNodeType
+
+from .builders import generated, line_network
 
 # --------------------------------------------------------------------------------------
-# generate_random_scenario
+# Network selection
 # --------------------------------------------------------------------------------------
 
 
-def test_scenario_generation_is_seeded_reproducible() -> None:
-    """Two generators with the same seed produce byte-identical scenarios"""
-    gen1 = ModemsScenarioGenerator(seed=11)
-    s1 = gen1.generate_random_scenario(nr_agents=2, nr_requests=5)
-    gen2 = ModemsScenarioGenerator(seed=11)
-    s2 = gen2.generate_random_scenario(nr_agents=2, nr_requests=5)
-    assert s1.to_dict() == s2.to_dict()
+def test_default_network_is_fixed_campus_layout() -> None:
+    a, b = ModemsScenarioGenerator(seed=1), ModemsScenarioGenerator(seed=2)
+    assert (a.network.nr_hubs, a.network.nr_stations) == (3, 15)
+    assert np.array_equal(a.network.locations, b.network.locations)
 
 
-def test_scenario_counts_match_request() -> None:
-    """generate_random_scenario() produces exactly the requested agent/request counts"""
-    gen = ModemsScenarioGenerator(seed=1)
-    scenario = gen.generate_random_scenario(nr_agents=3, nr_requests=7)
-    assert len(scenario.agents) == 3
-    assert len(scenario.requests) == 7
+def test_random_network_uses_requested_size() -> None:
+    gen = ModemsScenarioGenerator(seed=1, random_network=True, nr_hubs=2, nr_stations=6)
+    assert (gen.network.nr_hubs, gen.network.nr_stations) == (2, 6)
 
 
-def test_scenario_default_tw_length_and_earliest_pickup_floor() -> None:
-    """Every generated request has the default TW length and a >=15min lead"""
-    gen = ModemsScenarioGenerator(seed=1)
-    scenario = gen.generate_random_scenario(nr_agents=1, nr_requests=10)
+def test_given_network_is_copied_and_exclusive_with_random_network() -> None:
+    network = line_network([0.0, 1.0, 2.0, 3.0])
+    gen = ModemsScenarioGenerator(seed=1, network=network)
+    assert gen.network is not network
+    assert np.array_equal(gen.network.travel_times, network.travel_times)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        ModemsScenarioGenerator(seed=1, network=network, random_network=True)
+
+
+# --------------------------------------------------------------------------------------
+# Static scenarios
+# --------------------------------------------------------------------------------------
+
+
+def test_scenario_is_seed_reproducible() -> None:
+    kwargs = dict(nr_agents=2, nr_requests=5, scenario_type="mixed")
+    assert generated(11, **kwargs).to_dict() == generated(11, **kwargs).to_dict()
+    assert generated(11, **kwargs).to_dict() != generated(12, **kwargs).to_dict()
+
+
+@pytest.mark.parametrize("scenario_type", list(ScenarioType))
+@pytest.mark.parametrize("timing", list(ScenarioTiming))
+def test_scenario_fields_lie_in_their_documented_domains(
+    scenario_type: ScenarioType, timing: ScenarioTiming
+) -> None:
+    scenario = generated(
+        3,
+        nr_agents=4,
+        nr_requests=30,
+        nr_scheduled=5,
+        scenario_type=scenario_type,
+        scenario_timing=timing,
+        soc_lb=0.6,
+        soc_ub=0.7,
+    )
+    network = scenario.network
+    assert (scenario.type, scenario.timing) == (scenario_type, timing)
+    assert len(scenario.agents) == 4 and len(scenario.requests) == 30
+    for agent in scenario.agents:
+        limit = network.nr_hubs if agent.node_type == "h" else network.nr_stations
+        assert 1 <= agent.node_index <= limit
+        assert agent.load_max in (5, 6, 8)
+        assert 0.0 <= agent.time_initial <= 10.0
+        assert 0.6 <= agent.soc_initial <= 0.7
     for r in scenario.requests:
+        assert r.node_pickup_index != r.node_delivery_index
+        assert 1 <= r.load <= 4
+        assert r.service_time == pytest.approx(min(1.0, max(0.2, r.load / 10)))
         assert r.tw_length == DEFAULT_TIME_WINDOW
-        assert r.earliest_pickup >= 15.0
+        assert DEFAULT_MIN_LEAD <= r.earliest_pickup <= STATIC_HORIZON
+    assert [r.is_scheduled() for r in scenario.requests] == [True] * 5 + [False] * 25
+    ids = [r.request_id for r in scenario.requests] + [
+        a.agent_id for a in scenario.agents
+    ]
+    assert len(set(ids)) == len(ids)
 
 
-def test_scheduled_requests_count() -> None:
-    """nr_scheduled controls exactly how many requests are marked scheduled"""
-    gen = ModemsScenarioGenerator(seed=1)
-    scenario = gen.generate_random_scenario(nr_agents=1, nr_requests=6, nr_scheduled=2)
-    assert sum(1 for r in scenario.requests if r.is_scheduled()) == 2
-    assert sum(1 for r in scenario.requests if r.is_new()) == 4
+def test_agents_start_at_both_hubs_and_stations() -> None:
+    scenario = generated(1, nr_agents=40, nr_requests=0)
+    kinds = {agent.node_type for agent in scenario.agents}
+    assert kinds == {NetworkNodeType.hub, NetworkNodeType.station}
 
 
-def test_clustered_scenario_is_more_geographically_concentrated_than_random() -> None:
-    """Clustered pickups have a smaller mean distance to their centroid than Random"""
+def test_clustered_endpoints_concentrate_on_few_stations() -> None:
+    """One tight cluster snaps to a handful of stations, and random spans the network"""
 
-    def spread(scenario_type: ScenarioType, seed: int) -> float:
-        gen = ModemsScenarioGenerator(seed=seed)
-        scenario = gen.generate_random_scenario(
+    def distinct_pickups(scenario_type: ScenarioType) -> int:
+        scenario = generated(
+            2,
             nr_agents=1,
-            nr_requests=20,
+            nr_requests=40,
             scenario_type=scenario_type,
             nr_clusters=1,
             cluster_spread=2.0,
         )
-        pickup_indices = [r.node_pickup_index for r in scenario.requests]
-        locations = scenario.network.locations
-        # station index -> array row is (nr_hubs + station_idx - 1) for 1-based indices
-        coords = np.array(
-            [locations[scenario.network.nr_hubs + idx - 1] for idx in pickup_indices]
-        )
-        centroid = coords.mean(axis=0)
-        return np.mean(np.linalg.norm(coords - centroid, axis=1))
+        return len({r.node_pickup_index for r in scenario.requests})
 
-    random_spread = spread(ScenarioType.random, seed=2)
-    clustered_spread = spread(ScenarioType.clustered, seed=2)
-    assert clustered_spread < random_spread
+    assert distinct_pickups(ScenarioType.clustered) <= 5
+    assert distinct_pickups(ScenarioType.random) >= 12
 
 
-def test_tight_timing_concentrates_earliest_pickups_more_than_loose() -> None:
-    """Tight earliest-pickup times have a smaller std-dev than Loose ones"""
+def test_peaks_timing_concentrates_pickups_in_the_plateaus() -> None:
+    plateaus = _peaks_plateaus(DEFAULT_MIN_LEAD, STATIC_HORIZON, DEFAULT_MIN_LEAD)
 
-    def spread_in_time(timing: ScenarioTiming, seed: int) -> float:
-        gen = ModemsScenarioGenerator(seed=seed)
-        scenario = gen.generate_random_scenario(
-            nr_agents=1,
-            nr_requests=20,
-            scenario_timing=timing,
-            nr_surges=1,
-            temporal_spread=1.0,
-        )
-        times = np.array([r.earliest_pickup for r in scenario.requests])
-        return times.std()
+    def plateau_share(timing: ScenarioTiming) -> float:
+        times = [
+            r.earliest_pickup
+            for seed in range(20)
+            for r in generated(
+                seed, nr_agents=1, nr_requests=20, scenario_timing=timing
+            ).requests
+        ]
+        return float(np.mean([any(a <= t <= b for a, b in plateaus) for t in times]))
 
-    loose_spread = spread_in_time(ScenarioTiming.loose, seed=3)
-    tight_spread = spread_in_time(ScenarioTiming.tight, seed=3)
-    assert tight_spread < loose_spread
+    # plateaus cover 1/3 of [15, 60]: uniform ~1/3, peaks ~1/2 + 1/2 * 1/3 = 2/3
+    assert plateau_share(ScenarioTiming.uniform) == pytest.approx(1 / 3, abs=0.07)
+    assert plateau_share(ScenarioTiming.peaks) == pytest.approx(2 / 3, abs=0.07)
 
 
 # --------------------------------------------------------------------------------------
-# generate_workday_requests
+# Timing profile and surge geometry
 # --------------------------------------------------------------------------------------
 
 
-def test_workday_arrivals_sorted_and_within_horizon() -> None:
-    """Arrivals come back sorted by time and confined to [0, workday_length)"""
-    gen = ModemsScenarioGenerator(seed=4)
-    arrivals = gen.generate_workday_requests(
-        workday_length=120.0, base_rate_per_hour=6.0, nr_surges=1
-    )
-    times = [t for t, _ in arrivals]
-    assert times == sorted(times)
-    assert all(0.0 <= t < 120.0 for t in times)
+@pytest.mark.parametrize("timing", list(ScenarioTiming))
+@pytest.mark.parametrize("t_lb", [0.0, 15.0, 130.0])
+def test_timing_profile_is_a_density_on_its_support(
+    timing: ScenarioTiming, t_lb: float
+) -> None:
+    pieces = timing_profile(timing, 0.0, 480.0, t_lb)
+    assert sum((b - a) * h for a, b, h in pieces) == pytest.approx(1.0)
+    assert min(a for a, _, _ in pieces) == t_lb
+    assert max(b for _, b, _ in pieces) == 480.0
 
 
-def test_workday_arrivals_lead_times_within_bounds() -> None:
-    """Each request (earliest_pickup - time_submit) lead follows [min_lead, max_lead]"""
-    gen = ModemsScenarioGenerator(seed=4)
-    arrivals = gen.generate_workday_requests(
-        workday_length=120.0,
-        base_rate_per_hour=6.0,
-        nr_surges=1,
-        min_lead=15.0,
-        max_lead=45.0,
-    )
-    for t, r in arrivals:
-        lead = r.earliest_pickup - t
-        assert 15.0 - 1e-6 <= lead <= 45.0 + 1e-6
+def test_peaks_plateaus_are_placed_relative_to_the_full_horizon() -> None:
+    assert _peaks_plateaus(0.0, 480.0, 15.0) == [(120.0, 200.0), (280.0, 360.0)]
+    assert _peaks_plateaus(0.0, 480.0, 150.0) == [(150.0, 200.0), (280.0, 360.0)]
+    static = _peaks_plateaus(DEFAULT_MIN_LEAD, STATIC_HORIZON, DEFAULT_MIN_LEAD)
+    assert [(a + b) / 2 for a, b in static] == pytest.approx([30.0, 45.0])
 
 
-def test_workday_generation_is_seeded_reproducible() -> None:
-    """Two generators with the same seed produce identical arrival streams"""
-    gen1 = ModemsScenarioGenerator(seed=9)
-    a1 = gen1.generate_workday_requests(
-        workday_length=60.0, base_rate_per_hour=6.0, nr_surges=1
-    )
-    gen2 = ModemsScenarioGenerator(seed=9)
-    a2 = gen2.generate_workday_requests(
-        workday_length=60.0, base_rate_per_hour=6.0, nr_surges=1
-    )
-    assert [t for t, _ in a1] == [t for t, _ in a2]
-    assert [r.to_dict() for _, r in a1] == [r.to_dict() for _, r in a2]
+@pytest.mark.parametrize("t_lb", [-1.0, 480.0])
+def test_timing_profile_rejects_lower_bound_outside_horizon(t_lb: float) -> None:
+    with pytest.raises(ValueError):
+        timing_profile(ScenarioTiming.uniform, 0.0, 480.0, t_lb)
 
 
-def test_zero_base_rate_only_produces_surge_arrivals() -> None:
-    """With base_rate_per_hour=0, only the fixed-size surge bursts are generated"""
-    gen = ModemsScenarioGenerator(seed=1)
-    arrivals = gen.generate_workday_requests(
-        workday_length=60.0,
-        base_rate_per_hour=0.0,
-        nr_surges=1,
-        surge_size_range=(3, 3),
-    )
-    assert len(arrivals) == 3
-
-
-# --------------------------------------------------------------------------------------
-# request_id via the generator (seeded RNG stream)
-# --------------------------------------------------------------------------------------
-
-
-def test_generator_request_ids_are_deterministic_and_unique() -> None:
-    """Same seed -> identical, and within-scenario unique, request_id sequences"""
-    gen1 = ModemsScenarioGenerator(seed=42)
-    s1 = gen1.generate_random_scenario(nr_agents=2, nr_requests=5)
-    gen2 = ModemsScenarioGenerator(seed=42)
-    s2 = gen2.generate_random_scenario(nr_agents=2, nr_requests=5)
-
-    ids1: list[str] = [r.request_id for r in s1.requests]
-    ids2: list[str] = [r.request_id for r in s2.requests]
-    assert ids1 == ids2
-    assert len(set(ids1)) == len(ids1)
-
-
-def test_generator_request_ids_differ_across_seeds() -> None:
-    """Different seeds produce disjoint request_id sets"""
-    gen1 = ModemsScenarioGenerator(seed=1)
-    s1 = gen1.generate_random_scenario(nr_agents=1, nr_requests=3)
-    gen2 = ModemsScenarioGenerator(seed=2)
-    s2 = gen2.generate_random_scenario(nr_agents=1, nr_requests=3)
-    ids1: set[str] = {r.request_id for r in s1.requests}
-    ids2: set[str] = {r.request_id for r in s2.requests}
-    assert ids1.isdisjoint(ids2)
-
-
-def test_workday_request_ids_are_unique_and_reproducible() -> None:
-    """Workday-stream request_ids are seed-reproducible and within-stream unique"""
-    gen1 = ModemsScenarioGenerator(seed=9)
-    a1: list[tuple[float, ModemsRequest]] = gen1.generate_workday_requests(
-        workday_length=60.0, base_rate_per_hour=6.0, nr_surges=1
-    )
-    gen2 = ModemsScenarioGenerator(seed=9)
-    a2: list[tuple[float, ModemsRequest]] = gen2.generate_workday_requests(
-        workday_length=60.0, base_rate_per_hour=6.0, nr_surges=1
-    )
-    ids1 = [r.request_id for _, r in a1]
-    ids2 = [r.request_id for _, r in a2]
-    assert ids1 == ids2
-    assert len(set(ids1)) == len(ids1)
-
-
-# --------------------------------------------------------------------------------------
-# SocRangeSpec / ScenarioSocRange
-# --------------------------------------------------------------------------------------
-
-
-def test_soc_range_spec_normal_and_stress_match_module_constants() -> None:
-    """normal()/stress() have the right kind and the right default bounds"""
-    normal = SocRangeSpec.normal()
-    stress = SocRangeSpec.stress()
-    assert normal.kind == ScenarioSocRange.normal
-    assert normal.bounds == NORMAL_SOC_RANGE
-    assert stress.kind == ScenarioSocRange.stress
-    assert stress.bounds == STRESS_SOC_RANGE
-
-
-def test_soc_range_spec_custom_accepts_valid_bounds() -> None:
-    """custom() accepts any 0 < lb <= ub <= 1.0, including lb == ub"""
-    spec = SocRangeSpec.custom(0.35, 0.55)
-    assert spec.kind == ScenarioSocRange.custom
-    assert spec.bounds == (0.35, 0.55)
-    assert SocRangeSpec.custom(0.5, 0.5).bounds == (0.5, 0.5)
+def test_surge_spans_keep_the_gap_from_plateaus() -> None:
+    assert surge_spans(ScenarioTiming.uniform, 480.0) == [(15.0, 480.0)]
+    gap = SURGE_GAP_BY_TIMING[ScenarioTiming.peaks]
+    assert surge_spans(ScenarioTiming.peaks, 480.0) == [
+        (15.0, 120.0 - gap),
+        (200.0 + gap, 280.0 - gap),
+        (360.0 + gap, 480.0),
+    ]
 
 
 @pytest.mark.parametrize(
-    "lb, ub",
+    "timing, length, capacity",
     [
-        (0.0, 0.5),  # lb must be strictly positive
-        (0.5, 0.3),  # lb must not exceed ub
-        (0.5, 1.5),  # ub must not exceed 1.0
+        (ScenarioTiming.uniform, 90.0, 1),
+        (ScenarioTiming.uniform, 480.0, 8),
+        (ScenarioTiming.peaks, 90.0, 0),
+        (ScenarioTiming.peaks, 240.0, 2),
+        (ScenarioTiming.peaks, 480.0, 5),
     ],
 )
-def test_soc_range_spec_custom_rejects_invalid_bounds(lb: float, ub: float) -> None:
-    """custom() raises ValueError outside 0 < lb <= ub <= 1.0"""
-    with pytest.raises(ValueError, match="0 < lb <= ub <= 1.0"):
-        SocRangeSpec.custom(lb, ub)
+def test_max_surges_is_the_exact_generation_limit(
+    timing: ScenarioTiming, length: float, capacity: int
+) -> None:
+    assert max_surges(timing, length) == capacity
+    gen = ModemsScenarioGenerator(seed=1)
+    gen.generate_workday_requests(
+        workday_length=length, nr_surges=capacity, scenario_timing=timing
+    )
+    with pytest.raises(ValueError, match="exceed the maximum"):
+        gen.generate_workday_requests(
+            workday_length=length, nr_surges=capacity + 1, scenario_timing=timing
+        )
 
 
-def test_soc_range_spec_suffix_and_label() -> None:
-    """suffix() names scenarios/points; label() is the plain kind string"""
-    assert SocRangeSpec.normal().suffix == "_soc80-100"
-    assert SocRangeSpec.stress().suffix == "_soc50-70"
-    assert SocRangeSpec.custom(0.3, 0.5).suffix == "_soc30-50"
-    assert SocRangeSpec.normal().label == "normal"
-    assert SocRangeSpec.custom(0.3, 0.5).label == "custom"
+@pytest.mark.parametrize("timing", list(ScenarioTiming))
+def test_sampled_surges_never_overlap_and_avoid_plateaus(
+    timing: ScenarioTiming,
+) -> None:
+    gap = SURGE_GAP_BY_TIMING[timing]
+    plateaus = _peaks_plateaus(0.0, 480.0, 15.0) if timing == "peaks" else []
+    spans = surge_spans(timing, 480.0)
+    capacity = max_surges(timing, 480.0)
+    gen = ModemsScenarioGenerator(seed=2)
+    for nr_surges in (1, capacity):
+        for _ in range(100):
+            starts = gen._sample_surge_starts(nr_surges, spans, SURGE_DURATION, gap)
+            assert len(starts) == nr_surges and starts == sorted(starts)
+            for a, b in zip(starts, starts[1:]):
+                assert b - (a + SURGE_DURATION) >= gap - 1e-9
+            for t in starts:
+                assert any(
+                    lb - 1e-9 <= t and t + SURGE_DURATION <= ub + 1e-9
+                    for lb, ub in spans
+                )
+                for pa, pb in plateaus:
+                    assert t + SURGE_DURATION <= pa - gap + 1e-9 or t >= pb + gap - 1e-9
 
 
-def test_soc_range_spec_to_dict_is_compact_for_presets() -> None:
-    """normal()/stress() serialize by kind alone; bounds are implied, not stored"""
-    assert SocRangeSpec.normal().to_dict() == {"kind": "normal"}
-    assert SocRangeSpec.stress().to_dict() == {"kind": "stress"}
+# --------------------------------------------------------------------------------------
+# Workday request streams
+# --------------------------------------------------------------------------------------
 
 
-def test_soc_range_spec_to_dict_carries_bounds_for_custom() -> None:
-    """custom() bounds are not recoverable from kind alone, so they must be stored"""
-    assert SocRangeSpec.custom(0.3, 0.5).to_dict() == {
-        "kind": "custom",
-        "lb": 0.3,
-        "ub": 0.5,
-    }
+@pytest.mark.parametrize("timing", list(ScenarioTiming))
+def test_workday_submissions_leads_and_pickups_respect_bounds(
+    timing: ScenarioTiming,
+) -> None:
+    arrivals = ModemsScenarioGenerator(seed=4).generate_workday_requests(
+        workday_length=480.0,
+        base_rate_per_hour=8,
+        nr_surges=3,
+        scenario_timing=timing,
+        scenario_type="clustered",
+    )
+    times = [t for t, _ in arrivals]
+    assert arrivals and times == sorted(times)
+    for t_submit, r in arrivals:
+        assert 15.0 <= r.earliest_pickup <= 480.0
+        assert (
+            15.0 - 1e-9
+            <= r.earliest_pickup - t_submit
+            <= min(45.0, r.earliest_pickup) + 1e-9
+        )
+        assert r.is_new() and 1 <= r.load <= 5
+    ids = [r.request_id for _, r in arrivals]
+    assert len(set(ids)) == len(ids)
+
+
+def test_workday_stream_is_seed_reproducible() -> None:
+    kwargs = dict(
+        workday_length=240.0, base_rate_per_hour=6, nr_surges=2, scenario_timing="peaks"
+    )
+    a1 = ModemsScenarioGenerator(seed=9).generate_workday_requests(**kwargs)
+    a2 = ModemsScenarioGenerator(seed=9).generate_workday_requests(**kwargs)
+    assert [(t, r.to_dict()) for t, r in a1] == [(t, r.to_dict()) for t, r in a2]
 
 
 @pytest.mark.parametrize(
-    "spec",
-    [SocRangeSpec.normal(), SocRangeSpec.stress(), SocRangeSpec.custom(0.3, 0.5)],
+    "timing, surges", [("uniform", 0), ("uniform", 3), ("peaks", 3)]
 )
-def test_soc_range_spec_to_dict_from_dict_round_trip(spec: SocRangeSpec) -> None:
-    """to_dict()/from_dict() serialization round-trips for every kind"""
-    restored = SocRangeSpec.from_dict(spec.to_dict())
-    assert restored.kind == spec.kind
-    assert restored.bounds == spec.bounds
+def test_workday_mean_request_count(timing: str, surges: int) -> None:
+    """E[count] = base rate x (L - min_lead)/60 + one hour of base rate per surge"""
+    counts = [
+        len(
+            ModemsScenarioGenerator(seed=seed).generate_workday_requests(
+                workday_length=480.0,
+                base_rate_per_hour=5,
+                nr_surges=surges,
+                scenario_timing=timing,
+            )
+        )
+        for seed in range(150)
+    ]
+    assert np.mean(counts) == pytest.approx(
+        5 * (480.0 - 15.0) / 60.0 + 5 * surges, rel=0.05
+    )
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"base_rate_per_hour": 0}, "base_rate_per_hour"),
+        ({"min_lead": 50.0, "max_lead": 40.0}, "min_lead"),
+        ({"min_lead": -1.0}, "min_lead"),
+        ({"workday_length": 15.0}, "workday_length"),
+        ({"nr_surges": -1}, "nr_surges"),
+    ],
+)
+def test_workday_rejects_invalid_arguments(kwargs: dict, match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        ModemsScenarioGenerator(seed=1).generate_workday_requests(**kwargs)
+
+
+# --------------------------------------------------------------------------------------
+# SocRangeSpec
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "spec, kind, bounds, suffix",
+    [
+        (SocRangeSpec.normal(), ScenarioSocRange.normal, NORMAL_SOC_RANGE, "80_100"),
+        (SocRangeSpec.stress(), ScenarioSocRange.stress, STRESS_SOC_RANGE, "50_70"),
+        (
+            SocRangeSpec.custom(0.29, 0.57),
+            ScenarioSocRange.custom,
+            (0.29, 0.57),
+            "29_57",
+        ),
+        (SocRangeSpec.custom(0.5, 0.5), ScenarioSocRange.custom, (0.5, 0.5), "50_50"),
+    ],
+)
+def test_soc_range_spec_kind_bounds_suffix_and_round_trip(
+    spec: SocRangeSpec, kind: ScenarioSocRange, bounds: tuple, suffix: str
+) -> None:
+    assert spec.kind is kind and spec.label == kind.value
+    assert spec.bounds == bounds
+    assert spec.suffix == suffix
+    serialized = spec.to_dict()
+    assert ("lb" in serialized) == (kind is ScenarioSocRange.custom)
+    assert SocRangeSpec.from_dict(serialized) == spec
+
+
+@pytest.mark.parametrize("lb, ub", [(0.0, 0.5), (0.5, 0.3), (0.5, 1.5)])
+def test_soc_range_spec_custom_rejects_invalid_bounds(lb: float, ub: float) -> None:
+    with pytest.raises(ValueError, match="0 < lb <= ub <= 1.0"):
+        SocRangeSpec.custom(lb, ub)

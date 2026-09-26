@@ -12,6 +12,7 @@ import modems.workday_benchmark as workday_benchmark
 from modems.benchmark import ManifestStatus
 from modems.core import (
     ModemsRequest,
+    ObjectiveType,
     ScenarioSize,
     ScenarioTiming,
     ScenarioType,
@@ -56,7 +57,7 @@ def _workday_log(*records: RequestRecord) -> WorkdayLog:
         agent_node_visits={
             "agent_1": [
                 AgentNodeVisit("h_1", 0.0, 0.0, 1.0, 1.0),
-                AgentNodeVisit("r_1_d_2", 25.0, 25.5, 0.9, 0.9),
+                AgentNodeVisit("s_2", 25.0, 25.5, 0.9, 0.9),
             ]
         },
     )
@@ -71,18 +72,22 @@ def _summary(acceptance_rate: float) -> dict[str, float]:
         "total_energy_consumed": 0.25,
         "total_soc_gained_from_charging": 0.1,
         "mean_solve_time_per_epoch": 0.1,
+        "nr_requests_completed": 4,
+        "total_agent_travel_time": 30.0,
     }
 
 
-def _manifest_row(workday_name: str = "WD_br5LN0") -> dict[str, Any]:
+def _manifest_row(workday_name: str = "WC0_SRUN5_1") -> dict[str, Any]:
     """Return a valid pending manifest row for solve-phase tests"""
     return {
         "workday_name": workday_name,
+        "objective_type": ObjectiveType.closed,
         "size": ScenarioSize.small,
         "type": ScenarioType.random,
-        "timing": ScenarioTiming.loose,
+        "timing": ScenarioTiming.uniform,
         "start_time": WorkdayStartTime.normal,
-        "base_rate": 5.0,
+        "base_rate": 5,
+        "nr_surges": 1,
         "repetition": 0,
         "nr_agents": 1,
         "seed": 123,
@@ -103,12 +108,6 @@ def _write_manifest(outdir: Path, row: dict[str, Any]) -> None:
 # --------------------------------------------------------------------------------------
 # Deterministic input construction
 # --------------------------------------------------------------------------------------
-
-
-def test_workday_start_time_is_string_enum() -> None:
-    """WorkdayStartTime values remain stable because they appear in file names"""
-    assert WorkdayStartTime.normal == "N"
-    assert str(WorkdayStartTime.staggered) == "S"
 
 
 def test_build_fleet_applies_staggered_start_and_full_soc() -> None:
@@ -132,17 +131,19 @@ def test_build_workday_is_reproducible_from_seed() -> None:
         seed=19,
         nr_agents=2,
         scenario_type=ScenarioType.mixed,
-        scenario_timing=ScenarioTiming.tight,
-        workday_length=90.0,
-        base_rate_per_hour=1.0,
+        scenario_timing=ScenarioTiming.peaks,
+        workday_length=240.0,
+        base_rate_per_hour=1,
+        nr_surges=2,
     )
     second = workday_benchmark._build_workday(
         seed=19,
         nr_agents=2,
         scenario_type=ScenarioType.mixed,
-        scenario_timing=ScenarioTiming.tight,
-        workday_length=90.0,
-        base_rate_per_hour=1.0,
+        scenario_timing=ScenarioTiming.peaks,
+        workday_length=240.0,
+        base_rate_per_hour=1,
+        nr_surges=2,
     )
 
     _, first_agents, first_submissions = first
@@ -173,9 +174,10 @@ def test_generate_suite_creates_manifest_and_is_resumable(
         "outdir": str(tmp_path),
         "scenario_sizes": [ScenarioSize.small],
         "scenario_types": [ScenarioType.random],
-        "scenario_timings": [ScenarioTiming.loose],
+        "scenario_timings": [ScenarioTiming.uniform],
         "start_times": [WorkdayStartTime.normal],
-        "base_rates": [5.0],
+        "base_rates": [5],
+        "nr_surges": 1,
         "nr_repeats": 1,
         "base_seed": 11,
         "workday_length": 60.0,
@@ -185,10 +187,40 @@ def test_generate_suite_creates_manifest_and_is_resumable(
     second = generate_workday_suite(**kwargs)
     manifest = read_workday_manifest(str(tmp_path))
 
-    assert first == [{"workday_name": "WD_br5LN0", "status": "created"}]
-    assert second == [{"workday_name": "WD_br5LN0", "status": "existing"}]
-    assert set(manifest) == {"WD_br5LN0"}
-    assert manifest["WD_br5LN0"]["status"] == "pending"
+    assert first == [{"workday_name": "WC0_SRUN5_1", "status": "created"}]
+    assert second == [{"workday_name": "WC0_SRUN5_1", "status": "existing"}]
+    assert set(manifest) == {"WC0_SRUN5_1"}
+    assert manifest["WC0_SRUN5_1"]["status"] == "pending"
+
+
+def test_generate_suite_bakes_objective_into_name_and_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An open workday gets the O letter, stores its objective, and screens with it"""
+    screened: list[Any] = []
+    monkeypatch.setattr(
+        workday_benchmark,
+        "RollingHorizonSimulator",
+        lambda *args, **kwargs: screened.append(kwargs["objective"]),
+    )
+    generate_workday_suite(
+        outdir=str(tmp_path),
+        scenario_sizes=[ScenarioSize.small],
+        scenario_types=[ScenarioType.random],
+        scenario_timings=[ScenarioTiming.uniform],
+        start_times=[WorkdayStartTime.normal],
+        base_rates=[5],
+        nr_surges=1,
+        base_seed=11,
+        workday_length=60.0,
+        objective="open",
+    )
+    manifest = read_workday_manifest(str(tmp_path))
+    assert set(manifest) == {"WO0_SRUN5_1"}
+    assert (
+        ObjectiveType(manifest["WO0_SRUN5_1"]["objective_type"]) == ObjectiveType.open
+    )
+    assert screened == [ObjectiveType.open]
 
 
 def test_generate_suite_retries_infeasible_fleets_and_reports_progress(
@@ -213,9 +245,9 @@ def test_generate_suite_retries_infeasible_fleets_and_reports_progress(
         outdir=str(tmp_path),
         scenario_sizes=[ScenarioSize.small],
         scenario_types=[ScenarioType.random],
-        scenario_timings=[ScenarioTiming.loose],
+        scenario_timings=[ScenarioTiming.uniform],
         start_times=[WorkdayStartTime.normal],
-        base_rates=[5.0],
+        base_rates=[5],
         max_feasibility_attempts=2,
         on_progress=events.append,
     )
@@ -243,7 +275,7 @@ def test_generate_suite_does_not_persist_an_infeasible_combination(
         outdir=str(tmp_path),
         scenario_sizes=[ScenarioSize.small],
         scenario_types=[ScenarioType.random],
-        scenario_timings=[ScenarioTiming.loose],
+        scenario_timings=[ScenarioTiming.uniform],
         start_times=[WorkdayStartTime.normal],
         max_feasibility_attempts=2,
     )
@@ -278,7 +310,6 @@ def test_solve_one_workday_forwards_manifest_configuration(
 
     result = workday_benchmark._solve_one_workday(
         row,
-        workday_buffer=30.0,
         model_params={"rho": 2.5},
         milp_timelimit=2.0,
         alns_max_iter=40,
@@ -288,10 +319,12 @@ def test_solve_one_workday_forwards_manifest_configuration(
     )
 
     assert observed["args"] == (generator.network, agents, submissions)
-    assert observed["kwargs"]["workday_length"] == 90.0
+    assert observed["kwargs"]["workday_length"] == 60.0  # no buffer, drained instead
     assert observed["kwargs"]["milp_timelimit"] == 2.0
     assert observed["kwargs"]["alns_max_iter"] == 40
     assert observed["kwargs"]["workday_logs_out"] is logs
+    assert observed["kwargs"]["objective"] == ObjectiveType.closed
+    assert result["objective_type"] == ObjectiveType.closed
     assert result["nr_submissions"] == 1
     assert result["milp3"]["acceptance_rate"] == 0.75
 
@@ -305,6 +338,7 @@ def test_solve_suite_persists_result_log_and_done_state(
     record = RequestRecord(
         _request("request-a"),
         submission_time=1.0,
+        earliest_pickup=2.0,
         outcome=RequestOutcome.accepted,
         pickup_time=12.0,
         delivery_time=20.0,
@@ -401,8 +435,8 @@ def test_build_workday_table_writes_all_formats_and_pending_rows(
     tmp_path: Path,
 ) -> None:
     """Build is read-only with respect to solving and retains unfinished rows"""
-    done = _manifest_row("WD_done")
-    pending = _manifest_row("WD_pending")
+    done = _manifest_row("W_done")
+    pending = _manifest_row("W_pending")
     pending["status"] = ManifestStatus.pending
     result_path = tmp_path / "result.json"
     result_path.write_text(
@@ -418,13 +452,13 @@ def test_build_workday_table_writes_all_formats_and_pending_rows(
     done["result_file"] = str(result_path)
     tmp_path.mkdir(parents=True, exist_ok=True)
     with (tmp_path / "manifest.json").open("w") as file:
-        json.dump({"WD_done": done, "WD_pending": pending}, file, default=str)
+        json.dump({"W_done": done, "W_pending": pending}, file, default=str)
 
     rows = build_workday_summary_table(str(tmp_path), rows_per_block=1)
 
     by_name = {row["workday"]: row for row in rows}
-    assert by_name["WD_done"]["accept_delta_pp"] == pytest.approx(12.5)
-    assert by_name["WD_pending"]["nr_submissions"] is None
+    assert by_name["W_done"]["accept_delta_pp"] == pytest.approx(12.5)
+    assert by_name["W_pending"]["nr_submissions"] is None
     for suffix in ("csv", "json", "tex"):
         assert (tmp_path / f"summary_table.{suffix}").is_file()
     assert (tmp_path / "summary_table.tex").read_text().count(r"\begin{table*}") == 2
@@ -435,7 +469,7 @@ def test_build_requests_table_requires_a_solved_log(tmp_path: Path) -> None:
     _write_manifest(tmp_path, _manifest_row())
 
     with pytest.raises(ValueError, match="run the solve phase first"):
-        build_workday_requests_table(str(tmp_path), "WD_br5LN0")
+        build_workday_requests_table(str(tmp_path), "WC0_SRUN5_1")
 
 
 def test_build_requests_table_joins_by_id_and_preserves_raw_json_times(
@@ -445,6 +479,7 @@ def test_build_requests_table_joins_by_id_and_preserves_raw_json_times(
     accepted = RequestRecord(
         _request("request-a"),
         submission_time=5.0,
+        earliest_pickup=10.0,
         outcome=RequestOutcome.accepted,
         pickup_time=15.0,
         delivery_time=25.0,
@@ -455,11 +490,13 @@ def test_build_requests_table_joins_by_id_and_preserves_raw_json_times(
     rejected = RequestRecord(
         _request("request-b", pickup=2, delivery=3),
         submission_time=10.0,
+        earliest_pickup=20.0,
         outcome=RequestOutcome.rejected,
     )
     alns_accepted = RequestRecord(
         _request("request-a"),
         submission_time=5.0,
+        earliest_pickup=12.0,
         outcome=RequestOutcome.accepted,
         pickup_time=14.0,
         delivery_time=24.0,
@@ -493,16 +530,19 @@ def test_build_requests_table_joins_by_id_and_preserves_raw_json_times(
     assert rows[0]["pickup_time_alns"] == 14.0
     assert rows[1]["outcome_alns"] is None
     json_rows = json.loads(
-        (tmp_path / "requests_tables" / "WD_br5LN0_requests_table.json").read_text()
+        (tmp_path / "requests_tables" / "WC0_SRUN5_1_requests_table.json").read_text()
     )
     assert json_rows[0]["pickup_time_milp3"] == 15.0
-    with (tmp_path / "requests_tables" / "WD_br5LN0_requests_table.csv").open(
+    with (tmp_path / "requests_tables" / "WC0_SRUN5_1_requests_table.csv").open(
         newline=""
     ) as file:
         csv_rows = list(csv.DictReader(file))
     assert csv_rows[0]["submission_time"] == "08:05"
+    assert csv_rows[0]["earliest_pickup"] == "08:10"
     assert csv_rows[0]["pickup_time_milp3"] == "08:15"
-    latex = (tmp_path / "requests_tables" / "WD_br5LN0_requests_table.tex").read_text()
+    latex = (
+        tmp_path / "requests_tables" / "WC0_SRUN5_1_requests_table.tex"
+    ).read_text()
     assert latex.count(r"\begin{table*}") == 2
 
 
@@ -512,11 +552,13 @@ def test_plot_workday_soc_acceptance_creates_nonempty_png(tmp_path: Path) -> Non
         RequestRecord(
             _request("request-a"),
             submission_time=5.0,
+            earliest_pickup=10.0,
             outcome=RequestOutcome.accepted,
         ),
         RequestRecord(
             _request("request-b", pickup=2, delivery=3),
             submission_time=10.0,
+            earliest_pickup=15.0,
             outcome=RequestOutcome.rejected,
         ),
     )
@@ -525,3 +567,52 @@ def test_plot_workday_soc_acceptance_creates_nonempty_png(tmp_path: Path) -> Non
 
     assert output == tmp_path / "sample_soc_acceptance.png"
     assert output.stat().st_size > 0
+
+
+# --------------------------------------------------------------------------------------
+# End to end: generate / solve (real MILP3 and ALNS) / build / plot
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("objective", [ObjectiveType.closed, ObjectiveType.open])
+def test_workday_pipeline_end_to_end(tmp_path: Path, objective: ObjectiveType) -> None:
+    outdir = str(tmp_path)
+    (created,) = generate_workday_suite(
+        outdir,
+        scenario_sizes=[ScenarioSize.small],
+        scenario_types=[ScenarioType.random],
+        scenario_timings=[ScenarioTiming.uniform],
+        start_times=[WorkdayStartTime.staggered],
+        base_rates=[8],
+        nr_surges=0,
+        workday_length=45.0,
+        objective=objective,
+    )
+    assert created["status"] == ManifestStatus.created
+    name = created["workday_name"]
+
+    (solved,) = solve_workday_suite(outdir, milp_timelimit=5.0, alns_max_iter=10)
+    assert solved == {"workday_name": name, "status": ManifestStatus.done}
+    row = read_workday_manifest(outdir)[name]
+    assert 0.0 <= row["accept_rate_milp3"] <= 1.0
+
+    (summary,) = build_workday_summary_table(outdir)
+    assert (summary["workday"], summary["objective_type"]) == (name, objective)
+    assert summary["status"] == ManifestStatus.done
+    assert summary["accept_delta_pp"] == pytest.approx(
+        100.0 * (summary["accept_alns"] - summary["accept_milp3"])
+    )
+    requests = build_workday_requests_table(outdir, name, clock_display_start="08:00")
+    with open(row["workday_log_file"]) as f:
+        logs = {k: WorkdayLog.from_dict(v) for k, v in json.load(f).items()}
+    assert set(logs) == {"milp3", "alns"}
+    assert len(requests) == len(logs["alns"].requests) == len(logs["milp3"].requests)
+    for solver_key, log in logs.items():
+        outcomes = {record.outcome for record in log.requests}
+        assert RequestOutcome.unresolved not in outcomes
+        path = plot_workday_soc_acceptance(
+            log, str(tmp_path / "plots"), f"{name}_{solver_key}"
+        )
+        assert Path(path).stat().st_size > 0
+    assert solve_workday_suite(outdir) == []

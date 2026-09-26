@@ -530,6 +530,106 @@ def _delta_pp(alns_value: float | None, milp3_value: float | None) -> float | No
     return 100.0 * (alns_value - milp3_value)
 
 
+SUMMARY_FIELDS = [
+    "workday",
+    "objective_type",
+    "size",
+    "type",
+    "timing",
+    "start_time",
+    "base_rate",
+    "nr_surges",
+    "nr_agents",
+    "status",
+    "nr_submissions",
+    "accept_milp3",
+    "accept_alns",
+    "accept_delta_pp",
+    "tardiness_milp3",
+    "tardiness_alns",
+    "excess_ride_time_milp3",
+    "excess_ride_time_alns",
+    "energy_consumed_milp3",
+    "energy_consumed_alns",
+    "energy_recovered_milp3",
+    "energy_recovered_alns",
+    "solve_time_milp3",
+    "solve_time_alns",
+    "nr_served_milp3",
+    "nr_served_alns",
+    "travel_time_milp3",
+    "travel_time_alns",
+]
+
+# summary field prefix -> key of the per-solver metrics in a workday result file
+_SOLVER_METRIC_KEYS = {
+    "tardiness": "mean_delay_time",
+    "excess_ride_time": "mean_excess_ride_time",
+    "energy_consumed": "total_energy_consumed",
+    "energy_recovered": "total_soc_gained_from_charging",
+    "solve_time": "mean_solve_time_per_epoch",
+    "nr_served": "nr_requests_completed",
+    "travel_time": "total_agent_travel_time",
+}
+
+
+def workday_summary_row(workday_name: str, row: dict[str, Any]) -> dict[str, Any]:
+    """
+    One summary-table row (MILP3 and ALNS side by side) for a workday manifest row;
+    metric fields are None unless the row is done
+    """
+    status = ManifestStatus(row["status"])
+    summary = {field: None for field in SUMMARY_FIELDS}
+    summary.update(
+        workday=workday_name,
+        objective_type=row.get("objective_type"),
+        size=row.get("size"),
+        type=row.get("type"),
+        timing=row.get("timing"),
+        start_time=row.get("start_time"),
+        base_rate=row.get("base_rate"),
+        nr_surges=row.get("nr_surges"),
+        nr_agents=row.get("nr_agents"),
+        status=status,
+    )
+    if status != ManifestStatus.done:
+        return summary
+    with open(row["result_file"]) as f:
+        data = json.load(f)
+    milp3, alns = data["milp3"], data["alns"]
+    summary.update(
+        nr_submissions=data["nr_submissions"],
+        accept_milp3=milp3["acceptance_rate"],
+        accept_alns=alns["acceptance_rate"],
+        accept_delta_pp=_delta_pp(alns["acceptance_rate"], milp3["acceptance_rate"]),
+    )
+    for prefix, key in _SOLVER_METRIC_KEYS.items():
+        summary[f"{prefix}_milp3"] = milp3[key]
+        summary[f"{prefix}_alns"] = alns[key]
+    return summary
+
+
+def write_workday_summary_files(
+    rows: list[dict[str, Any]],
+    outdir: str,
+    table_name: str,
+    fieldnames: list[str] = SUMMARY_FIELDS,
+    rows_per_block: int = MAX_ROWS_PER_BLOCK,
+) -> None:
+    """Write summary rows to {outdir}/{table_name}.{csv,json,tex}"""
+    os.makedirs(outdir, exist_ok=True)
+    with open(os.path.join(outdir, f"{table_name}.csv"), "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for r in rows:
+            writer.writerow(r)
+    with open(os.path.join(outdir, f"{table_name}.json"), "w") as f:
+        json.dump(rows, f, indent=4, default=str)
+    _write_latex_file(
+        rows, os.path.join(outdir, f"{table_name}.tex"), rows_per_block=rows_per_block
+    )
+
+
 def build_workday_summary_table(
     outdir: str,
     table_name: str = "summary_table",
@@ -539,118 +639,12 @@ def build_workday_summary_table(
     Build the paired MILP3-vs-ALNS workday comparison table from the manifest + result
     files; write {table_name}.csv, {table_name}.json, and {table_name}.tex to outdir.
     The tex file is landscape, booktabs/siunitx, split into multiple table* blocks
-    beyond past rows_per_block rows) to outdir. Return the list of row dicts, one row
-    per workday, with side-by-side MILP3 and ALNS metrics
+    past rows_per_block rows. Return the list of row dicts, one row per workday, with
+    side-by-side MILP3 and ALNS metrics
     """
     manifest = read_workday_manifest(outdir)
-    rows: list[dict[str, Any]] = []
-    for workday_name, row in sorted(manifest.items()):
-        status = ManifestStatus(row["status"])
-        if status != ManifestStatus.done:
-            rows.append(
-                {
-                    "workday": workday_name,
-                    "objective_type": row.get("objective_type"),
-                    "size": row.get("size"),
-                    "type": row.get("type"),
-                    "timing": row.get("timing"),
-                    "start_time": row.get("start_time"),
-                    "base_rate": row.get("base_rate"),
-                    "nr_surges": row.get("nr_surges"),
-                    "nr_agents": row.get("nr_agents"),
-                    "status": status,
-                    "nr_submissions": None,
-                    "accept_milp3": None,
-                    "accept_alns": None,
-                    "accept_delta_pp": None,
-                    "tardiness_milp3": None,
-                    "tardiness_alns": None,
-                    "excess_ride_time_milp3": None,
-                    "excess_ride_time_alns": None,
-                    "energy_consumed_milp3": None,
-                    "energy_consumed_alns": None,
-                    "energy_recovered_milp3": None,
-                    "energy_recovered_alns": None,
-                    "solve_time_milp3": None,
-                    "solve_time_alns": None,
-                }
-            )
-            continue
-        with open(row["result_file"]) as f:
-            data = json.load(f)
-        milp3, alns = data["milp3"], data["alns"]
-        rows.append(
-            {
-                "workday": workday_name,
-                "objective_type": row["objective_type"],
-                "size": row["size"],
-                "type": row["type"],
-                "timing": row["timing"],
-                "start_time": row.get("start_time"),
-                "base_rate": row.get("base_rate"),
-                "nr_surges": row.get("nr_surges"),
-                "nr_agents": row["nr_agents"],
-                "status": status,
-                "nr_submissions": data["nr_submissions"],
-                "accept_milp3": milp3["acceptance_rate"],
-                "accept_alns": alns["acceptance_rate"],
-                "accept_delta_pp": _delta_pp(
-                    alns["acceptance_rate"], milp3["acceptance_rate"]
-                ),
-                "tardiness_milp3": milp3["mean_delay_time"],
-                "tardiness_alns": alns["mean_delay_time"],
-                "excess_ride_time_milp3": milp3["mean_excess_ride_time"],
-                "excess_ride_time_alns": alns["mean_excess_ride_time"],
-                "energy_consumed_milp3": milp3["total_energy_consumed"],
-                "energy_consumed_alns": alns["total_energy_consumed"],
-                "energy_recovered_milp3": milp3["total_soc_gained_from_charging"],
-                "energy_recovered_alns": alns["total_soc_gained_from_charging"],
-                "solve_time_milp3": milp3["mean_solve_time_per_epoch"],
-                "solve_time_alns": alns["mean_solve_time_per_epoch"],
-            }
-        )
-
-    os.makedirs(outdir, exist_ok=True)
-    csv_path = os.path.join(outdir, f"{table_name}.csv")
-    json_path = os.path.join(outdir, f"{table_name}.json")
-    tex_path = os.path.join(outdir, f"{table_name}.tex")
-
-    fieldnames = [
-        "workday",
-        "objective_type",
-        "size",
-        "type",
-        "timing",
-        "start_time",
-        "base_rate",
-        "nr_surges",
-        "nr_agents",
-        "status",
-        "nr_submissions",
-        "accept_milp3",
-        "accept_alns",
-        "accept_delta_pp",
-        "tardiness_milp3",
-        "tardiness_alns",
-        "excess_ride_time_milp3",
-        "excess_ride_time_alns",
-        "energy_consumed_milp3",
-        "energy_consumed_alns",
-        "energy_recovered_milp3",
-        "energy_recovered_alns",
-        "solve_time_milp3",
-        "solve_time_alns",
-    ]
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        for r in rows:
-            writer.writerow(r)
-
-    with open(json_path, "w") as f:
-        json.dump(rows, f, indent=4, default=str)
-
-    _write_latex_file(rows, tex_path, rows_per_block=rows_per_block)
+    rows = [workday_summary_row(name, row) for name, row in sorted(manifest.items())]
+    write_workday_summary_files(rows, outdir, table_name, rows_per_block=rows_per_block)
     return rows
 
 
@@ -884,6 +878,26 @@ def _requests_latex_table_block(
     return "\n".join([header] + body_lines + [footer])
 
 
+def agent_soc_series(
+    workday_log: WorkdayLog,
+) -> list[tuple[str, list[float], list[float]]]:
+    """
+    Per-agent (name, times, SoC) arrival series of a WorkdayLog, extended flat to
+    clock_end once the agent stops. Committed arrivals past clock_end (e.g., the final
+    return to a hub) are kept as-is. agent_id is not human-friendly, so agents are
+    tagged with a numerical 1-based name in log order
+    """
+    series = []
+    for idx, node_visits in enumerate(workday_log.agent_node_visits.values()):
+        t_soc = [visit.arrival_time for visit in node_visits]
+        soc = [visit.soc_arrival for visit in node_visits]
+        if t_soc[-1] < workday_log.clock_end:
+            t_soc.append(workday_log.clock_end)
+            soc.append(soc[-1])
+        series.append((ModemsAgent.make_agent_name(idx + 1), t_soc, soc))
+    return series
+
+
 def plot_workday_soc_acceptance(
     workday_log: WorkdayLog,
     outdir: str,
@@ -917,17 +931,7 @@ def plot_workday_soc_acceptance(
 
     soc_handles = []
     # compile and plot agent data
-    for idx, (_, node_visits) in enumerate(workday_log.agent_node_visits.items()):
-        # agent_id is not human-friendly, compile a numerical 1-based tag instead
-        agent_name = ModemsAgent.make_agent_name(idx + 1)
-        t_soc: list[float] = []
-        soc: list[float] = []
-        for node_visit in node_visits:
-            t_soc.append(node_visit.arrival_time)
-            soc.append(node_visit.soc_arrival)
-        # agent stopped, extend flat to t_final
-        t_soc.append(t_final)
-        soc.append(soc[-1])
+    for idx, (agent_name, t_soc, soc) in enumerate(agent_soc_series(workday_log)):
         (line,) = ax2.plot(
             t_soc,
             soc,

@@ -1,571 +1,410 @@
+"""
+Unit tests for modems.algorithms: preprocessing (Alg.1), greedy completion (Alg.2),
+and feasible-insertion enumeration (Alg.3): append-only (MILPs) and insertion (ALNS).
+alns_feasible_insertions is validated against the brute-force oracle variant_v0_naive,
+which tries every (pickup, delivery) position pair through ModemsJourney.insert_at():
+candidate sets, propagated states, and delta_obj must match
+"""
+
 from __future__ import annotations
 
 import math
 
 import pytest
 
-from modems import ModemsScenarioGenerator
 from modems.algorithms import (
-    InsertionCandidate,
     _sort_key,
     alns_feasible_insertions,
     greedy_complete,
     milp_feasible_insertions,
     preprocess,
 )
-from modems.core import ModemsScenario, ProblemContext, ProblemType, SolverStrategy
+from modems.core import ModemsAgent, ModemsRequest, ProblemContext
 from modems.insertion_ablation import variant_v0_naive
 from modems.solution import ModemsJourney, ModemsSolution
 
-PARAMS: dict = {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 2.0, "omega": 5.0}
+from .builders import (
+    duration_limited_scenario,
+    generated,
+    greedy_solution,
+    line_scenario,
+    make_ctx,
+)
+
+STATE_FIELDS = ("t_arr", "t_wait", "t_start", "t_dep", "tau", "phi_arr", "phi_dep")
 
 
-def _preprocess(
-    scenario: ModemsScenario,
-    problem_type: ProblemType,
-    strategy: SolverStrategy,
-    model_params: dict = PARAMS,
-) -> tuple[ModemsSolution | None, set[str]]:
-    """Build a ProblemContext from raw arguments, then run Algorithm 1 on it"""
-    return preprocess(ProblemContext(scenario, problem_type, strategy, model_params))
+def partially_filled(
+    ctx: ProblemContext, nr_held: int
+) -> tuple[ModemsSolution, list[str]]:
+    """Greedy-fill all but the last nr_held requests (in greedy order), return both"""
+    base, unassigned = preprocess(ctx)
+    assert base is not None
+    ordered = sorted(unassigned, key=lambda r: _sort_key(ctx, r))
+    solution, _, _ = greedy_complete(base, set(ordered[:-nr_held]))
+    return solution, ordered[-nr_held:]
 
 
-def _candidate_map(
-    candidates: list[InsertionCandidate],
-) -> dict[tuple[str, tuple[str, ...]], float]:
-    """Map candidates by (agent, route) -> delta_obj for order-independent comparison"""
-    return {
-        (c.journey.agent_name, tuple(c.journey.route)): c.delta_obj for c in candidates
+# --------------------------------------------------------------------------------------
+# Algorithm 1: preprocess
+# --------------------------------------------------------------------------------------
+
+SCHEDULED = ModemsRequest(1, 4, earliest_pickup=5.0, status="scheduled", request_id="s")
+NEW = ModemsRequest(2, 3, earliest_pickup=20.0, request_id="n")
+INHERITED_ROUTE = ["a_1_h_1", "r_1_p_1", "r_1_d_4", "h_1"]
+
+
+def inherited_plan(
+    ctx: ProblemContext, route: list[str] = INHERITED_ROUTE, **kwargs
+) -> ModemsSolution:
+    plan = ModemsSolution(ctx)
+    plan.journeys["agent_1"] = ModemsJourney.from_route(ctx, "agent_1", route, **kwargs)
+    plan.accepted = set(plan.journeys["agent_1"].request_pickup)
+    return plan
+
+
+def test_preprocess_with_only_new_requests_returns_the_idle_fleet() -> None:
+    ctx = make_ctx(line_scenario([NEW]))
+    base, unassigned = preprocess(ctx)
+    assert base is not None and unassigned == {"request_1"}
+    assert base.accepted == set() and not base.journeys["agent_1"].is_active
+
+
+def test_preprocess_adopts_the_inherited_route_with_its_exact_timing() -> None:
+    ctx = make_ctx(line_scenario([SCHEDULED, NEW]), "milp3")
+    starts = {"r_1_p_1": 7.0, "r_1_d_4": 11.0}
+    plan = inherited_plan(ctx, t_start_of=starts, tau_of={"r_1_p_1": 0.0})
+
+    base, unassigned = preprocess(ctx, partial_plan=plan)
+
+    assert base is not None and unassigned == {"request_2"}
+    assert base.accepted == {"request_1"}
+    journey = base.journeys["agent_1"]
+    assert journey.route == INHERITED_ROUTE
+    assert [s.t_start for s in journey.states[1:3]] == [7.0, 11.0]
+    completed, _, ok = greedy_complete(base, unassigned)
+    assert ok and completed.accepted == {"request_1", "request_2"}
+
+
+def _no_plan(ctx: ProblemContext) -> None:
+    return None
+
+
+def _plan_missing_agent(ctx: ProblemContext) -> ModemsSolution:
+    plan = inherited_plan(ctx)
+    plan.journeys.pop("agent_1")
+    return plan
+
+
+def _plan_with_other_request_id(ctx: ProblemContext) -> ModemsSolution:
+    other = ModemsRequest(1, 4, earliest_pickup=5.0, status="scheduled", request_id="x")
+    return inherited_plan(make_ctx(line_scenario([other, NEW])))
+
+
+def _plan_routing_a_new_request(ctx: ProblemContext) -> ModemsSolution:
+    return inherited_plan(
+        ctx, ["a_1_h_1", "r_1_p_1", "r_2_p_2", "r_2_d_3", "r_1_d_4", "h_1"]
+    )
+
+
+def _plan_without_the_scheduled_request(ctx: ProblemContext) -> ModemsSolution:
+    return ModemsSolution(ctx)
+
+
+def _plan_with_impossible_timing(ctx: ProblemContext) -> ModemsSolution:
+    plan = inherited_plan(ctx)
+    plan.journeys["agent_1"].states[1].t_start = 0.5  # before arrival at t=1
+    return plan
+
+
+@pytest.mark.parametrize(
+    "make_plan",
+    [
+        _no_plan,
+        _plan_missing_agent,
+        _plan_with_other_request_id,
+        _plan_routing_a_new_request,
+        _plan_without_the_scheduled_request,
+        _plan_with_impossible_timing,
+    ],
+)
+def test_preprocess_fails_on_missing_or_inconsistent_partial_plans(make_plan) -> None:
+    ctx = make_ctx(line_scenario([SCHEDULED, NEW]))
+    base, unassigned = preprocess(ctx, partial_plan=make_plan(ctx))
+    assert base is None
+    assert unassigned == {"request_2"}
+
+
+def test_preprocess_fails_when_an_agent_cannot_reach_a_hub() -> None:
+    agent = ModemsAgent("s", 6, soc_initial=0.26, soc_min_operational=0.25)
+    base, _ = preprocess(make_ctx(line_scenario([NEW], agents=[agent])))
+    assert base is None
+
+
+# --------------------------------------------------------------------------------------
+# Algorithm 2: greedy_complete
+# --------------------------------------------------------------------------------------
+
+
+def test_greedy_order_is_deadline_then_load_then_name() -> None:
+    requests = [
+        ModemsRequest(1, 2, load=1, earliest_pickup=20.0, request_id="a"),
+        ModemsRequest(1, 2, load=1, earliest_pickup=10.0, request_id="b"),
+        ModemsRequest(1, 2, load=3, earliest_pickup=20.0, request_id="c"),
+        ModemsRequest(
+            1, 2, load=1, earliest_pickup=20.0, tw_length=5.0, request_id="d"
+        ),
+    ]
+    ctx = make_ctx(line_scenario(requests))
+    ordered = sorted(ctx.request_names, key=lambda r: _sort_key(ctx, r))
+    assert ordered == ["request_2", "request_3", "request_1", "request_4"]
+
+
+@pytest.mark.parametrize("strategy", ["milp1", "milp2", "milp3", "alns"])
+@pytest.mark.parametrize("objective", ["closed", "open"])
+def test_greedy_produces_a_consistent_feasible_solution(
+    strategy: str, objective: str
+) -> None:
+    ctx = make_ctx(generated(7, nr_agents=2, nr_requests=6), strategy, objective)
+    base, unassigned = preprocess(ctx)
+    solution, rejected, ok = greedy_complete(base, unassigned)
+    assert ok
+    assert all(journey._is_feasible() for journey in solution.journeys.values())
+    routed = {r for j in solution.journeys.values() for r in j.request_pickup}
+    assert routed == solution.accepted
+    assert rejected == solution.rejected == solution.pending()
+    assert solution.accepted  # generated demand is serviceable for every strategy
+    assert base.accepted == set()  # input plan is not mutated
+
+
+def test_greedy_milp2_serves_requests_that_require_waiting() -> None:
+    """Arriving at t=2 for a window [10, 15] is feasible: the agent waits"""
+    request = ModemsRequest(2, 5, earliest_pickup=10.0)
+    solution = greedy_solution(make_ctx(line_scenario([request]), "milp2"))
+    assert solution.accepted == {"request_1"}
+    assert solution.journeys["agent_1"].states[1].t_start == 10.0
+
+
+@pytest.mark.parametrize("strategy, accepted", [("milp2", False), ("milp3", True)])
+def test_greedy_hard_time_window_rejects_late_arrivals(
+    strategy: str, accepted: bool
+) -> None:
+    """Arriving at s6 at t=6 misses the window [0, 1]: only soft-TW strategies accept"""
+    late = ModemsRequest(6, 1, earliest_pickup=0.0, tw_length=1.0)
+    solution = greedy_solution(make_ctx(line_scenario([late]), strategy))
+    assert (solution.accepted == {"request_1"}) == accepted
+
+
+def test_greedy_non_selective_fails_on_the_first_unservable_request() -> None:
+    ctx = make_ctx(duration_limited_scenario(), "milp1")
+    base, unassigned = preprocess(ctx)
+    _, rejected, ok = greedy_complete(base, unassigned)
+    assert not ok and rejected == {"request_2"}
+
+
+def test_greedy_adopts_the_minimum_delta_candidate() -> None:
+    ctx = make_ctx(generated(3, nr_agents=2, nr_requests=4))
+    base, unassigned = preprocess(ctx)
+    first = sorted(unassigned, key=lambda r: _sort_key(ctx, r))[0]
+    best = min(alns_feasible_insertions(base, first), key=lambda c: c.delta_obj)
+    solution, _, _ = greedy_complete(base, {first})
+    assert solution.journeys[best.journey.agent_name].route == best.journey.route
+
+
+# --------------------------------------------------------------------------------------
+# MILPs: append-only insertions
+# --------------------------------------------------------------------------------------
+
+
+def test_milp_insertions_append_at_route_end_without_touching_the_source() -> None:
+    ctx = make_ctx(generated(1, nr_agents=2, nr_requests=4), "milp3")
+    solution, (held,) = partially_filled(ctx, nr_held=1)
+    before = {
+        k: (list(j.route), dict(j.request_pickup)) for k, j in solution.journeys.items()
     }
 
+    candidates = milp_feasible_insertions(solution, held)
 
-def _candidates_by_route(
-    candidates: list[InsertionCandidate],
-) -> dict[tuple[str, tuple[str, ...]], InsertionCandidate]:
-    """Index candidates by (agent, route) -> the candidate itself"""
-    return {(c.journey.agent_name, tuple(c.journey.route)): c for c in candidates}
+    assert {c.journey.agent_name for c in candidates} == set(ctx.agent_names)
+    for c in candidates:
+        route = c.journey.route
+        assert route[-3:-1] == [ctx.pickup_node[held], ctx.delivery_node[held]]
+        assert route[:-3] == solution.journeys[c.journey.agent_name].route[:-1]
+        assert c.journey._is_feasible()
+    after = {
+        k: (list(j.route), dict(j.request_pickup)) for k, j in solution.journeys.items()
+    }
+    assert after == before
 
 
-def _ordered(ctx: ProblemContext, requests: set[str]) -> list[str]:
-    """Sort requests by greedy_complete()'s own key for deterministic test ordering"""
-    return sorted(requests, key=lambda r: _sort_key(ctx, r))
+@pytest.mark.parametrize(
+    "enumerate_", [milp_feasible_insertions, alns_feasible_insertions]
+)
+def test_insertions_respect_capacity_and_agent_filter(enumerate_) -> None:
+    agents = [ModemsAgent("h", 1, load_max=2), ModemsAgent("h", 1, load_max=6)]
+    requests = [ModemsRequest(1, 2, load=4, request_id="a")]
+    strategy = "alns" if enumerate_ is alns_feasible_insertions else "milp3"
+    base, _ = preprocess(make_ctx(line_scenario(requests, agents=agents), strategy))
+    assert {c.journey.agent_name for c in enumerate_(base, "request_1")} == {"agent_2"}
+    assert enumerate_(base, "request_1", agents=["agent_1"]) == []
+    assert enumerate_(base, "request_1", agents=[]) == []
 
 
-def _assert_matches_reference(solution: ModemsSolution, request_name: str) -> None:
-    """Assert alns_feasible_insertions() and the brute-force reference match exactly"""
-    new = _candidates_by_route(alns_feasible_insertions(solution, request_name))
-    ref = _candidates_by_route(variant_v0_naive(solution, request_name))
-    assert set(new.keys()) == set(ref.keys())
-    for key in new:
-        candidate = new[key]
-        reference = ref[key]
+# --------------------------------------------------------------------------------------
+# ALNS: all feasible insertions
+# --------------------------------------------------------------------------------------
+
+
+def assert_matches_oracle(solution: ModemsSolution, request_name: str) -> int:
+    """Compare Algorithm 3 against the V0 oracle, return the number of candidates"""
+    fast = {
+        (c.journey.agent_name, tuple(c.journey.route)): c
+        for c in alns_feasible_insertions(solution, request_name)
+    }
+    slow = {
+        (c.journey.agent_name, tuple(c.journey.route)): c
+        for c in variant_v0_naive(solution, request_name)
+    }
+    assert fast.keys() == slow.keys()
+    base_obj = solution.objective()
+    for key, candidate in fast.items():
+        reference = slow[key]
         assert math.isclose(
-            candidate.delta_obj,
-            reference.delta_obj,
-            rel_tol=1e-9,
-            abs_tol=1e-7,
-        ), f"{key}: new={candidate.delta_obj!r} ref={reference.delta_obj!r}"
-        assert candidate.journey.request_pickup == reference.journey.request_pickup
-        assert candidate.journey.request_delivery == reference.journey.request_delivery
-        assert len(candidate.journey.states) == len(reference.journey.states)
-        for actual_state, reference_state in zip(
-            candidate.journey.states, reference.journey.states
+            candidate.delta_obj, reference.delta_obj, rel_tol=1e-9, abs_tol=1e-7
+        ), key
+        for actual, expected in zip(
+            candidate.journey.states, reference.journey.states, strict=True
         ):
-            assert actual_state.node == reference_state.node
-            assert actual_state.z_arr == reference_state.z_arr
-            assert actual_state.z_dep == reference_state.z_dep
-            for attribute in (
-                "t_arr",
-                "t_wait",
-                "t_start",
-                "t_dep",
-                "tau",
-                "phi_arr",
-                "phi_dep",
-            ):
+            assert (actual.node, actual.z_arr, actual.z_dep) == (
+                expected.node,
+                expected.z_arr,
+                expected.z_dep,
+            )
+            for field in STATE_FIELDS:
                 assert math.isclose(
-                    getattr(actual_state, attribute),
-                    getattr(reference_state, attribute),
+                    getattr(actual, field),
+                    getattr(expected, field),
                     rel_tol=1e-9,
                     abs_tol=1e-7,
-                ), f"{key} state {actual_state.node} attribute {attribute}"
-
+                ), (key, actual.node, field)
+        assert candidate.journey.request_pickup == reference.journey.request_pickup
+        assert candidate.journey.request_delivery == reference.journey.request_delivery
+        assert candidate.journey._is_feasible()
         adopted = solution.copy()
         adopted.journeys[candidate.journey.agent_name] = candidate.journey
         adopted.accepted.add(request_name)
-        adopted.rejected.discard(request_name)
         assert math.isclose(
-            adopted.objective() - solution.objective(),
+            adopted.objective() - base_obj,
             candidate.delta_obj,
             rel_tol=1e-9,
             abs_tol=1e-7,
         )
+    return len(fast)
 
 
-# --------------------------------------------------------------------------------------
-# Algorithm 1 -- preprocess()
-# --------------------------------------------------------------------------------------
-
-
-def test_preprocess_succeeds_with_all_new_requests(
-    small_scenario: ModemsScenario,
+@pytest.mark.parametrize("objective", ["closed", "open"])
+@pytest.mark.parametrize("seed", range(1, 11))
+def test_algorithm3_matches_the_oracle_on_filled_routes(
+    seed: int, objective: str
 ) -> None:
-    """With no scheduled requests, preprocess() always returns a feasible base plan"""
-    ctx = ProblemContext(
-        small_scenario,
-        ProblemType.closed_selective,
-        SolverStrategy.alns,
-        PARAMS,
+    scenario = generated(seed, nr_agents=1 + seed % 3, nr_requests=6 + seed % 8)
+    solution, held = partially_filled(
+        make_ctx(scenario, objective=objective), nr_held=3
     )
-    sol, unassigned = preprocess(ctx)
-    assert sol is not None
-    assert unassigned == set(sol.ctx.request_names)
+    for request_name in held:
+        assert_matches_oracle(solution, request_name)
 
 
-# --------------------------------------------------------------------------------------
-# Algorithm 2 -- greedy_complete()
-# --------------------------------------------------------------------------------------
-
-
-def test_greedy_complete_accepts_feasible_requests(
-    small_scenario: ModemsScenario,
+@pytest.mark.parametrize("scenario_type", ["clustered", "mixed"])
+@pytest.mark.parametrize("timing", ["uniform", "peaks"])
+def test_algorithm3_matches_the_oracle_across_spatial_and_temporal_shapes(
+    scenario_type: str, timing: str
 ) -> None:
-    """greedy_complete() buckets every request into accepted or rejected"""
+    scenario = generated(
+        5,
+        nr_agents=2,
+        nr_requests=12,
+        scenario_type=scenario_type,
+        scenario_timing=timing,
+    )
+    solution, held = partially_filled(make_ctx(scenario), nr_held=3)
+    for request_name in held:
+        assert_matches_oracle(solution, request_name)
+
+
+def test_algorithm3_matches_the_oracle_when_soc_is_scarce() -> None:
+    """Low starting SoC makes the energy-based pruning bounds decide the outcome"""
+    counts = []
+    for seed in range(1, 6):
+        scenario = generated(seed, nr_agents=1, nr_requests=10, soc_lb=0.4, soc_ub=0.5)
+        solution, held = partially_filled(make_ctx(scenario), nr_held=4)
+        counts += [assert_matches_oracle(solution, r) for r in held]
+    assert 0 in counts and sum(counts) > 0  # both pruned and surviving probes occur
+
+
+def test_algorithm3_matches_the_oracle_with_tight_ride_times() -> None:
+    """rho close to 1 makes the ride-time early exit decide the outcome"""
+    solution, held = partially_filled(
+        make_ctx(generated(4, nr_agents=1, nr_requests=9), rho=1.2), nr_held=4
+    )
+    assert sum(assert_matches_oracle(solution, r) for r in held) > 0
+
+
+def test_algorithm3_matches_the_oracle_for_non_selective_problems() -> None:
     ctx = ProblemContext(
-        small_scenario,
-        ProblemType.closed_selective,
-        SolverStrategy.alns,
-        PARAMS,
+        generated(3, nr_agents=2, nr_requests=8), "closed_non_selective", "alns"
     )
-    base_plan, r_unassigned = preprocess(ctx)
-    assert base_plan is not None
-    sol, _, ok = greedy_complete(base_plan, r_unassigned)
-    assert ok
-    assert sol.accepted | sol.rejected == set(sol.ctx.request_names)
+    solution, held = partially_filled(ctx, nr_held=3)
+    for request_name in held:
+        assert_matches_oracle(solution, request_name)
 
 
-def test_greedy_complete_rejected_set_is_not_stale() -> None:
-    """
-    Regression test for a real bug: greedy_complete()'s local rejection tracking must
-    appear in both its own return value and solution.rejected
-    """
-    scenario = ModemsScenarioGenerator(seed=1).generate_random_scenario(
-        nr_agents=1, nr_requests=10
+def test_algorithm3_exercises_mid_route_deliveries() -> None:
+    solution, held = partially_filled(
+        make_ctx(generated(1, nr_agents=1, nr_requests=10)), nr_held=3
     )
-    scenario.agents[0].load_max = 2  # force some impossible requests
-    ctx = ProblemContext(
-        scenario, ProblemType.closed_selective, SolverStrategy.alns, PARAMS
+    mid_route = [
+        c
+        for r in held
+        for c in alns_feasible_insertions(solution, r)
+        if c.journey.request_delivery[r] < len(c.journey.route) - 2
+    ]
+    assert mid_route
+
+
+@pytest.mark.parametrize("strategy", ["milp1", "milp2", "milp3"])
+def test_algorithm3_rejects_non_alns_strategies(strategy: str) -> None:
+    base, _ = preprocess(make_ctx(line_scenario([NEW]), strategy))
+    with pytest.raises(ValueError, match="requires SolverStrategy.alns"):
+        alns_feasible_insertions(base, "request_1")
+
+
+def test_algorithm3_candidates_are_independent_of_each_other_and_the_source() -> None:
+    solution, (held, *_) = partially_filled(
+        make_ctx(generated(5, nr_agents=1, nr_requests=8)), nr_held=3
     )
-    base_plan, r_unassigned = preprocess(ctx)
-    assert base_plan is not None
-    sol, r_rejected, ok = greedy_complete(base_plan, r_unassigned)
-    assert ok
-    assert len(sol.accepted) < len(ctx.request_names)  # fixture must force a rejection
-    assert r_rejected == sol.pending()
-    assert sol.rejected == sol.pending()
+    source = solution.journeys["agent_1"]
+    source_snapshot = (list(source.route), [s.to_dict() for s in source.states])
 
-
-def test_greedy_complete_milp1_fails_if_any_request_unservable() -> None:
-    """A non-selective strategy fails outright if one request can't be served"""
-    # duration_max just barely covers the idle hop to the nearest final hub
-    # (so preprocessing/base-plan feasibility still succeeds) but leaves no
-    # budget at all for actually serving any request
-    generator = ModemsScenarioGenerator(seed=1)
-    scenario = generator.generate_random_scenario(nr_agents=1, nr_requests=3)
-    ctx0 = ProblemContext(
-        scenario,
-        ProblemType.closed_non_selective,
-        SolverStrategy.milp1,
-        PARAMS,
-    )
-    agent_name = ctx0.agent_names[0]
-    idle_hop = ModemsJourney(ctx0, agent_name).total_travel_time()
-    scenario.agents[0].duration_max = idle_hop
-
-    ctx = ProblemContext(
-        scenario,
-        ProblemType.closed_non_selective,
-        SolverStrategy.milp1,
-        PARAMS,
-    )
-    base_plan, r_unassigned = preprocess(ctx)
-    assert base_plan is not None
-    _, _, ok = greedy_complete(base_plan, r_unassigned)
-    assert not ok
-
-
-def test_greedy_completion_adopts_candidate_without_insert_at(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    greedy_complete() (ALNS) adopts a ready InsertionCandidate directly,
-    no re-insertion
-    """
-    scenario = ModemsScenarioGenerator(seed=8).generate_random_scenario(
-        nr_agents=1,
-        nr_requests=3,
-    )
-    base_plan, r_unassigned = _preprocess(
-        scenario,
-        ProblemType.closed_selective,
-        SolverStrategy.alns,
-        PARAMS,
-    )
-    assert base_plan is not None
-
-    def fail_if_called(*args: object, **kwargs: object) -> None:
-        raise AssertionError("the ready candidate must be adopted directly")
-
-    monkeypatch.setattr(ModemsJourney, "insert_at", fail_if_called)
-    sol, _, ok = greedy_complete(base_plan, r_unassigned)
-    assert ok
-    assert sol.accepted
-
-
-# --------------------------------------------------------------------------------------
-# Algorithm 3 -- alns_feasible_insertions(): direct unit tests
-# --------------------------------------------------------------------------------------
-
-
-def test_feasible_insertions_returns_candidates_for_first_request(
-    small_scenario: ModemsScenario,
-) -> None:
-    """Every returned candidate is a feasible InsertionCandidate for this context"""
-    ctx = ProblemContext(
-        small_scenario,
-        ProblemType.closed_selective,
-        SolverStrategy.alns,
-        PARAMS,
-    )
-    base_plan, r_unassigned = preprocess(ctx)
-    assert base_plan is not None
-    ctx = base_plan.ctx
-    r = next(iter(r_unassigned))
-    candidates = alns_feasible_insertions(base_plan, r)
-    assert len(candidates) > 0
-    assert all(isinstance(c, InsertionCandidate) for c in candidates)
-    assert all(c.journey.agent_name in ctx.agent_names for c in candidates)
-    assert all(c.journey._is_feasible() for c in candidates)
-
-
-def test_feasible_insertions_respects_capacity() -> None:
-    """No candidates are returned when the request load exceeds every agent capacity"""
-    generator = ModemsScenarioGenerator(seed=1)
-    scenario = generator.generate_random_scenario(nr_agents=1, nr_requests=1)
-    scenario.agents[0].load_max = 1
-    scenario.requests[0].load = 5  # exceeds capacity
-    ctx = ProblemContext(
-        scenario,
-        ProblemType.closed_selective,
-        SolverStrategy.alns,
-        PARAMS,
-    )
-    base_plan, r_unassigned = preprocess(ctx)
-    assert base_plan is not None
-    r = next(iter(r_unassigned))
-    candidates = alns_feasible_insertions(base_plan, r)
-    assert candidates == []
-
-
-def test_feasible_insertions_respects_empty_agent_filter() -> None:
-    """Passing agents=[] returns no candidates regardless of feasibility"""
-    scenario = ModemsScenarioGenerator(seed=3).generate_random_scenario(
-        nr_agents=1,
-        nr_requests=1,
-    )
-    ctx = ProblemContext(
-        scenario,
-        ProblemType.closed_selective,
-        SolverStrategy.alns,
-        PARAMS,
-    )
-    solution = ModemsSolution(ctx)
-    assert alns_feasible_insertions(solution, ctx.request_names[0], agents=[]) == []
-
-
-def test_milp_feasible_insertions_does_not_corrupt_source_journey() -> None:
-    """
-    Regression test for a real bug: ModemsJourney.copy() aliases request_pickup/
-    request_delivery to the same dict objects as the source journey (copy-on-write)
-    until something reassigns them. milp_feasible_insertions() used to silently mutate
-    the original, still-live journey dict too; it must rebuild fresh dicts instead
-    """
-    scenario = ModemsScenarioGenerator(seed=1).generate_random_scenario(
-        nr_agents=1, nr_requests=4
-    )
-    ctx = ProblemContext(
-        scenario, ProblemType.closed_non_selective, SolverStrategy.milp1, PARAMS
-    )
-    base_plan, r_unassigned = preprocess(ctx)
-    assert base_plan is not None
-    agent_name = ctx.agent_names[0]
-    source_journey = base_plan.journeys[agent_name]
-    pickup_before = dict(source_journey.request_pickup)
-    delivery_before = dict(source_journey.request_delivery)
-
-    r = next(iter(r_unassigned))
-    candidates = milp_feasible_insertions(base_plan, r)
-
-    assert source_journey.request_pickup == pickup_before
-    assert source_journey.request_delivery == delivery_before
-    assert r not in source_journey.request_pickup
-    if candidates:
-        assert r in candidates[0].journey.request_pickup
-
-
-# --------------------------------------------------------------------------------------
-# Broad cross-validation against the reference (pre-rewrite) implementation
-# --------------------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("seed", range(1, 15))
-def test_matches_reference_across_seeds_alns(seed: int) -> None:
-    """alns_feasible_insertions() matches the brute-force reference across many seeds"""
-    generator = ModemsScenarioGenerator(seed=seed)
-    n_agents = 1 + seed % 3
-    n_requests = 6 + seed % 8
-    scenario = generator.generate_random_scenario(
-        nr_agents=n_agents, nr_requests=n_requests
-    )
-    base_plan, r_unassigned = _preprocess(
-        scenario, ProblemType.closed_selective, SolverStrategy.alns, PARAMS
-    )
-    if base_plan is None:
-        pytest.skip("infeasible base plan for this seed")
-    ctx = base_plan.ctx
-    nr_seed = max(1, n_requests - 3)
-    ordered = _ordered(ctx, r_unassigned)
-    sol, _, _ = greedy_complete(base_plan, set(ordered[:nr_seed]))
-    for r in ordered[nr_seed:]:
-        _assert_matches_reference(sol, r)
-
-
-@pytest.mark.parametrize("ptype", list(ProblemType))
-def test_matches_reference_across_alns_problem_types(ptype: ProblemType) -> None:
-    """alns_feasible_insertions() matches the reference under every ProblemType"""
-    generator = ModemsScenarioGenerator(seed=3)
-    scenario = generator.generate_random_scenario(nr_agents=2, nr_requests=8)
-    ctx = ProblemContext(scenario, ptype, SolverStrategy.alns, PARAMS)
-    sol = ModemsSolution(ctx)
-    r_assigned = []
-    for r in ctx.request_names[:5]:
-        for k in ctx.agent_names:
-            candidate = sol.journeys[k]._append_request_direct(r)
-            if candidate is not None:
-                sol.journeys[k] = candidate
-                sol.accepted.add(r)
-                r_assigned.append(r)
-                break
-    for r in [r for r in ctx.request_names if r not in r_assigned]:
-        _assert_matches_reference(sol, r)
-
-
-# --------------------------------------------------------------------------------------
-# Targeted regressions for bugs found while building the current
-# alns_feasible_insertions() implementation
-# --------------------------------------------------------------------------------------
-
-
-def test_modified_segment_intermediate_node_shift_affects_objective() -> None:
-    """
-    Regression for a real bug: inserting p^u before an intermediate node n_b (a < b)
-    shifts n_b's own service-start time, and if n_b is itself a request node, that
-    shift changes its own g_i(t) contribution to the objective, which is distinct from
-    (and in addition to) the separately-handled suffix shift past b. The first version
-    of this rewrite silently dropped this term entirely
-    """
-    generator = ModemsScenarioGenerator(seed=1)
-    scenario = generator.generate_random_scenario(nr_agents=1, nr_requests=10)
-    base_plan, r_unassigned = _preprocess(
-        scenario, ProblemType.closed_selective, SolverStrategy.alns, PARAMS
-    )
-    assert base_plan is not None
-    ctx = base_plan.ctx
-    r_ordered = _ordered(ctx, r_unassigned)
-    sol, _, _ = greedy_complete(base_plan, set(r_ordered[:7]))
-    r_remaining = r_ordered[7:]
-
-    found_b_gt_a = False
-    for r in r_remaining:
-        new = alns_feasible_insertions(sol, r)
-        for c in new:
-            pickup_index = c.journey.request_pickup[r]
-            delivery_index = c.journey.request_delivery[r]
-            if delivery_index > pickup_index + 1:
-                found_b_gt_a = True
-        _assert_matches_reference(sol, r)
-    assert (
-        found_b_gt_a
-    ), "test scenario never exercised a b>a candidate; strengthen the fixture"
-
-
-def test_non_selective_problem_has_no_rejection_penalty_in_delta() -> None:
-    """
-    Regression for a real bug: a non-selective problem has no rejection penalty in
-    the objective at all, so accepting a request must not subtract eta from delta_obj.
-    The first version of this rewrite unconditionally subtracted eta regardless of
-    the problem type
-    """
-    generator = ModemsScenarioGenerator(seed=1)
-    scenario = generator.generate_random_scenario(nr_agents=2, nr_requests=6)
-    ctx = ProblemContext(
-        scenario,
-        ProblemType.closed_non_selective,
-        SolverStrategy.alns,
-        PARAMS,
-    )
-    sol = ModemsSolution(ctx)
-    r0 = ctx.request_names[0]
-    for k in ctx.agent_names:
-        candidate = sol.journeys[k]._append_request_direct(r0)
-        if candidate is not None:
-            sol.journeys[k] = candidate
-            sol.accepted.add(r0)
-            break
-
-    r_remaining = ctx.request_names[1]
-    candidates = alns_feasible_insertions(sol, r_remaining)
-    assert candidates, "expected at least one feasible candidate"
-    for c in candidates:
-        # a bare insertion delta should be a modest, request-scale adjustment
-        # (mission time + eps terms), never offset by -100 (eta)
-        assert c.delta_obj > -50.0, f"delta_obj={c.delta_obj} looks eta-contaminated"
-    _assert_matches_reference(sol, r_remaining)
-
-
-def test_candidate_journey_shares_state_until_committed_mutation() -> None:
-    """A candidate journey aliases the source untouched states (copy-on-write)"""
-    scenario = ModemsScenarioGenerator(seed=8).generate_random_scenario(
-        nr_agents=1,
-        nr_requests=3,
-    )
-    base_plan, r_unassigned = _preprocess(
-        scenario,
-        ProblemType.closed_selective,
-        SolverStrategy.alns,
-        PARAMS,
-    )
-    assert base_plan is not None
-    request_name = _ordered(base_plan.ctx, r_unassigned)[0]
-    source_journey = base_plan.journeys[base_plan.ctx.agent_names[0]]
-    candidate = alns_feasible_insertions(base_plan, request_name)[0]
-
-    assert candidate.journey.states[0] is source_journey.states[0]
-    source_route = list(source_journey.route)
-    source_states = [state.to_dict() for state in source_journey.states]
-
-    candidate.journey.remove_request(request_name)
-
-    assert list(source_journey.route) == source_route
-    assert [state.to_dict() for state in source_journey.states] == source_states
-
-
-def test_candidates_use_independent_builtin_containers() -> None:
-    """Each candidate owns its own route/states/index-map containers (no aliasing)"""
-    scenario = ModemsScenarioGenerator(seed=5).generate_random_scenario(
-        nr_agents=1,
-        nr_requests=8,
-    )
-    base_plan, r_unassigned = _preprocess(
-        scenario, ProblemType.closed_selective, SolverStrategy.alns, PARAMS
-    )
-    assert base_plan is not None
-    r_ordered = _ordered(base_plan.ctx, r_unassigned)
-    sol, _, ok = greedy_complete(base_plan, set(r_ordered[:4]))
-    assert ok
-    candidates = alns_feasible_insertions(sol, r_ordered[4])
-
+    candidates = alns_feasible_insertions(solution, held)
     assert len(candidates) > 1
-    assert all(type(candidate.journey.route) is list for candidate in candidates)
-    assert all(type(candidate.journey.states) is list for candidate in candidates)
-    assert all(
-        type(candidate.journey.request_pickup) is dict for candidate in candidates
+    assert len({id(c.journey.states) for c in candidates}) == len(candidates)
+    assert len({id(c.journey.request_pickup) for c in candidates}) == len(candidates)
+    for candidate in candidates:
+        candidate.journey.remove_request(held)
+    assert (list(source.route), [s.to_dict() for s in source.states]) == source_snapshot
+
+
+def test_algorithm3_is_deterministic() -> None:
+    solution, held = partially_filled(
+        make_ctx(generated(42, nr_agents=2, nr_requests=8)), nr_held=3
     )
-    assert all(
-        type(candidate.journey.request_delivery) is dict for candidate in candidates
-    )
-    assert len({id(candidate.journey.route) for candidate in candidates}) == len(
-        candidates
-    )
-    assert len({id(candidate.journey.states) for candidate in candidates}) == len(
-        candidates
-    )
-    assert all(
-        candidate.journey.route == [state.node for state in candidate.journey.states]
-        for candidate in candidates
-    )
-
-
-# --------------------------------------------------------------------------------------
-# New pruning optimizations
-# --------------------------------------------------------------------------------------
-
-
-def test_energy_lower_bound_prunes_when_terminal_slack_is_tight() -> None:
-    """
-    The energy lower bound (monotone on-board distance while carrying u) should
-    terminate the delivery scan early once even the minimum extra cost would exceed
-    the terminal SoC slack: verified indirectly by checking the candidate set still
-    matches the reference exactly even when xi^k is deliberately made very tight
-    """
-    generator = ModemsScenarioGenerator(seed=2)
-    scenario = generator.generate_random_scenario(nr_agents=1, nr_requests=6)
-    base_plan, r_unassigned = _preprocess(
-        scenario, ProblemType.closed_selective, SolverStrategy.alns, PARAMS
-    )
-    assert base_plan is not None
-    ctx = base_plan.ctx
-    r_ordered = _ordered(ctx, r_unassigned)
-    sol, _, _ = greedy_complete(base_plan, set(r_ordered[:3]))
-    # tighten the agent's operational SoC floor so slack is scarce
-    for j in sol.journeys.values():
-        j.agent.soc_min_operational = min(0.9, j.states[-1].phi_arr - 1e-3)
-    for r in r_ordered[3:]:
-        _assert_matches_reference(sol, r)
-
-
-def test_ride_time_violation_for_u_terminates_scan_not_just_candidate() -> None:
-    """
-    u's own ride time is monotone non-decreasing as b increases (more detour before
-    its own delivery), so once it exceeds the max-ride-time bound, every larger b is
-    equally hopeless
-    """
-    generator = ModemsScenarioGenerator(seed=4)
-    scenario = generator.generate_random_scenario(nr_agents=1, nr_requests=8)
-    base_plan, r_unassigned = _preprocess(
-        scenario, ProblemType.closed_selective, SolverStrategy.alns, PARAMS
-    )
-    assert base_plan is not None
-    ctx = base_plan.ctx
-    r_ordered = _ordered(ctx, r_unassigned)
-    sol, _, _ = greedy_complete(base_plan, r_ordered[:5])
-    for r in r_ordered[5:]:
-        _assert_matches_reference(sol, r)
-
-
-# --------------------------------------------------------------------------------------
-# Determinism note
-# --------------------------------------------------------------------------------------
-
-
-def test_feasible_insertions_is_deterministic_given_sorted_input() -> None:
-    """
-    alns_feasible_insertions() itself must be a pure function of its inputs, verified
-    by calling it twice on the same (ctx, solution, request) and checking bit-identical
-    output. Full-process ALNS determinism is covered separately in test_alns.py
-    """
-    generator = ModemsScenarioGenerator(seed=42)
-    scenario = generator.generate_random_scenario(nr_agents=2, nr_requests=8)
-    base_plan, r_unassigned = _preprocess(
-        scenario, ProblemType.closed_selective, SolverStrategy.alns, PARAMS
-    )
-    assert base_plan is not None
-    ctx = base_plan.ctx
-    r_ordered = _ordered(ctx, r_unassigned)
-    sol, _, _ = greedy_complete(base_plan, set(r_ordered[:5]))
-    for r in r_ordered[5:]:
-        first = _candidate_map(alns_feasible_insertions(sol, r))
-        second = _candidate_map(alns_feasible_insertions(sol, r))
-        assert first.keys() == second.keys()
-        for key in first:
-            assert first[key] == second[key]
+    for request_name in held:
+        runs = [
+            [
+                (c.journey.agent_name, c.journey.route, c.delta_obj)
+                for c in alns_feasible_insertions(solution, request_name)
+            ]
+            for _ in range(2)
+        ]
+        assert runs[0] == runs[1]

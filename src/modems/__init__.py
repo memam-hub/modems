@@ -127,6 +127,9 @@ from .workday_benchmark import (
     solve_workday_suite,
 )
 
+# --- workday_comparison: closed-vs-open objective comparison of two workday suites
+from .workday_comparison import compare_workday_objectives
+
 __all__ = [  # noqa: RUF022 -- grouped by module (with comments) on purpose
     "__version__",
     # core
@@ -195,6 +198,7 @@ __all__ = [  # noqa: RUF022 -- grouped by module (with comments) on purpose
     # workday_benchmark
     "WorkdayStartTime",
     "build_workday_requests_table",
+    "compare_workday_objectives",
     "build_workday_summary_table",
     "generate_workday_suite",
     "plot_workday_soc_acceptance",

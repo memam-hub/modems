@@ -1,15 +1,23 @@
+"""
+Tests for modems.benchmark: result bookkeeping, and the resumable generate and/or solve 
+and/or build pipeline at benchmarks/run_suite.py. Phase 1 generation tests do not solve;
+Phase 2 runs real solvers on the smallest (smoke) instances
+"""
+
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
+import os
 from typing import Any
 
 import pytest
 
-from modems.algorithms import greedy_complete, preprocess
 from modems.benchmark import (
+    ManifestPhase,
     ManifestStatus,
     ModemsBenchmarkResult,
+    _latex_fmt,
+    _solve_one,
     build_benchmark_table,
     generate_benchmark_suite,
     read_manifest,
@@ -17,334 +25,306 @@ from modems.benchmark import (
     stable_seed,
 )
 from modems.core import (
-    ModemsScenario,
-    ProblemContext,
-    ProblemType,
+    ModemsAgent,
+    ModemsRequest,
     ScenarioSize,
-    ScenarioTiming,
     ScenarioType,
-    SolverStrategy,
 )
 from modems.generator import SocRangeSpec
-from modems.milp import DEFAULT_MILP_SOLVER_DATA, MilpType
-from modems.solution import FLOAT_INF, ModemsSolutionInfo, SolutionStatus
+from modems.solution import (
+    FLOAT_INF,
+    ModemsSolution,
+    ModemsSolutionInfo,
+    SolutionStatus,
+)
+
+from .builders import (
+    duration_limited_scenario,
+    greedy_solution,
+    line_scenario,
+    make_ctx,
+)
+
+# plain strings, letters, and enum members are all accepted
+SMALLEST = dict(
+    scenario_sizes=["s"],
+    scenario_types=[ScenarioType.random],
+    scenario_timings=["Uniform"],
+    scenario_soc_ranges=[SocRangeSpec.normal()],
+)
+
+
+def generate(outdir, **kwargs: Any) -> list[dict[str, Any]]:
+    return generate_benchmark_suite(str(outdir), **{**SMALLEST, **kwargs})
+
 
 # --------------------------------------------------------------------------------------
-# stable_seed
+# stable_seed / ModemsBenchmarkResult
 # --------------------------------------------------------------------------------------
 
 
-def test_stable_seed_is_deterministic() -> None:
-    """stable_seed() returns the same value for the same inputs every call"""
-    assert stable_seed(42, "S", "R", 0) == stable_seed(42, "S", "R", 0)
-    assert stable_seed(42, "S", "R", "T", 1) == stable_seed(42, "S", "R", "T", 1)
-
-
-def test_stable_seed_differs_for_different_inputs() -> None:
-    """stable_seed() returns a different value when any input part changes"""
-    assert stable_seed(42, "S", "R", 0) != stable_seed(42, "S", "R", 1)
-    assert stable_seed(42, "S", "R", 0) != stable_seed(42, "M", "R", 0)
-
-
-# --------------------------------------------------------------------------------------
-# ModemsBenchmarkResult
-# --------------------------------------------------------------------------------------
-
-
-def _make_result(tiny_scenario: ModemsScenario) -> ModemsBenchmarkResult:
-    """Build a ModemsBenchmarkResult from a constructive baseline (no real solve)"""
-    params = {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 2.0, "omega": 5.0}
-    ctx = ProblemContext(
-        tiny_scenario, ProblemType.closed_selective, SolverStrategy.alns, params
+def test_stable_seed_is_a_deterministic_32_bit_function_of_its_parts() -> None:
+    assert stable_seed(42, "a", 1) == stable_seed(42, "a", 1)
+    assert (
+        len({stable_seed(42, "a", 1), stable_seed(42, "a", 2), stable_seed(43, "a", 1)})
+        == 3
     )
-    base_plan, r_unassigned = preprocess(ctx)
-    assert base_plan is not None
-    sol, _, _ = greedy_complete(base_plan, r_unassigned)
-    sol_info = ModemsSolutionInfo(
-        status=SolutionStatus.feasible,
-        objective=sol.objective(),
-        solver_name="baseline",
-    )
-    final_info = ModemsSolutionInfo(
-        status=SolutionStatus.optimal,
-        objective=sol.objective() * 0.9,
-        lower_bound=sol.objective() * 0.9,
-        upper_bound=sol.objective() * 0.9,
-        solver_name=DEFAULT_MILP_SOLVER_DATA[0],
-    )
+    assert 0 <= stable_seed(0) < 2**32
+
+
+def _result(
+    baseline: float | None, final: float, lb=None, ub=None
+) -> ModemsBenchmarkResult:
+    ctx = make_ctx(line_scenario([ModemsRequest(1, 2)]), "milp3")
+    solution = ModemsSolution(ctx)
+    base_info = None if baseline is None else ModemsSolutionInfo(objective=baseline)
     return ModemsBenchmarkResult(
         ctx,
         "milp3",
-        sol,
-        sol_info,
-        sol,
-        final_info,
+        None if baseline is None else solution,
+        base_info,
+        solution,
+        ModemsSolutionInfo(objective=final, lower_bound=lb, upper_bound=ub),
     )
 
 
-def test_benchmark_result_to_dict_from_dict_round_trip(
-    tiny_scenario: ModemsScenario,
+@pytest.mark.parametrize(
+    "baseline, final, expected",
+    [
+        (100.0, 80.0, 20.0),
+        (100.0, 120.0, -20.0),
+        (None, 80.0, None),
+        (0.0, 80.0, None),
+        (FLOAT_INF, 80.0, None),
+        (100.0, FLOAT_INF, None),
+        (100.0, None, None),
+    ],
+)
+def test_improvement_is_a_signed_percentage_of_the_baseline(
+    baseline, final, expected
 ) -> None:
-    """to_dict()/from_dict() (JSON round-trip) preserve solver_strategy and objective"""
-    result = _make_result(tiny_scenario)
-    d = result.to_dict()
-    result2 = ModemsBenchmarkResult.from_dict(json.loads(json.dumps(d)))
-    assert result2.solver_strategy == "milp3"
-    assert result2.final_solution.objective() == pytest.approx(
-        result.final_solution.objective()
+    assert _result(baseline, final).improvement_pct() == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    "value, spec, text",
+    [
+        (12.345, "{:.1f}", "12.3"),
+        (-12.345, "{:.1f}", "-12.3"),
+        (-0.04, "{:.1f}", "0.0"),
+        (-0.0, "{:.1f}", "0.0"),
+        (0.04, "{:.1f}", "0.0"),
+        (-0.4, "{:.0f}", "0"),
+        (None, "{:.1f}", r"$\mathrm{-}$"),
+        (FLOAT_INF, "{:.1f}", r"$\mathrm{-}$"),
+    ],
+)
+def test_latex_numbers_keep_their_sign_but_never_print_negative_zero(
+    value: float | None, spec: str, text: str
+) -> None:
+    assert _latex_fmt(value, spec) == text
+
+
+@pytest.mark.parametrize(
+    "lb, ub, expected",
+    [
+        (75.0, 100.0, 25.0),
+        (None, 100.0, None),
+        (75.0, 0.0, None),
+        (75.0, FLOAT_INF, None),
+    ],
+)
+def test_gap_is_a_percentage_of_the_upper_bound(lb, ub, expected) -> None:
+    assert _result(None, 100.0, lb, ub).gap_pct() == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("with_baseline", [True, False])
+def test_result_json_round_trip(tmp_path, with_baseline: bool) -> None:
+    ctx = make_ctx(line_scenario([ModemsRequest(1, 2, earliest_pickup=0.0)]))
+    solution = greedy_solution(ctx)
+    info = ModemsSolutionInfo(status="feasible", objective=solution.objective())
+    result = ModemsBenchmarkResult(
+        ctx,
+        "alns",
+        solution if with_baseline else None,
+        info if with_baseline else None,
+        solution,
+        info,
     )
-
-
-def test_benchmark_result_improvement_and_gap_pct(
-    tiny_scenario: ModemsScenario,
-) -> None:
-    """improvement_pct()/gap_pct() compute the expected percentages from the fixture"""
-    result = _make_result(tiny_scenario)
-    assert result.improvement_pct() == pytest.approx(0.10, abs=1e-6)
-    assert result.gap_pct() == pytest.approx(0.0, abs=1e-6)
-
-
-def test_benchmark_result_improvement_pct_none_when_baseline_missing_info(
-    tiny_scenario: ModemsScenario,
-) -> None:
-    """improvement_pct() returns None when the baseline objective is non-finite"""
-    result = _make_result(tiny_scenario)
-    result.baseline_info.objective = FLOAT_INF
-    assert result.improvement_pct() is None
-
-
-def test_benchmark_result_round_trip_without_constructive(
-    tiny_scenario: ModemsScenario,
-) -> None:
-    """A result with no baseline round-trips with baseline fields staying None"""
-    result = _make_result(tiny_scenario)
-    result.baseline_solution = None
-    result.baseline_info = None
-
-    restored = ModemsBenchmarkResult.from_dict(json.loads(json.dumps(result.to_dict())))
-
-    assert restored.baseline_solution is None
-    assert restored.baseline_info is None
-    assert restored.improvement_pct() is None
-
-
-def test_benchmark_gap_ignores_nonfinite_bounds(tiny_scenario: ModemsScenario) -> None:
-    """gap_pct() returns None when the upper bound is non-finite"""
-    result = _make_result(tiny_scenario)
-    result.final_info.upper_bound = FLOAT_INF
-    assert result.gap_pct() is None
-
-
-def test_milp_still_solves_when_constructive_fails(
-    tiny_scenario: ModemsScenario,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """_solve_one() still solves via a (faked) MILP even if _compute_baseline() fails"""
-    import modems.benchmark as benchmark
-
-    class FakeMilp:
-        """Stand-in for ModemsMilp that skips real solver, asserting no warm start"""
-
-        def __init__(
-            self,
-            scenario: ModemsScenario,
-            milp_type: MilpType,
-            problem_type: ProblemType,
-            model_params: dict,
-        ) -> None:
-            """Build a trivial idle-fleet instance instead of a real Pyomo model"""
-            ctx = benchmark.ProblemContext(
-                scenario,
-                problem_type,
-                SolverStrategy.milp3,
-                model_params,
-            )
-            self.ctx = ctx
-            self.milp_type = milp_type
-            self.problem_type = problem_type
-            solution = benchmark.ModemsSolution(ctx)
-            self.instance = SimpleNamespace(
-                solution=solution,
-                solution_info=ModemsSolutionInfo(
-                    status=SolutionStatus.feasible,
-                    objective=solution.objective(),
-                ),
-            )
-
-        def solve(self, **kwargs: Any) -> None:
-            """Assert the caller never passes a warm start when baseline failed"""
-            assert kwargs["warm_start_solution"] is None
-
-    monkeypatch.setattr(benchmark, "_compute_baseline", lambda *args: (None, None))
-    monkeypatch.setattr(benchmark, "ModemsMilp", FakeMilp)
-
-    result = benchmark._solve_one(
-        tiny_scenario,
-        SolverStrategy("milp3"),
-        {"eps": 0.01, "zeta": 1.0, "eta": 100.0, "rho": 2.5, "omega": 5.0},
-        milp_timelimit=1.0,
-        alns_max_iter=1,
-        seed=1,
-    )
-
-    assert result is not None
-    assert result.baseline_solution is None
+    restored = ModemsBenchmarkResult.from_json(result.to_json(str(tmp_path / "r.json")))
+    assert restored.to_dict() == result.to_dict()
+    assert (restored.baseline_solution is None) == (not with_baseline)
 
 
 # --------------------------------------------------------------------------------------
-# generate_benchmark_suite / manifest resumability (no solving, fast)
-# --------------------------------------------------------------------------------------
-
-
-def test_generate_suite_creates_scenarios_and_manifest_rows(tmp_path: Any) -> None:
-    """generate_benchmark_suite() writes one manifest row per (scenario, solver)"""
-    summary = generate_benchmark_suite(
-        outdir=str(tmp_path),
-        scenario_sizes=[ScenarioSize.small],
-        scenario_types=[ScenarioType.random],
-        scenario_timings=[ScenarioTiming.loose],
-        scenario_soc_ranges=[SocRangeSpec.normal()],
-        nr_repeats=1,
-        base_seed=1,
-    )
-    assert any(row["status"] == ManifestStatus.created for row in summary)
-    manifest = read_manifest(str(tmp_path))
-    assert len(manifest) == 4  # one row per solver (alns, milp1, milp2, milp3)
-
-
-def test_generate_suite_is_resumable(tmp_path: Any) -> None:
-    """Re-running generate_benchmark_suite() skips already-generated scenarios"""
-    generate_benchmark_suite(
-        outdir=str(tmp_path),
-        scenario_sizes=[ScenarioSize.small],
-        scenario_types=[ScenarioType.random],
-        scenario_timings=[ScenarioTiming.loose],
-        scenario_soc_ranges=[SocRangeSpec.normal()],
-        nr_repeats=1,
-        base_seed=1,
-    )
-    summary2 = generate_benchmark_suite(
-        outdir=str(tmp_path),
-        scenario_sizes=[ScenarioSize.small],
-        scenario_types=[ScenarioType.random],
-        scenario_timings=[ScenarioTiming.loose],
-        scenario_soc_ranges=[SocRangeSpec.normal()],
-        nr_repeats=1,
-        base_seed=1,
-    )
-    assert all(row["status"] == ManifestStatus.existing for row in summary2)
-
-
-def test_manifest_is_a_streamlined_json_object(tmp_path: Any) -> None:
-    """manifest.json is one JSON object keyed by {scenario__solver}"""
-    generate_benchmark_suite(
-        outdir=str(tmp_path),
-        scenario_sizes=[ScenarioSize.small],
-        scenario_types=[ScenarioType.random],
-        scenario_timings=[ScenarioTiming.loose],
-        scenario_soc_ranges=[SocRangeSpec.normal()],
-        nr_repeats=1,
-        base_seed=1,
-    )
-    manifest_path = tmp_path / "manifest.json"
-    assert manifest_path.exists()
-    with open(manifest_path) as f:
-        on_disk = json.load(f)  # raises if it is NDJSON rather than one JSON document
-    assert set(on_disk.keys()) == {
-        "DS_SRL0_soc80-100__alns",
-        "DS_SRL0_soc80-100__milp1",
-        "DS_SRL0_soc80-100__milp2",
-        "DS_SRL0_soc80-100__milp3",
-    }
-    assert on_disk["DS_SRL0_soc80-100__alns"]["scenario_name"] == "DS_SRL0_soc80-100"
-    assert on_disk["DS_SRL0_soc80-100__alns"]["solver_strategy"] == "alns"
-
-
-def test_generate_suite_reports_progress(tmp_path: Any) -> None:
-    """on_progress fires a start and an end event per (size, type, repetition) combo"""
-    events: list[dict[str, Any]] = []
-    generate_benchmark_suite(
-        outdir=str(tmp_path),
-        scenario_sizes=[ScenarioSize.small],
-        scenario_types=[ScenarioType.random, ScenarioType.clustered],
-        scenario_timings=[ScenarioTiming.loose],
-        scenario_soc_ranges=[SocRangeSpec.normal()],
-        nr_repeats=1,
-        base_seed=1,
-        on_progress=events.append,
-    )
-    assert len(events) == 4  # 2 combos x (starting, terminal status)
-    assert {e["status"] for e in events} == {"starting", "created"}
-    assert all(e["phase"] == "generate" and e["total"] == 2 for e in events)
-    assert {e["scenario_name"] for e in events} == {
-        "DS_SRL0_soc80-100",
-        "DS_SCL0_soc80-100",
-    }
-
-
-def test_solve_suite_reports_progress(tmp_path: Any) -> None:
-    """on_progress fires a start and a done event per (scenario, solver) row"""
-    generate_benchmark_suite(
-        outdir=str(tmp_path),
-        scenario_sizes=[ScenarioSize.small],
-        scenario_types=[ScenarioType.random],
-        scenario_timings=[ScenarioTiming.loose],
-        scenario_soc_ranges=[SocRangeSpec.normal()],
-        nr_repeats=1,
-        base_seed=1,
-        solver_strategies=[SolverStrategy("alns")],
-    )
-    events: list[dict[str, Any]] = []
-    solve_benchmark_suite(
-        outdir=str(tmp_path), alns_max_iter=20, on_progress=events.append
-    )
-    assert len(events) == 2  # one row x (starting, done)
-    assert [e["status"] for e in events] == ["starting", "done"]
-    assert all(
-        e["phase"] == "solve"
-        and e["scenario_name"] == "DS_SRL0_soc80-100"
-        and e["solver_strategy"] == "alns"
-        for e in events
-    )
-    assert events[1]["t_exe"] >= 0.0
-
-
-# --------------------------------------------------------------------------------------
-# solve_benchmark_suite / table building (real CBC + real alns solver calls)
+# _solve_one when the constructive baseline fails
 # --------------------------------------------------------------------------------------
 
 
 @pytest.mark.integration
-def test_solve_and_build_table_end_to_end(tmp_path: Any) -> None:
-    """generate -> solve (real CBC/alns) -> build_table runs and is resumable"""
-    generate_benchmark_suite(
-        outdir=str(tmp_path),
-        scenario_sizes=[ScenarioSize.small],
-        scenario_types=[ScenarioType.random],
-        scenario_timings=[ScenarioTiming.loose],
-        scenario_soc_ranges=[SocRangeSpec.normal()],
-        nr_repeats=1,
-        base_seed=1,
+def test_milp_is_still_solved_without_a_constructive_baseline() -> None:
+    """Non-selective greedy exceeds the driving budget: MILP1 proves infeasibility"""
+    result = _solve_one(
+        duration_limited_scenario(),
+        "milp1",
+        {},
+        milp_timelimit=10.0,
+        alns_max_iter=1,
+        seed=1,
     )
-    outcomes = solve_benchmark_suite(
-        outdir=str(tmp_path), milp_timelimit=10.0, alns_max_iter=100, seed=1
-    )
-    assert len(outcomes) == 4
-    assert all(o["status"] == "done" for o in outcomes)
+    assert result is not None
+    assert result.baseline_solution is None and result.improvement_pct() is None
+    assert result.final_info.status is SolutionStatus.infeasible
 
-    # resumability: rerun should find nothing pending
-    outcomes2 = solve_benchmark_suite(
-        outdir=str(tmp_path), milp_timelimit=10.0, alns_max_iter=100, seed=1
-    )
-    assert outcomes2 == []
 
+def test_alns_is_skipped_without_a_feasible_base_plan() -> None:
+    agent = ModemsAgent("s", 6, soc_initial=0.26, soc_min_operational=0.25)
+    scenario = line_scenario([ModemsRequest(1, 2)], agents=[agent])
+    assert (
+        _solve_one(scenario, "alns", {}, milp_timelimit=1.0, alns_max_iter=1, seed=1)
+        is None
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Phase 1: generation (no solving)
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("objective, prefix", [("closed", "SC"), ("open", "SO")])
+def test_generation_writes_one_scenario_and_one_pending_row_per_solver(
+    tmp_path, objective: str, prefix: str
+) -> None:
+    summary = generate(
+        tmp_path, nr_repeats=2, objective=objective, solver_strategies=["milp3", "alns"]
+    )
+    names = [f"{prefix}0_SRU80_100", f"{prefix}1_SRU80_100"]
+    assert summary == [
+        {"scenario_name": n, "status": ManifestStatus.created} for n in names
+    ]
+    assert sorted(os.listdir(tmp_path / "scenarios")) == [f"{n}.json" for n in names]
+    manifest = read_manifest(str(tmp_path))
+    assert set(manifest) == {(n, s) for n in names for s in ("milp3", "alns")}
+    for row in manifest.values():
+        assert row["status"] == "pending" and row["objective_type"] == objective
+        assert row["nr_agents"] == 1 and 4 <= row["nr_requests"] <= 6
+    raw = json.loads((tmp_path / "manifest.json").read_text())
+    assert isinstance(raw, dict) and len(raw) == 4
+
+
+def test_generation_is_reproducible_and_resumable(tmp_path) -> None:
+    generate(tmp_path / "a", base_seed=5)
+    generate(tmp_path / "b", base_seed=5)
+    scenario_a = (tmp_path / "a" / "scenarios" / "SC0_SRU80_100.json").read_text()
+    assert (
+        scenario_a == (tmp_path / "b" / "scenarios" / "SC0_SRU80_100.json").read_text()
+    )
+
+    manifest_before = (tmp_path / "a" / "manifest.json").read_text()
+    summary = generate(tmp_path / "a", base_seed=99)  # existing rows are never rebuilt
+    assert summary == [
+        {"scenario_name": "SC0_SRU80_100", "status": ManifestStatus.existing}
+    ]
+    assert (tmp_path / "a" / "manifest.json").read_text() == manifest_before
+
+
+def test_generation_skips_combinations_without_a_feasible_base_plan(tmp_path) -> None:
+    """Agents starting at the operational SoC floor cannot all reach a hub"""
+    summary = generate(
+        tmp_path,
+        scenario_sizes=[ScenarioSize.large],
+        scenario_soc_ranges=[SocRangeSpec.custom(0.25, 0.25)],
+        max_feasibility_attempts=2,
+    )
+    assert summary == [
+        {"scenario_name": "SC0_LRU25_25", "status": ManifestStatus.infeasible}
+    ]
+    assert read_manifest(str(tmp_path)) == {}
+    assert os.listdir(tmp_path / "scenarios") == []
+
+
+def test_generation_reports_progress_before_and_after_each_combination(
+    tmp_path,
+) -> None:
+    events: list[dict] = []
+    generate(tmp_path, nr_repeats=2, on_progress=events.append)
+    assert [(e["phase"], e["index"], e["total"], e["status"]) for e in events] == [
+        (ManifestPhase.generate, 1, 2, ManifestStatus.starting),
+        (ManifestPhase.generate, 1, 2, ManifestStatus.created),
+        (ManifestPhase.generate, 2, 2, ManifestStatus.starting),
+        (ManifestPhase.generate, 2, 2, ManifestStatus.created),
+    ]
+
+
+# --------------------------------------------------------------------------------------
+# Phases 2 and 3: solve and build (integration)
+# --------------------------------------------------------------------------------------
+
+
+QUICK_SEED = 2  # its smallest-bucket scenario (4 requests) solves to optimality in <1s
+
+
+def solve(outdir, **kwargs: Any) -> list[dict[str, Any]]:
+    return solve_benchmark_suite(
+        str(outdir), milp_timelimit=10.0, alns_max_iter=20, **kwargs
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("objective", ["closed", "open"])
+def test_pipeline_solves_every_strategy_and_builds_the_table(
+    tmp_path, objective: str
+) -> None:
+    generate(tmp_path, objective=objective, base_seed=QUICK_SEED)
+    events: list[dict] = []
+    outcomes = solve(tmp_path, on_progress=events.append)
+
+    assert sorted(o["solver_strategy"] for o in outcomes) == [
+        "alns",
+        "milp1",
+        "milp2",
+        "milp3",
+    ]
+    assert all(o["status"] == ManifestStatus.done for o in outcomes)
+    assert len(events) == 8 and {e["phase"] for e in events} == {ManifestPhase.solve}
+    for row in read_manifest(str(tmp_path)).values():
+        result = ModemsBenchmarkResult.from_json(row["result_file"])
+        assert result.ctx.is_open() == (objective == "open")
+        assert result.final_info.status in (
+            SolutionStatus.optimal,
+            SolutionStatus.feasible,
+        )
+        assert result.final_info.objective <= result.baseline_info.objective + 1e-6
+    results = os.listdir(tmp_path / "results")
+    assert sum(f.endswith("_alns_stats.json") for f in results) == 1
+
+    rows = build_benchmark_table(str(tmp_path), rows_per_block=2)
+    assert [r["solver"] for r in rows] == ["alns", "milp1", "milp2", "milp3"]
+    assert all(r["status_symbol"] in (r"$\star$", r"$\dagger$") for r in rows)
+    tex = (tmp_path / "benchmark_table.tex").read_text()
+    assert tex.count(r"\begin{table*}") == 2
+    assert len((tmp_path / "benchmark_table.csv").read_text().splitlines()) == 5
+    assert (
+        json.loads((tmp_path / "benchmark_table.json").read_text())[0]["scenario"]
+        == f"S{objective[0].upper()}0_SRU80_100"
+    )
+
+    assert solve(tmp_path) == []  # nothing left to solve
+
+
+@pytest.mark.integration
+def test_failed_rows_are_kept_and_only_retried_on_request(tmp_path) -> None:
+    generate(tmp_path, solver_strategies=["alns"], base_seed=QUICK_SEED)
+    scenario_file = tmp_path / "scenarios" / "SC0_SRU80_100.json"
+    content = scenario_file.read_text()
+    scenario_file.unlink()
+
+    (outcome,) = solve(tmp_path)
+    assert outcome["status"] == ManifestStatus.failed and outcome["error"]
+    assert solve(tmp_path) == []
     rows = build_benchmark_table(str(tmp_path))
-    assert len(rows) == 4
-    for row in rows:
-        assert row["status_symbol"] in {
-            r"$\star$",
-            r"$\dagger$",
-            r"$\times$",
-            "?",
-            "--",
-        }
+    assert rows[0]["status"] == ManifestStatus.failed and rows[0]["objective"] is None
+
+    scenario_file.write_text(content)
+    (outcome,) = solve(tmp_path, retry_failed=True)
+    assert outcome["status"] == ManifestStatus.done

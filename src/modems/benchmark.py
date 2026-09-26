@@ -176,16 +176,16 @@ class ModemsBenchmarkResult:
             return cls.from_dict(json.load(f))
 
     def improvement_pct(self) -> float | None:
-        """(baseline - final) / baseline"""
+        """100 * (baseline - final) / baseline, negative if final is worse"""
         if self.baseline_info is None:
             return None
         base_obj = self.baseline_info.objective
         final_obj = self.final_info.objective
         if not base_obj or base_obj == FLOAT_INF or not math.isfinite(base_obj):
             return None
-        if final_obj == FLOAT_INF or not math.isfinite(final_obj):
+        if final_obj is None or final_obj == FLOAT_INF or not math.isfinite(final_obj):
             return None
-        return (base_obj - final_obj) / base_obj
+        return 100.0 * (base_obj - final_obj) / base_obj
 
     def gap_pct(self) -> float | None:
         """duality gap from upper and lower bounds"""
@@ -200,7 +200,7 @@ class ModemsBenchmarkResult:
             or not math.isfinite(info.upper_bound)
         ):
             return None
-        return 100.0 * abs((info.upper_bound - info.lower_bound) / info.upper_bound)
+        return 100.0 * (info.upper_bound - info.lower_bound) / info.upper_bound
 
 
 # --------------------------------------------------------------------------------------
@@ -249,19 +249,19 @@ def read_manifest(outdir: str) -> dict[tuple[str, str], dict[str, Any]]:
 
 def generate_benchmark_suite(
     outdir: str,
-    scenario_sizes: list[ScenarioSize] = [n for n in ScenarioSize],
-    scenario_types: list[ScenarioType] = [n for n in ScenarioType],
-    scenario_timings: list[ScenarioTiming] = [n for n in ScenarioTiming],
+    scenario_sizes: list[ScenarioSize | str] = [n for n in ScenarioSize],
+    scenario_types: list[ScenarioType | str] = [n for n in ScenarioType],
+    scenario_timings: list[ScenarioTiming | str] = [n for n in ScenarioTiming],
     nr_repeats: int = 1,
     base_seed: int = DEFAULT_BASE_SEED,
-    solver_strategies: list[SolverStrategy] = [n for n in SolverStrategy],
+    solver_strategies: list[SolverStrategy | str] = [n for n in SolverStrategy],
     model_params: dict[str, Any] | None = None,
     scenario_soc_ranges: list[SocRangeSpec] = [
         SocRangeSpec.normal(),
         SocRangeSpec.stress(),
     ],
     max_feasibility_attempts: int = 5,
-    objective: ObjectiveType = ObjectiveType.closed,
+    objective: ObjectiveType | str = ObjectiveType.closed,
     on_progress: ProgressCallback | None = None,
 ) -> list[dict[str, Any]]:
     """
@@ -271,6 +271,11 @@ def generate_benchmark_suite(
     rows are skipped. on_progress, if given, is called once before and once after
     each combo is screened, check ProgressCallback
     """
+    scenario_sizes = [ScenarioSize(n) for n in scenario_sizes]
+    scenario_types = [ScenarioType(n) for n in scenario_types]
+    scenario_timings = [ScenarioTiming(n) for n in scenario_timings]
+    solver_strategies = [SolverStrategy(n) for n in solver_strategies]
+    objective = ObjectiveType(objective)
     scenarios_dir = os.path.join(outdir, "scenarios")
     os.makedirs(scenarios_dir, exist_ok=True)
     model_params = {**DEFAULT_PARAMS_MILP, **(model_params or {})}
@@ -693,7 +698,11 @@ def _latex_fmt_is_nan(value: Any) -> str | None:
 
 def _latex_fmt(value: Any, spec: str = "{:.2f}") -> str:
     chk_value = _latex_fmt_is_nan(value)
-    return chk_value if chk_value is not None else spec.format(value)
+    if chk_value is not None:
+        return chk_value
+    text = spec.format(value)
+    # values rounding to zero (e.g., -0.04 with 1 decimal) print as 0, not -0
+    return spec.format(0.0) if float(text) == 0.0 else text
 
 
 def _latex_fmt_pct(value: Any, spec: str = "{:.1f}") -> str:
@@ -915,7 +924,7 @@ def _latex_table_block(rows: list[dict[str, Any]], continuation_note: str = "") 
                     _latex_fmt(r["nr_accepted"], "{:.0f}"),
                     _latex_fmt(r["baseline_objective"], "{:.1f}"),
                     _latex_fmt(r["objective"], "{:.1f}"),
-                    _latex_fmt_pct(r["improvement_pct"]),
+                    _latex_fmt(r["improvement_pct"], "{:.1f}"),
                     _latex_fmt(r["lower_bound"], "{:.1f}"),
                     _latex_fmt(r["upper_bound"], "{:.1f}"),
                     _latex_fmt(r["gap_pct"], "{:.1f}"),

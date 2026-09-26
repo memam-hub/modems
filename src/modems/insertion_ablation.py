@@ -449,8 +449,8 @@ def generate_ablation_suite(
     outdir: str,
     request_counts: list[int],
     agent_counts: list[int],
-    scenario_types: list[ScenarioType],
-    scenario_timings: list[ScenarioTiming],
+    scenario_types: list[ScenarioType | str],
+    scenario_timings: list[ScenarioTiming | str],
     nr_repeats: int = 1,
     base_seed: int = DEFAULT_BASE_SEED,
     model_params: dict[str, Any] | None = None,
@@ -464,9 +464,11 @@ def generate_ablation_suite(
     combination for a fillable scenario with at least one insertion probe
     (build_measurement_scenario succeeds) and write one "pending" manifest row per
     combination. Safe to re-run: points with existing manifest rows are skipped.
-    soc_range is baked into each point_name (e.g., "..._soc40-60") so a normal-SoC and
+    soc_range is baked into each point_name (e.g., "..._50_70") so a normal-SoC and
     a SoC-stress corpus can coexist in the same --outdir/manifest without collisions
     """
+    scenario_types = [ScenarioType(n) for n in scenario_types]
+    scenario_timings = [ScenarioTiming(n) for n in scenario_timings]
     model_params = model_params or DEFAULT_PARAMS_OBJ
     points_dict = read_ablation_manifest(outdir)
 

@@ -43,8 +43,8 @@ every pending `(scenario, solver)` row (ALNS + MILP1/2/3, each MILP warm-started
 | `--plots` | off | Per-result `instance.plot()` + ALNS convergence/operator charts |
 
 Generated table columns: scenario, objective type, solver, baseline objective, status,
-solver objective, lower/upper bound, gap%, improvement (fraction; `.tex` renders it as
-%), count of accepted requests, solve time. Bounds (and gap%) are blank for ALNS and
+solver objective, lower/upper bound, gap%, improvement% over the baseline (negative when
+the solver ends worse), count of accepted requests, solve time. Bounds (and gap%) are blank for ALNS and
 any trivial instance, reported only by MILP solutions.
 
 The objective is not part of the scenario seed, so runs with `--objective closed` and

@@ -236,7 +236,7 @@ def milp_feasible_insertions(
             delta_obj += _node_objective(ctx, state.node, state.t_start, soft_tw)
         if soc_violated or (
             not extended_soc
-            and candidate.states[-1].t_arr > journey.agent.duration_max + tol
+            and candidate.total_travel_time() > journey.agent.duration_max + tol
         ):
             continue
         # update request nodes (indices)

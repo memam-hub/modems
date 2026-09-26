@@ -106,6 +106,8 @@ class ModemsRequest:
             raise ValueError("node_pickup_index must be a positive 1-based index")
         if not isinstance(node_delivery_index, int) or node_delivery_index < 1:
             raise ValueError("node_delivery_index must be a positive 1-based index")
+        if node_pickup_index == node_delivery_index:
+            raise ValueError("pickup and delivery must be different stations")
         if not isinstance(load, int) or isinstance(load, bool) or load <= 0:
             raise ValueError("load must be a positive integer")
         if service_time < 0:
@@ -567,7 +569,24 @@ class ModemsScenario:
         timing: ScenarioTiming | str = ScenarioTiming.uniform,
     ) -> None:
         """Initialize the scenario with agents, requests, and a road network"""
-        for agent in agents:
+        self.agents = copy.deepcopy(agents)
+        self.requests = copy.deepcopy(requests)
+        self.network = copy.deepcopy(network)
+        self.size = scenario_size_of(len(agents), len(requests))
+        self.type = ScenarioType(type)
+        self.timing = ScenarioTiming(timing)
+        self.validate()
+
+    def validate(self) -> None:
+        """
+        Raise ValueError if the scenario cannot form a valid routing problem: agent or
+        request nodes outside the network, duplicate request_id values, or a request
+        whose load exceeds every agent capacity (it could never be served). Field-level
+        invariants (e.g., pickup != delivery) are checked by ModemsRequest/ModemsAgent.
+        Called on construction and again by ProblemContext, since fields are mutable
+        """
+        network = self.network
+        for agent in self.agents:
             limit = (
                 network.nr_hubs
                 if agent.node_type == NetworkNodeType.hub
@@ -578,23 +597,25 @@ class ModemsScenario:
                     f"agent node index {agent.node_index} exceeds the available "
                     f"{agent.node_type} nodes ({limit})"
                 )
-        for request in requests:
+        for request in self.requests:
             if request.node_pickup_index > network.nr_stations:
                 raise ValueError("request pickup index exceeds nr_stations")
             if request.node_delivery_index > network.nr_stations:
                 raise ValueError("request delivery index exceeds nr_stations")
-        request_ids = [request.request_id for request in requests]
+        request_ids = [request.request_id for request in self.requests]
         if len(request_ids) != len(set(request_ids)):
             raise ValueError(
                 "request_id values must be unique within a scenario; provide "
                 "explicit IDs for otherwise identical requests"
             )
-        self.agents = copy.deepcopy(agents)
-        self.requests = copy.deepcopy(requests)
-        self.network = copy.deepcopy(network)
-        self.size = scenario_size_of(len(agents), len(requests))
-        self.type = ScenarioType(type)
-        self.timing = ScenarioTiming(timing)
+        if self.agents:
+            capacity = max(agent.load_max for agent in self.agents)
+            oversized = [r.request_id for r in self.requests if r.load > capacity]
+            if oversized:
+                raise ValueError(
+                    f"request load exceeds the largest agent capacity ({capacity}): "
+                    f"{oversized}"
+                )
 
     @property
     def new_requests(self) -> list[ModemsRequest]:
@@ -721,9 +742,10 @@ class ProblemContext:
     ) -> None:
         """
         Initialize a problem context from the given scenario and parameters,
-        validating the given model_params (or using defaults from DEFAULT_PARAMS_OBJ)
+        validating the scenario (check ModemsScenario.validate) and the given
+        model_params (or using defaults from DEFAULT_PARAMS_OBJ)
         """
-
+        scenario.validate()
         self.scenario = scenario
         self.problem_type = ProblemType(problem_type)
         self.strategy = SolverStrategy(strategy)

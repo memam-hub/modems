@@ -162,10 +162,10 @@ def read_workday_manifest(outdir: str) -> dict[str, dict[str, Any]]:
 
 def generate_workday_suite(
     outdir: str,
-    scenario_sizes: list[ScenarioSize] = [n for n in ScenarioSize],
-    scenario_types: list[ScenarioType] = [n for n in ScenarioType],
-    scenario_timings: list[ScenarioTiming] = [n for n in ScenarioTiming],
-    start_times: list[WorkdayStartTime] = [n for n in WorkdayStartTime],
+    scenario_sizes: list[ScenarioSize | str] = [n for n in ScenarioSize],
+    scenario_types: list[ScenarioType | str] = [n for n in ScenarioType],
+    scenario_timings: list[ScenarioTiming | str] = [n for n in ScenarioTiming],
+    start_times: list[WorkdayStartTime | str] = [n for n in WorkdayStartTime],
     base_rates: list[int] = [DEFAULT_BASE_RATE_PER_HOUR],
     nr_surges: int = 3,
     nr_repeats: int = 1,
@@ -184,12 +184,17 @@ def generate_workday_suite(
     Raises ValueError, before generating anything, if nr_surges exceeds max_surges
     for any of scenario_timings
     """
+    scenario_sizes = [ScenarioSize(n) for n in scenario_sizes]
+    scenario_types = [ScenarioType(n) for n in scenario_types]
+    scenario_timings = [ScenarioTiming(n) for n in scenario_timings]
+    start_times = [WorkdayStartTime(n) for n in start_times]
+    objective = ObjectiveType(objective)
     for sc_timing in scenario_timings:
         capacity = max_surges(sc_timing, workday_length)
         if nr_surges > capacity:
             raise ValueError(
                 f"nr_surges={nr_surges} exceeds the maximum of {capacity} for a "
-                f"{workday_length}-minute {ScenarioTiming(sc_timing)} workday"
+                f"{workday_length}-minute {sc_timing} workday"
             )
     model_params = {**DEFAULT_PARAMS_MILP, **(model_params or {})}
     manifest_data = read_workday_manifest(outdir)
@@ -205,7 +210,6 @@ def generate_workday_suite(
         for i_rep in range(nr_repeats)
     ]
     nr_total = len(combos)
-    objective = ObjectiveType(objective)
     for index, (
         sc_size,
         sc_type,

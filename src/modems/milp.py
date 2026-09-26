@@ -21,6 +21,10 @@ from .solution import (
     SolutionStatus,
 )
 
+# Optimality/integrality tolerance. Each solver has a different default value,
+# so use a somewhat permissive but still reasonable value for all solvers
+INTEGRALITY_TOL = 1.0e-5
+
 
 class SolverConfigType(StrEnum):
     """
@@ -199,9 +203,10 @@ class ModemsMilp:
             within=pyo.NonNegativeIntegers,
         )
         max_load = max(ctx.agents[k].load_max for k in ctx.agent_names)
-        m.param_load_max_fleet = pyo.Param(
-            initialize=max_load, within=pyo.NonNegativeIntegers
+        m.param_big_q = pyo.Param(
+            initialize=2.0 * max_load, within=pyo.NonNegativeIntegers
         )
+        m.param_big_s = pyo.Param(initialize=2.0, within=pyo.NonNegativeIntegers)
 
         if self.milp_type == MilpType.milp1:
             m.param_agent_duration_max = pyo.Param(
@@ -690,9 +695,9 @@ class ModemsMilp:
             sum_x = sum(
                 m.var_x[i, j, k] for k in m.set_agents if j in self._x_out(i, k)
             )
-            return m.var_z[j] >= m.var_z[i] + m.param_station_q[
-                j
-            ] - m.param_load_max_fleet * (1 - sum_x)
+            return m.var_z[j] >= m.var_z[i] + m.param_station_q[j] - m.param_big_q * (
+                1 - sum_x
+            )
 
         m.cstr_load_flow = pyo.Constraint(station_pairs, rule=cstr_load_flow)
 
@@ -710,7 +715,7 @@ class ModemsMilp:
                         for k in m.set_agents
                         for j in self._x_out(p, k)
                     )
-                    + m.param_load_max_fleet * (1 - m.var_y[r])
+                    + m.param_big_q * (1 - m.var_y[r])
                 )
 
             m.cstr_load_pickup_lb = pyo.Constraint(
@@ -757,7 +762,7 @@ class ModemsMilp:
                     )
                     * m.var_x[ctx.agent_initial_node[k], p, k]
                     for k in m.set_agents
-                ) + (1 - direct_sum)
+                ) + m.param_big_s * (1 - direct_sum)
 
             m.cstr_soc_initial = pyo.Constraint(m.set_requests, rule=cstr_soc_initial)
 
@@ -768,17 +773,13 @@ class ModemsMilp:
             ]
 
             def cstr_soc_flow(m: Any, i: str, j: str, k: str) -> Any:
-                return m.var_phi[j] <= m.var_phi[i] - m.param_agent_alpha[
-                    k
-                ] * m.param_travel_time[i, j] - m.param_agent_beta[
-                    k
-                ] * m.param_travel_time[
-                    i, j
-                ] * m.var_z[
-                    i
-                ] + (
-                    1 - m.var_x[i, j, k]
+                rhs = (
+                    m.var_phi[i]
+                    - m.param_agent_alpha[k] * m.param_travel_time[i, j]
+                    - m.param_agent_beta[k] * m.param_travel_time[i, j] * m.var_z[i]
+                    + m.param_big_s * (1 - m.var_x[i, j, k])
                 )
+                return m.var_phi[j] <= rhs
 
             m.cstr_soc_flow = pyo.Constraint(soc_flow_index, rule=cstr_soc_flow)
 
@@ -956,7 +957,7 @@ class ModemsMilp:
         if any(not journey._is_feasible() for journey in sol.journeys.values()):
             raise ValueError("MILP route extraction produced an infeasible journey")
         objective = self._pyo_value(self.model.objective)
-        if abs(sol.objective() - objective) > FLOAT_TOL:
+        if abs(sol.objective() - objective) > INTEGRALITY_TOL:
             raise ValueError("MILP solution and re-constructed objective mismatch")
         return sol
 
@@ -1092,8 +1093,16 @@ class ModemsMilp:
         internally-inconsistent solution (e.g., t_i violating its own soft-TW lower
         bound) despite reporting a plausible-looking status and bounds. This is a
         solver/interface reliability issue, not something we can fix upstream, so we
-        validate defensively before trusting any non-proven-optimal incumbent
+        validate defensively before trusting any non-proven-optimal incumbent. A
+        time-limited solve without an integer incumbent may also load the fractional
+        LP relaxation point, which satisfies every constraint, so also verify that
+        integer/binary variables are integral
         """
+        for var in self.model.component_data_objects(pyo.Var, active=True):
+            value = var.value
+            if value is not None and (var.is_integer() or var.is_binary()):
+                if abs(value - round(value)) > INTEGRALITY_TOL:
+                    return False
         for conditions in self.model.component_objects(pyo.Constraint, active=True):
             for idx in conditions:
                 condition = conditions[idx]
@@ -1125,7 +1134,10 @@ class ModemsMilp:
                 else:
                     status = SolutionStatus.optimal
             else:
-                status = SolutionStatus.infeasible
+                # no valid incumbent (e.g., time limit hit without an integer
+                # solution): the solver bound still holds, but nothing was found
+                status = SolutionStatus.unknown
+                objective = upper_bound = None
         elif self.results.solver.status == pyo.SolverStatus.warning:
             status = SolutionStatus.infeasible
         else:

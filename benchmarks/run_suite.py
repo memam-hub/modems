@@ -11,6 +11,7 @@ rows are skipped. Use --phase to run just one part instead of the full pipeline.
 Usage:
     python3 run_suite.py --smoke
     python3 run_suite.py --phase solve --retry-failed
+    python3 run_suite.py --objective open
     python3 run_suite.py --solver-name appsi_highs --solver-config-type highs
 """
 
@@ -44,7 +45,7 @@ from modems.benchmark import (
     SolverStrategy,
     read_manifest,
 )
-from modems.core import ScenarioSize, ScenarioTiming, ScenarioType
+from modems.core import ObjectiveType, ScenarioSize, ScenarioTiming, ScenarioType
 from modems.generator import (
     NORMAL_SOC_RANGE,
     STRESS_SOC_RANGE,
@@ -69,9 +70,10 @@ if __name__ == "__main__":
         ParserArgumentName.milp_timelimit,
         ParserArgumentName.alns_max_iter,
         ParserArgumentName.latex_rows_per_block,
+        ParserArgumentName.objective,
     ]
     add_cli_arguments(parser, shared_args)
-    parser.set_defaults(outdir=os.path.join(os.path.dirname(__file__), "results"))
+    parser.set_defaults(outdir=os.path.join(os.path.dirname(__file__), "single_suite"))
 
     parser.add_argument(
         "--soc-test",
@@ -108,7 +110,7 @@ if __name__ == "__main__":
     if args.smoke:
         args.sizes = [ScenarioSize.small, ScenarioSize.medium]
         args.types = [ScenarioType.random, ScenarioType.clustered]
-        args.timings = [ScenarioTiming.loose]
+        args.timings = [ScenarioTiming.uniform]
         args.nr_repeats = 2
         args.milp_timelimit = 8.0
         args.alns_max_iter = 100
@@ -124,6 +126,7 @@ if __name__ == "__main__":
         except ValueError as excp:
             parser.error(str(excp))
     args.phases = resolve_cli_phase(args.phase)
+    args.objective = ObjectiveType(args.objective)
 
     on_progress = make_progress_printer()
 
@@ -136,6 +139,7 @@ if __name__ == "__main__":
             nr_repeats=args.nr_repeats,
             base_seed=args.seed,
             scenario_soc_ranges=args.soc_test,
+            objective=args.objective,
             on_progress=on_progress,
         )
         nr_generated = nr_skipped = nr_failed = 0
@@ -194,7 +198,7 @@ if __name__ == "__main__":
                 if ManifestStatus(row["status"]) == ManifestStatus.done
             ]
             nr_done_rows = len(done_rows)
-            for idx, row in enumerate(done_rows):
+            for idx, row in enumerate(done_rows, start=1):
                 scenario_name = row["scenario_name"]
                 if on_progress:
                     on_progress(

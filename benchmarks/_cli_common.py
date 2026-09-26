@@ -11,7 +11,13 @@ from enum import StrEnum
 from typing import Any, Callable
 
 from modems.benchmark import MAX_ROWS_PER_BLOCK, ManifestPhase
-from modems.core import DEFAULT_BASE_SEED, ScenarioSize, ScenarioTiming, ScenarioType
+from modems.core import (
+    DEFAULT_BASE_SEED,
+    ObjectiveType,
+    ScenarioSize,
+    ScenarioTiming,
+    ScenarioType,
+)
 from modems.generator import ScenarioSocRange, SocRangeSpec
 from modems.insertion_ablation import InsertionAblationMetric
 from modems.milp import DEFAULT_MILP_SOLVER_DATA, SolverConfigType
@@ -37,6 +43,7 @@ class ParserArgumentName(StrEnum):
     latex_rows_per_block = "rows_per_block"
     ablation_bucket_size = "bucket_size"
     ablation_comparison_metric = "metric"
+    objective = "objective"
 
 
 def add_cli_arguments(
@@ -50,31 +57,43 @@ def add_cli_arguments(
             help="desired output directory",
         )
     if ParserArgumentName.sizes in argument_names:
-        types = [t for t in ScenarioSize]
         parser.add_argument(
             "--sizes",
+            type=ScenarioSize,
             nargs="+",
-            default=types,
-            choices=types,
-            help="size buckets for number of agents/requests",
+            default=list(ScenarioSize),
+            choices=list(ScenarioSize),
+            metavar="{small,medium,large}",
+            help=(
+                "size buckets for number of agents/requests. Case-insensitive, the "
+                "letter is accepted as an alias"
+            ),
         )
     if ParserArgumentName.types in argument_names:
-        types = [t.value for t in ScenarioType]
         parser.add_argument(
             "--types",
+            type=ScenarioType,
             nargs="+",
-            default=types,
-            choices=types,
-            help="spatial types, how the requests are distributed over the network",
+            default=list(ScenarioType),
+            choices=list(ScenarioType),
+            metavar="{random,clustered,mixed}",
+            help=(
+                "spatial types, how the requests are distributed over the network. "
+                "Case-insensitive, the letter is accepted as an alias"
+            ),
         )
     if ParserArgumentName.timings in argument_names:
-        timings = [t.value for t in ScenarioTiming]
         parser.add_argument(
             "--timings",
+            type=ScenarioTiming,
             nargs="+",
-            default=timings,
-            choices=timings,
-            help="request timings, the spread between request submission/arrival times",
+            default=list(ScenarioTiming),
+            choices=list(ScenarioTiming),
+            metavar="{uniform,peaks}",
+            help=(
+                "shape of the earliest-pickup times: uniform, or peaks (two plateaus). "
+                "Case-insensitive, the letter is accepted as an alias"
+            ),
         )
     if ParserArgumentName.nr_repeats in argument_names:
         parser.add_argument(
@@ -87,7 +106,7 @@ def add_cli_arguments(
         parser.add_argument(
             "--phase",
             default=ManifestPhase.all,
-            choices=[n for n in ManifestPhase],
+            choices=[n.value for n in ManifestPhase],
             help=(
                 "Which phase(s) to run. 'all' (default) runs the complete "
                 "pipeline -- generate, solve, build table -- in one command."
@@ -161,6 +180,20 @@ def add_cli_arguments(
             default=InsertionAblationMetric.speedup_V2_V3.value,
             choices=[m.value for m in InsertionAblationMetric],
             help="Comparison metric averaged per route-length bucket",
+        )
+    if ParserArgumentName.objective in argument_names:
+        parser.add_argument(
+            "--objective",
+            type=ObjectiveType,
+            default=ObjectiveType.closed,
+            choices=list(ObjectiveType),
+            metavar="{closed,open}",
+            help=(
+                "Routing objective, sets the problem type of every solver: closed (C, "
+                "default) includes the final return-to-hub leg in the mission time; "
+                "open (O) ends it at the last delivery. Case-insensitive, the letter "
+                "is accepted as an alias"
+            ),
         )
 
 

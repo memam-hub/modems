@@ -216,8 +216,7 @@ class RoadNetwork:
             travel_times = np.asarray(travel_times, dtype=float)
             if travel_times.shape != (self.nr_nodes, self.nr_nodes):
                 raise ValueError(
-                    "travel_times must be a square matrix of size "
-                    "nr_hubs + nr_stations"
+                    "travel_times must be a square matrix of size nr_hubs + nr_stations"
                 )
             if not np.all(np.isfinite(travel_times)):
                 raise ValueError("travel_times must contain only finite values")

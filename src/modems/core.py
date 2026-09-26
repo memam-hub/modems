@@ -26,6 +26,29 @@ DEFAULT_PARAMS_OBJ = {
 }
 
 
+class SmartStrEnum(StrEnum):
+    """An aliasable StrEnum for parsing/reporting purposes"""
+
+    @classmethod
+    def _missing_(cls, value: Any) -> None | SmartStrEnum:
+        if not isinstance(value, str):
+            return None
+        normalized = value.casefold()
+        for member in cls:
+            aliases = {
+                member.name.casefold(),
+                str(member.value).casefold(),
+                member.name[0].casefold(),
+            }
+            if normalized in aliases:
+                return member
+        return None
+
+    @property
+    def letter(self) -> str:
+        return self.value[0].upper()
+
+
 class RequestStatus(StrEnum):
     """Request status enumeration class"""
 
@@ -348,6 +371,17 @@ class ModemsAgent:
 # --------------------------------------------------------------------------------------
 
 
+class ObjectiveType(SmartStrEnum):
+    """
+    Routing objective: closed includes the final return-to-hub leg (for all agents)
+    in the mission time, open ends the mission time at each agent last delivery. Both
+    cases ensure that every journey ends at a reachable final hub (SoC feasibility)
+    """
+
+    closed = "closed"
+    open = "open"
+
+
 class ProblemType(StrEnum):
     """Routing problem type enumeration class"""
 
@@ -355,6 +389,21 @@ class ProblemType(StrEnum):
     open_selective = "open_selective"
     closed_non_selective = "closed_non_selective"
     closed_selective = "closed_selective"
+
+    @staticmethod
+    def from_parts(objective: ObjectiveType | str, selective: bool) -> ProblemType:
+        """Compose a problem type from its objective and selectivity"""
+        suffix = "selective" if selective else "non_selective"
+        return ProblemType(f"{ObjectiveType(objective)}_{suffix}")
+
+    @staticmethod
+    def objective_of(problem_type: str) -> ObjectiveType:
+        """Get the objective (open/closed) of the given problem type"""
+        return (
+            ObjectiveType.open
+            if ProblemType.is_open(problem_type)
+            else ObjectiveType.closed
+        )
 
     @staticmethod
     def is_open(problem_type: str) -> bool:
@@ -403,13 +452,45 @@ class SolverStrategy(StrEnum):
         """Strategy uses extended SoC model"""
         return self in (SolverStrategy.milp2, SolverStrategy.milp3, SolverStrategy.alns)
 
+    def supported_selectivity(self) -> tuple[bool, ...]:
+        """
+        Selectivity values this strategy supports, the first being its default:
+        milp1 is non-selective only, milp2 and alns are selective only, milp3 supports
+        both (selective by default). Every strategy supports both objectives
+        """
+        if self == SolverStrategy.milp1:
+            return (False,)
+        if self == SolverStrategy.milp3:
+            return (True, False)
+        return (True,)
+
+
+def resolve_problem_type(
+    strategy: SolverStrategy | str,
+    objective: ObjectiveType | str,
+    selective: bool | None = None,
+) -> ProblemType:
+    """
+    Resolve the problem type for the given strategy and objective. If selective is
+    None, use the strategy default selectivity; otherwise validate that the strategy
+    supports it and raise ValueError if not
+    """
+    strategy = SolverStrategy(strategy)
+    supported = strategy.supported_selectivity()
+    if selective is None:
+        selective = supported[0]
+    elif selective not in supported:
+        kind = "selective" if selective else "non-selective"
+        raise ValueError(f"{strategy} does not support {kind} routing problems")
+    return ProblemType.from_parts(objective, selective)
+
 
 # --------------------------------------------------------------------------------------
 # Scenario container and precomputed problem context
 # --------------------------------------------------------------------------------------
 
 
-class ScenarioType(StrEnum):
+class ScenarioType(SmartStrEnum):
     """
     Spatial distribution of request pickup/delivery stations
       - random: pickup/delivery stations drawn uniformly at random.
@@ -419,36 +500,35 @@ class ScenarioType(StrEnum):
         mixed_probability, uniform otherwise
     """
 
-    random = "R"
-    clustered = "C"
-    mixed = "M"
+    random = "random"
+    clustered = "clustered"
+    mixed = "mixed"
 
 
-class ScenarioSize(StrEnum):
-    """Scenario size: Small, Medium, Large"""
+class ScenarioSize(SmartStrEnum):
+    """Scenario size, check scenario_bucket() for corresponding nr_agents/nr_requests"""
 
-    small = "S"
-    medium = "M"
-    large = "L"
+    small = "small"
+    medium = "medium"
+    large = "large"
 
 
-class ScenarioTiming(StrEnum):
+class ScenarioTiming(SmartStrEnum):
     """
-    Temporal distribution of requests' earliest-pickup times:
-      - loose: earliest-pickup times drawn uniformly across the horizon.
-      - tight: drawn tightly around a handful of sampled "surge" moments --
-        models many requests arriving in a short window (e.g., a building
-        exit), independent of spatial clustering.
+    Temporal distribution (shape) of requests' earliest-pickup times over a horizon:
+      - uniform: spread uniformly across the horizon.
+      - peaks: half spread uniformly across the horizon, half within two plateaus
+        of 1/6 of the horizon each, centered at 1/3 and 2/3 of it (rush hours).
+    Workday surges (generate_workday_requests) come on top of either shape
     """
 
-    loose = "L"
-    tight = "T"
+    uniform = "uniform"
+    peaks = "peaks"
 
 
 def scenario_bucket(size: ScenarioSize | str) -> tuple[int, tuple[int, int]]:
     """Return the (nr_agents, (min_requests, max_requests)) bucket data for the size"""
-    if isinstance(size, str):
-        size = ScenarioSize(size)
+    size = ScenarioSize(size)
     if size == ScenarioSize.small:
         return (1, (4, 6))
     elif size == ScenarioSize.medium:
@@ -483,8 +563,8 @@ class ModemsScenario:
         agents: list[ModemsAgent],
         requests: list[ModemsRequest],
         network: RoadNetwork,
-        type: ScenarioType | str = "R",
-        timing: ScenarioTiming | str = "L",
+        type: ScenarioType | str = ScenarioType.random,
+        timing: ScenarioTiming | str = ScenarioTiming.uniform,
     ) -> None:
         """Initialize the scenario with agents, requests, and a road network"""
         for agent in agents:
@@ -527,9 +607,12 @@ class ModemsScenario:
         return [r for r in self.requests if r.is_scheduled()]
 
     def make_scenario_name(self, i_rep: int = 0) -> str:
-        """Make a scenario name from its properties and the given repitition index"""
+        """
+        Make a scenario name from its size/type/timing letters, the given repetition
+        index, and its agent/request/station/hub counts, e.g., S_SRL0_a1_r4_s15_h3
+        """
         return (
-            f"S_{self.size.value}{self.type.value}{self.timing.value}{i_rep}_"
+            f"S_{self.size.letter}{self.type.letter}{self.timing.letter}{i_rep}_"
             f"a{len(self.agents)}_"
             f"r{len(self.requests)}_"
             f"s{self.network.nr_stations}_"
@@ -540,9 +623,9 @@ class ModemsScenario:
         """Return a dictionary representation of the Scenario"""
         return {
             "properties": {
-                "size": self.size.name,
-                "type": self.type.name,
-                "timing": self.timing.name,
+                "size": self.size,
+                "type": self.type,
+                "timing": self.timing,
             },
             "agents": [
                 {

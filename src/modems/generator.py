@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import itertools
+import math
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -18,21 +20,122 @@ from .core import (
 )
 from .network import NetworkNodeType, RoadNetwork
 
-# default request arrival base rate per hour
-DEFAULT_BASE_RATE_PER_HOUR = 5.0
+# default request arrival base rate per hour (an integer number of requests)
+DEFAULT_BASE_RATE_PER_HOUR = 5
 
 # Duration of a full simulated workday (minutes)
 DEFAULT_WORKDAY_LENGTH = 480.0
-
-# Buffer (minutes) to run the simulator longer than workday so that requests arriving
-# near the end of the day can still be resolved (completed or rejected)
-DEFAULT_WORKDAY_BUFFER = 90.0
 
 # Normal range for the starting agent SoC values
 NORMAL_SOC_RANGE = (0.8, 1.0)
 
 # Stress range for the starting agent SoC values
 STRESS_SOC_RANGE = (0.5, 0.7)
+
+# Lead time (minutes) between a request submission and its earliest pickup: every
+# earliest pickup lies in [DEFAULT_MIN_LEAD, horizon end], its lead is drawn uniformly
+# from [DEFAULT_MIN_LEAD, min(DEFAULT_MAX_LEAD, earliest pickup)]
+DEFAULT_MIN_LEAD = 15.0
+DEFAULT_MAX_LEAD = 45.0
+
+# Static scenario horizon (minutes): earliest pickups lie in [DEFAULT_MIN_LEAD,
+# STATIC_HORIZON], all requests are submitted at t=0
+STATIC_HORIZON = 60.0
+
+# ScenarioTiming.peaks shape: PEAKS_FLOOR_SHARE of the demand spread uniformly, the
+# rest within two plateaus, each PEAKS_DURATION (fraction of the horizon) wide, centered
+# at PEAKS_CENTERS (fractions of the horizon)
+PEAKS_FLOOR_SHARE = 0.5
+PEAKS_CENTERS = (1.0 / 3.0, 2.0 / 3.0)
+PEAKS_DURATION = 1.0 / 6.0
+
+# Workday surge window length (minutes); a surge adds one hour worth of base-rate
+# demand within its window, i.e., (60 / SURGE_DURATION) x the base rate on top
+SURGE_DURATION = 30.0
+
+# Minimum gap (minutes) a surge window keeps from any other surge window and from the
+# peaks plateaus, per timing
+SURGE_GAP_BY_TIMING: dict[ScenarioTiming, float] = {
+    ScenarioTiming.uniform: 30.0,
+    ScenarioTiming.peaks: 15.0,
+}
+
+
+def _peaks_plateaus(
+    horizon_start: float, horizon_end: float, t_lb: float
+) -> list[tuple[float, float]]:
+    """ScenarioTiming.peaks plateaus of [horizon_start, horizon_end], clipped at t_lb"""
+    span = horizon_end - horizon_start
+    plateaus = []
+    for center in PEAKS_CENTERS:
+        mid = horizon_start + center * span
+        lb = max(t_lb, mid - PEAKS_DURATION * span / 2.0)
+        ub = min(horizon_end, mid + PEAKS_DURATION * span / 2.0)
+        if ub > lb:
+            plateaus.append((lb, ub))
+    return plateaus
+
+
+def timing_profile(
+    timing: ScenarioTiming | str,
+    horizon_start: float,
+    horizon_end: float,
+    t_lb: float | None = None,
+) -> list[tuple[float, float, float]]:
+    """
+    Earliest-pickup probability density of the timing over [t_lb, horizon_end] as
+    (start, end, density) pieces that overlap (additively) and integrate to 1. Peaks
+    plateaus are placed relative to the full horizon; t_lb defaults to horizon_start
+    """
+    t_lb = horizon_start if t_lb is None else t_lb
+    if not horizon_start <= t_lb < horizon_end:
+        raise ValueError("expected horizon_start <= t_lb < horizon_end")
+    if ScenarioTiming(timing) == ScenarioTiming.uniform:
+        return [(t_lb, horizon_end, 1.0 / (horizon_end - t_lb))]
+    plateaus = _peaks_plateaus(horizon_start, horizon_end, t_lb)
+    p_span = sum(ub - lb for lb, ub in plateaus)
+    floor_share = PEAKS_FLOOR_SHARE if p_span > 0 else 1.0
+    pieces = [(t_lb, horizon_end, floor_share / (horizon_end - t_lb))]
+    pieces += [(lb, ub, (1.0 - floor_share) / p_span) for lb, ub in plateaus]
+    return pieces
+
+
+def surge_spans(
+    timing: ScenarioTiming | str,
+    workday_length: float,
+    min_lead: float = DEFAULT_MIN_LEAD,
+) -> list[tuple[float, float]]:
+    """
+    Time spans within [min_lead, workday_length] where a surge window may lie, kept
+    SURGE_GAP_BY_TIMING away from the peaks plateaus; the gap between surges themselves
+    is enforced by _sample_surge_starts
+    """
+    timing = ScenarioTiming(timing)
+    gap = SURGE_GAP_BY_TIMING[timing]
+    plateaus = (
+        _peaks_plateaus(0.0, workday_length, min_lead)
+        if timing == ScenarioTiming.peaks
+        else []
+    )
+    spans, t_start, after_plateau = [], min_lead, False
+    for lb, ub in sorted(plateaus):
+        spans.append((t_start + (gap if after_plateau else 0.0), lb - gap))
+        t_start, after_plateau = ub, True
+    spans.append((t_start + (gap if after_plateau else 0.0), workday_length))
+    return [(lb, ub) for lb, ub in spans if ub - lb >= SURGE_DURATION]
+
+
+def max_surges(
+    timing: ScenarioTiming | str,
+    workday_length: float,
+    min_lead: float = DEFAULT_MIN_LEAD,
+) -> int:
+    """Maximum number of non-overlapping, gap-separated surges a workday can hold"""
+    gap = SURGE_GAP_BY_TIMING[ScenarioTiming(timing)]
+    return sum(
+        int((ub - lb + gap) // (SURGE_DURATION + gap))
+        for lb, ub in surge_spans(timing, workday_length, min_lead)
+    )
 
 
 class ScenarioSocRange(StrEnum):
@@ -84,8 +187,8 @@ class SocRangeSpec:
 
     @property
     def suffix(self) -> str:
-        """Scenario/point name suffix, e.g. "_soc80-100" """
-        return f"_soc{int(self.lb * 100)}-{int(self.ub * 100)}"
+        """Scenario/point name suffix, e.g., "80_100" """
+        return f"{int(self.lb * 100)}_{int(self.ub * 100)}"
 
     @property
     def label(self) -> str:
@@ -231,29 +334,72 @@ class ModemsScenarioGenerator:
             return self._nearest_station_index(point)
         return int(self.rng.integers(0, self.network.nr_stations))
 
-    def sample_surge_moments(
-        self, nr_surges: int, time_lb: float, time_ub: float
+    def _sample_from_pieces(
+        self, pieces: list[tuple[float, float, float]], size: int
     ) -> np.ndarray:
         """
-        Sample nr_surges moments within [time_lb, time_ub] for ScenarioTiming.tight
-        earliest-pickup times
+        Sample size points from piecewise-constant (lb, ub, density) pieces that
+        overlap additively: pick a piece by its mass, then a uniform point within it
         """
-        return self.rng.uniform(time_lb, time_ub, size=nr_surges)
+        masses = np.array([(ub - lb) * density for lb, ub, density in pieces])
+        idx = self.rng.choice(len(pieces), size=size, p=masses / masses.sum())
+        starts = np.array([pieces[i][0] for i in idx])
+        ends = np.array([pieces[i][1] for i in idx])
+        return starts + (ends - starts) * self.rng.uniform(0.0, 1.0, size=size)
 
-    def _sample_earliest_pickup(
+    def _sample_surge_starts(
         self,
-        use_tight: bool,
-        surge_moments: np.ndarray | None,
-        temporal_spread: float,
-        time_lb: float,
-        time_ub: float,
-    ) -> float:
-        """sample an earliest pickup time within surge_moments if use_tight"""
-        if use_tight and surge_moments is not None and len(surge_moments) > 0:
-            moment = surge_moments[self.rng.integers(0, len(surge_moments))]
-            t_pickup = self.rng.normal(moment, temporal_spread)
-            return round(float(np.clip(t_pickup, time_lb, time_ub)), 1)
-        return round(self.rng.uniform(time_lb, time_ub), 1)
+        nr_surges: int,
+        spans: list[tuple[float, float]],
+        duration: float,
+        gap: float,
+    ) -> list[float]:
+        """
+        Sample nr_surges non-overlapping surge window starts within spans, each pair
+        gap apart, uniformly over all valid placements: pick how many surges each span
+        holds (weighted by the volume of its placements), then spread each span's
+        slack uniformly. Raises ValueError if they do not fit
+        """
+        if nr_surges == 0:
+            return []
+
+        def slack(span_length: float, n: int) -> float:
+            return span_length - n * duration - max(0, n - 1) * gap
+
+        span_lengths = [ub - lb for lb, ub in spans]
+        capacities = [
+            int((span_length + gap) // (duration + gap)) for span_length in span_lengths
+        ]
+        allocations = [
+            counts
+            for counts in itertools.product(*(range(c + 1) for c in capacities))
+            if sum(counts) == nr_surges
+        ]
+        if not allocations:
+            raise ValueError(f"{nr_surges} surges do not fit in the workday")
+        weights = np.array(
+            [
+                math.prod(
+                    slack(span_length, count) ** count / math.factorial(count)
+                    for span_length, count in zip(span_lengths, counts)
+                )
+                for counts in allocations
+            ]
+        )
+        if weights.sum() <= 0.0:  # every allocation is packed exactly (zero slack)
+            weights = np.ones(len(allocations))
+        counts = allocations[
+            self.rng.choice(len(allocations), p=weights / weights.sum())
+        ]
+        starts = []
+        for (lb, _), span_length, count in zip(spans, span_lengths, counts):
+            offsets = np.sort(
+                self.rng.uniform(0.0, slack(span_length, count), size=count)
+            )
+            starts += [
+                lb + offset + j * (duration + gap) for j, offset in enumerate(offsets)
+            ]
+        return sorted(float(t) for t in starts)
 
     # ----------------------------------------------------------------------------------
     # Agent and request generation
@@ -318,17 +464,13 @@ class ModemsScenarioGenerator:
         self,
         load_lb: int,
         load_ub: int,
-        time_lb: float,
-        time_ub: float,
+        earliest_pickup: float,
         tw_length: float,
         status: RequestStatus | str = RequestStatus.new,
         cluster_centers: np.ndarray | None = None,
         cluster_spread: float = 6.0,
         use_clustered_pickup: bool = False,
         use_clustered_delivery: bool = False,
-        surge_moments: np.ndarray | None = None,
-        temporal_spread: float = 3.0,
-        use_tight_timing: bool = False,
     ) -> ModemsRequest:
         """
         Generate a random request
@@ -336,17 +478,13 @@ class ModemsScenarioGenerator:
         Args:
             load_lb: Lower bound for load
             load_ub: Upper bound for load
-            time_lb: Lower bound for earliest pickup time
-            time_ub: Upper bound for earliest pickup time
+            earliest_pickup: Earliest pickup time (sampled by the caller)
             tw_length: Fixed pickup time-window length (omega)
             status: "new" (R_n) or "scheduled" (R_s)
             cluster_centers: Optional (x, y) centers for spatial clustering
             cluster_spread: std-dev (in coordinate units) of the spread around a center
             use_clustered_pickup: sample the pickup station using cluster_centers
             use_clustered_delivery: sample the delivery station using cluster_centers
-            surge_moments: optional "surge" times for temporal clustering
-            temporal_spread: std-dev (in minutes) of the spread around a surge moment
-            use_tight_timing: sample earliest_pickup TIGHTly around a surge moment
 
         Returns:
             ModemsRequest object
@@ -369,9 +507,6 @@ class ModemsScenarioGenerator:
 
         load = int(self.rng.integers(load_lb, load_ub))
         service_time = min(1.0, max(0.2, load / 10))  # [0.2-1.0] min, load-dependent
-        earliest_pickup = self._sample_earliest_pickup(
-            use_tight_timing, surge_moments, temporal_spread, time_lb, time_ub
-        )
         return ModemsRequest(
             node_pickup_index=pickup_idx + 1,  # stored index is 1-based
             node_delivery_index=delivery_idx + 1,
@@ -388,14 +523,12 @@ class ModemsScenarioGenerator:
         nr_agents: int = 3,
         nr_requests: int = 10,
         scenario_type: ScenarioType | str = ScenarioType.random,
-        scenario_timing: ScenarioTiming | str = ScenarioTiming.loose,
+        scenario_timing: ScenarioTiming | str = ScenarioTiming.uniform,
         tw_length: float = DEFAULT_TIME_WINDOW,
         nr_scheduled: int = 0,
         nr_clusters: int = 3,
         cluster_spread: float = 6.0,
         mixed_probability: float = 0.5,
-        nr_surges: int = 2,
-        temporal_spread: float = 3.0,
         soc_lb: float = 0.8,
         soc_ub: float = 1.0,
     ) -> ModemsScenario:
@@ -407,8 +540,9 @@ class ModemsScenarioGenerator:
             nr_requests: Number of requests. Defaults to 10
             scenario_type: Spatial distribution of pickup/delivery stations
                 (random/clustered/mixed). Defaults to ScenarioType.random
-            scenario_timing: Temporal distribution of earliest-pickup times
-                (loose/tight). Defaults to ScenarioTiming.loose
+            scenario_timing: Shape of the earliest-pickup times distribution over
+                [DEFAULT_MIN_LEAD, STATIC_HORIZON] (uniform/peaks, check
+                timing_profile). Defaults to ScenarioTiming.uniform
             tw_length: Fixed pickup time-window length (omega). Defaults to 5.0 minutes
             nr_scheduled: Number of requests (out of nr_requests) marked as
                 scheduled (R_s) rather than new (R_n). Defaults to 0
@@ -418,9 +552,6 @@ class ModemsScenarioGenerator:
                 center. Defaults to 6.0
             mixed_probability: Per-endpoint probability of using the clustered draw
                 when scenario_type is mixed. Defaults to 0.5
-            nr_surges: Number of "surge" moments for TIGHT timings. Defaults to 2
-            temporal_spread: Std-dev (minutes) of the spread around a surge moment.
-                Defaults to 3.0
             soc_lb: Lower bound for each agent's initial SoC. Defaults to 0.8
             soc_ub: Upper bound for each agent's initial SoC. Defaults to 1.0
 
@@ -447,12 +578,12 @@ class ModemsScenarioGenerator:
             if scenario_type in (ScenarioType.clustered, ScenarioType.mixed)
             else None
         )
-        # e^r must lie within [15, 60] in the future relative to submission time (t=0)
-        time_lb, time_ub = 15.0, 60.0
-        surge_moments = (
-            self.sample_surge_moments(nr_surges, time_lb, time_ub)
-            if scenario_timing == ScenarioTiming.tight
-            else None
+        # e^r lies within [15, 60] in the future relative to submission time (t=0), a
+        # fixed number of requests follows the timing shape (a Poisson process given
+        # its count), each rounded to 0.1 minutes
+        earliest_pickups = self._sample_from_pieces(
+            timing_profile(scenario_timing, DEFAULT_MIN_LEAD, STATIC_HORIZON),
+            nr_requests,
         )
 
         requests = []
@@ -469,8 +600,7 @@ class ModemsScenarioGenerator:
                 self.generate_random_request(
                     load_lb=1,
                     load_ub=5,
-                    time_lb=time_lb,
-                    time_ub=time_ub,
+                    earliest_pickup=round(float(earliest_pickups[i]), 1),
                     tw_length=tw_length,
                     status=(
                         RequestStatus.scheduled
@@ -481,9 +611,6 @@ class ModemsScenarioGenerator:
                     cluster_spread=cluster_spread,
                     use_clustered_pickup=use_clustered_pickup,
                     use_clustered_delivery=use_clustered_delivery,
-                    surge_moments=surge_moments,
-                    temporal_spread=temporal_spread,
-                    use_tight_timing=(scenario_timing == ScenarioTiming.tight),
                 )
             )
         return ModemsScenario(
@@ -497,33 +624,79 @@ class ModemsScenarioGenerator:
     def generate_workday_requests(
         self,
         workday_length: float = DEFAULT_WORKDAY_LENGTH,
-        base_rate_per_hour: float = DEFAULT_BASE_RATE_PER_HOUR,
-        nr_surges: int = 3,
-        surge_size_range: tuple[int, int] = (6, 10),
-        surge_spread_min: float = 5.0,
+        base_rate_per_hour: int = DEFAULT_BASE_RATE_PER_HOUR,
+        nr_surges: int = 0,
+        scenario_timing: ScenarioTiming | str = ScenarioTiming.uniform,
         scenario_type: ScenarioType | str = ScenarioType.random,
         nr_clusters: int = 3,
         cluster_spread: float = 6.0,
         mixed_probability: float = 0.5,
         tw_length: float = DEFAULT_TIME_WINDOW,
-        min_lead: float = 15.0,
-        max_lead: float = 45.0,
+        min_lead: float = DEFAULT_MIN_LEAD,
+        max_lead: float = DEFAULT_MAX_LEAD,
     ) -> list[tuple[float, ModemsRequest]]:
         """
-        Generate a full workday request-arrival stream: a steady baseline Poisson
-        process plus a handful of "surge" bursts (e.g., end-of-lecture), spread across
-        [0, workday_length]. Returns a list of (time_submit, ModemsRequest) sorted by
-        time_submit; each request earliest_pickup is time_submit + a random lead
-        in [min_lead, max_lead], matching the >=15min submission-to-pickup
+        Generate a workday request stream as a (non-homogeneous) Poisson process over
+        the earliest-pickup times in [min_lead, workday_length], with the rate:
+          - base_rate_per_hour x the scenario_timing shape (check timing_profile, the
+            peaks plateaus are placed relative to [0, workday_length]), so the expected
+            number of requests is base_rate_per_hour x (workday_length - min_lead)/60
+          - plus nr_surges surge windows of SURGE_DURATION minutes, each adding one hour
+            worth of base-rate demand, placed uniformly over all valid placements: never
+            overlapping each other or the peaks plateaus, and at least the timing's
+            SURGE_GAP_BY_TIMING apart from both (check max_surges)
+        Each request is submitted at earliest_pickup - lead, with the lead drawn
+        uniformly from [min_lead, min(max_lead, earliest_pickup)], so submissions lie
+        in [0, workday_length - min_lead]. Returns a list of (time_submit,
+        ModemsRequest), sorted by time_submit. Raises ValueError for a base rate below
+        1, a negative nr_surges, or more surges than max_surges allows
         """
+        scenario_timing = ScenarioTiming(scenario_timing)
         scenario_type = ScenarioType(scenario_type)
+        if base_rate_per_hour < 1:
+            raise ValueError("base_rate_per_hour must be a positive integer")
+        if not 0.0 <= min_lead <= max_lead:
+            raise ValueError("expected 0 <= min_lead <= max_lead")
+        if workday_length <= min_lead:
+            raise ValueError("workday_length must exceed min_lead")
+        if nr_surges < 0:
+            raise ValueError("nr_surges must be non-negative")
+        capacity = max_surges(scenario_timing, workday_length, min_lead)
+        if nr_surges > capacity:
+            raise ValueError(
+                f"{nr_surges} surges exceed the maximum of {capacity} for a "
+                f"{workday_length}-minute {scenario_timing} workday"
+            )
+
         cluster_centers = (
             self.sample_cluster_centers(nr_clusters)
             if scenario_type in (ScenarioType.clustered, ScenarioType.mixed)
             else None
         )
 
-        def make_one_request(t_submit: float) -> ModemsRequest:
+        # rate pieces (requests per minute): base shape plus surge windows
+        rate_per_min = base_rate_per_hour / 60.0
+        pieces = [
+            (lb, ub, density * rate_per_min * (workday_length - min_lead))
+            for lb, ub, density in timing_profile(
+                scenario_timing, 0.0, workday_length, min_lead
+            )
+        ]
+        surge_starts = self._sample_surge_starts(
+            nr_surges,
+            surge_spans(scenario_timing, workday_length, min_lead),
+            SURGE_DURATION,
+            SURGE_GAP_BY_TIMING[scenario_timing],
+        )
+        pieces += [
+            (t, t + SURGE_DURATION, rate_per_min * 60.0 / SURGE_DURATION)
+            for t in surge_starts
+        ]
+        nr_requests = int(self.rng.poisson(sum((b - a) * h for a, b, h in pieces)))
+        earliest_pickups = np.sort(self._sample_from_pieces(pieces, nr_requests))
+
+        request_submissions: list[tuple[float, ModemsRequest]] = []
+        for earliest_pickup in earliest_pickups:
             if scenario_type == ScenarioType.random:
                 use_p = use_d = False
             elif scenario_type == ScenarioType.clustered:
@@ -531,13 +704,11 @@ class ModemsScenarioGenerator:
             else:
                 use_p = self.rng.random() < mixed_probability
                 use_d = self.rng.random() < mixed_probability
-            t_lead = self.rng.uniform(min_lead, max_lead)
-            pickup_time = t_submit + t_lead
-            return self.generate_random_request(
+            lead = self.rng.uniform(min_lead, min(max_lead, earliest_pickup))
+            request = self.generate_random_request(
                 load_lb=1,
                 load_ub=6,
-                time_lb=pickup_time,
-                time_ub=pickup_time,
+                earliest_pickup=float(earliest_pickup),
                 tw_length=tw_length,
                 status=RequestStatus.new,
                 cluster_centers=cluster_centers,
@@ -545,33 +716,7 @@ class ModemsScenarioGenerator:
                 use_clustered_pickup=use_p,
                 use_clustered_delivery=use_d,
             )
-
-        request_submissions: list[tuple[float, ModemsRequest]] = []
-        rate_per_min = base_rate_per_hour / 60.0
-        if rate_per_min > 0:
-            t_submit = 0.0
-            while True:
-                t_submit += self.rng.exponential(1.0 / rate_per_min)
-                if t_submit >= workday_length:
-                    break
-                request_submissions.append((t_submit, make_one_request(t_submit)))
-
-        surge_moments = (
-            self.rng.uniform(0.0, workday_length, size=nr_surges)
-            if nr_surges > 0
-            else []
-        )
-        for moment in surge_moments:
-            size = int(self.rng.integers(surge_size_range[0], surge_size_range[1] + 1))
-            for _ in range(size):
-                t_submit = float(
-                    np.clip(
-                        self.rng.normal(moment, surge_spread_min),
-                        0.0,
-                        workday_length - 1e-3,
-                    )
-                )
-                request_submissions.append((t_submit, make_one_request(t_submit)))
+            request_submissions.append((float(earliest_pickup - lead), request))
 
         request_submissions.sort(key=lambda x: x[0])
         return request_submissions

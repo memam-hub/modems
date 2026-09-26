@@ -91,7 +91,7 @@ class InsertionAblationMetric(StrEnum):
 
 
 # prefix for the insertion ablation benchmarking result
-BNCH_ABLATION_PFX = "IA_"
+BNCH_ABLATION_PFX = "I"
 
 
 # --------------------------------------------------------------------------------------
@@ -484,8 +484,8 @@ def generate_ablation_suite(
         combos, start=1
     ):
         point_name = (
-            f"{BNCH_ABLATION_PFX}"
-            f"a{nr_agents}r{nr_requests}{sc_type}{sc_timing}{i_rep}"
+            f"{BNCH_ABLATION_PFX}{i_rep}_"
+            f"a{nr_agents}r{nr_requests}{sc_type.letter}{sc_timing.letter}"
             f"{soc_range.suffix}"
         )
         if on_progress:

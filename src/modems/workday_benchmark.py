@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import csv
 import json
-import math
 import os
 import time
-from enum import StrEnum
 from typing import Any
 
 from modems.network import RoadNetwork
@@ -13,7 +11,6 @@ from modems.solution import (
     DEFAULT_MILP_TIMELIMIT,
     DEFAULT_PARAMS_ALNS,
     DEFAULT_PARAMS_MILP,
-    FLOAT_INF,
 )
 
 from .benchmark import (
@@ -33,17 +30,19 @@ from .core import (
     DEFAULT_BASE_SEED,
     ModemsAgent,
     ModemsRequest,
+    ObjectiveType,
     ScenarioSize,
     ScenarioTiming,
     ScenarioType,
+    SmartStrEnum,
     SolverStrategy,
     scenario_bucket,
 )
 from .generator import (
     DEFAULT_BASE_RATE_PER_HOUR,
-    DEFAULT_WORKDAY_BUFFER,
     DEFAULT_WORKDAY_LENGTH,
     ModemsScenarioGenerator,
+    max_surges,
 )
 from .milp import DEFAULT_MILP_SOLVER_DATA, SolverConfigType
 from .rolling_horizon import (
@@ -54,33 +53,15 @@ from .rolling_horizon import (
 )
 
 
-class WorkdayStartTime(StrEnum):
+class WorkdayStartTime(SmartStrEnum):
     """Whether all fleet agents start at t=0, or staggered throughout the day"""
 
-    normal = "N"
-    staggered = "S"
+    normal = "normal"
+    staggered = "staggered"
 
 
 # Staggered agent i (0-indexed) starts at time = i * (workday_length / STAGGER_DIVISOR)
 STAGGER_DIVISOR = 5.0
-
-# ScenarioTiming to surge parameters conversion:
-# loose: small, spread-out bursts; tight: larger, more concentrated bursts
-TIMING_SURGE_PARAMS: dict[ScenarioTiming, dict[str, Any]] = {
-    ScenarioTiming.loose: {
-        "nr_surges": 2,
-        "surge_size_range": (3, 6),
-        "surge_spread_min": 10.0,
-    },
-    ScenarioTiming.tight: {
-        "nr_surges": 4,
-        "surge_size_range": (8, 14),
-        "surge_spread_min": 3.0,
-    },
-}
-
-# Use a simplified name for readable reporting when working fixed fleet, mark as TODO
-FIXED_FLEET_NAMING = True
 
 
 def _build_fleet(
@@ -121,7 +102,8 @@ def _build_workday(
     scenario_timing: ScenarioTiming,
     workday_length: float,
     start_time: WorkdayStartTime = WorkdayStartTime.normal,
-    base_rate_per_hour: float = DEFAULT_BASE_RATE_PER_HOUR,
+    base_rate_per_hour: int = DEFAULT_BASE_RATE_PER_HOUR,
+    nr_surges: int = 3,
 ) -> tuple[
     ModemsScenarioGenerator, list[ModemsAgent], list[tuple[float, ModemsRequest]]
 ]:
@@ -132,7 +114,8 @@ def _build_workday(
         workday_length=workday_length,
         scenario_type=scenario_type,
         base_rate_per_hour=base_rate_per_hour,
-        **TIMING_SURGE_PARAMS[ScenarioTiming(scenario_timing)],
+        nr_surges=nr_surges,
+        scenario_timing=scenario_timing,
     )
     return generator, agents, request_submissions
 
@@ -183,20 +166,31 @@ def generate_workday_suite(
     scenario_types: list[ScenarioType] = [n for n in ScenarioType],
     scenario_timings: list[ScenarioTiming] = [n for n in ScenarioTiming],
     start_times: list[WorkdayStartTime] = [n for n in WorkdayStartTime],
-    base_rates: list[float] = [DEFAULT_BASE_RATE_PER_HOUR],
+    base_rates: list[int] = [DEFAULT_BASE_RATE_PER_HOUR],
+    nr_surges: int = 3,
     nr_repeats: int = 1,
     base_seed: int = DEFAULT_BASE_SEED,
     workday_length: float = DEFAULT_WORKDAY_LENGTH,
     model_params: dict[str, Any] | None = None,
     max_feasibility_attempts: int = 5,
+    objective: ObjectiveType | str = ObjectiveType.closed,
     on_progress: ProgressCallback | None = None,
 ) -> list[dict[str, Any]]:
     """
     Screen a workday for a feasible initial fleet, i.e., all fleet agents can reach
     a final hub, same check as RollingHorizonSimulator.__init__; write one "pending"
     manifest row per workday, skipping any existing manifest workday rows. When given,
-    on_progress is called once before and once after each combo/point is screened
+    on_progress is called once before and once after each combo/point is screened.
+    Raises ValueError, before generating anything, if nr_surges exceeds max_surges
+    for any of scenario_timings
     """
+    for sc_timing in scenario_timings:
+        capacity = max_surges(sc_timing, workday_length)
+        if nr_surges > capacity:
+            raise ValueError(
+                f"nr_surges={nr_surges} exceeds the maximum of {capacity} for a "
+                f"{workday_length}-minute {ScenarioTiming(sc_timing)} workday"
+            )
     model_params = {**DEFAULT_PARAMS_MILP, **(model_params or {})}
     manifest_data = read_workday_manifest(outdir)
 
@@ -211,6 +205,7 @@ def generate_workday_suite(
         for i_rep in range(nr_repeats)
     ]
     nr_total = len(combos)
+    objective = ObjectiveType(objective)
     for index, (
         sc_size,
         sc_type,
@@ -220,15 +215,11 @@ def generate_workday_suite(
         i_rep,
     ) in enumerate(combos, start=1):
         nr_agents, (_, _) = scenario_bucket(sc_size)
-        if FIXED_FLEET_NAMING:
-            workday_name = (
-                f"{BNCH_WORKDAY_PFX}br{int(base_rate)}{sc_timing}{start_time}{i_rep}"
-            )
-        else:
-            workday_name = (
-                f"{BNCH_WORKDAY_PFX}{sc_size}{sc_type}{sc_timing}{start_time}"
-                f"br{int(base_rate)}{i_rep}"
-            )
+        workday_name = (
+            f"{BNCH_WORKDAY_PFX}{objective.letter}{i_rep}_"
+            f"{sc_size.letter}{sc_type.letter}{sc_timing.letter}{start_time.letter}"
+            f"{base_rate}_{nr_surges}"
+        )
         if on_progress:
             on_progress(
                 {
@@ -263,6 +254,7 @@ def generate_workday_suite(
                 sc_timing,
                 start_time,
                 base_rate,
+                nr_surges,
                 i_rep,
                 attempt,
             )
@@ -270,7 +262,10 @@ def generate_workday_suite(
             agents = _build_fleet(generator, nr_agents, start_time, workday_length)
             try:
                 RollingHorizonSimulator(
-                    generator.network, agents, model_params=model_params
+                    generator.network,
+                    agents,
+                    model_params=model_params,
+                    objective=objective,
                 )
             except ValueError:
                 continue
@@ -297,11 +292,13 @@ def generate_workday_suite(
             outdir,
             {
                 "workday_name": workday_name,
+                "objective_type": objective,
                 "size": sc_size,
                 "type": sc_type,
                 "timing": sc_timing,
                 "start_time": start_time,
                 "base_rate": base_rate,
+                "nr_surges": nr_surges,
                 "repetition": i_rep,
                 "nr_agents": nr_agents,
                 "seed": seed,
@@ -333,7 +330,6 @@ def generate_workday_suite(
 
 def _solve_one_workday(
     row: dict[str, Any],
-    workday_buffer: float,
     model_params: dict[str, Any],
     milp_timelimit: float,
     alns_max_iter: int,
@@ -348,6 +344,7 @@ def _solve_one_workday(
     compare_solvers_one_workday's own workday_logs_out for what it holds.
     """
     workday_length = row["workday_length"]
+    objective = ObjectiveType(row["objective_type"])
     generator, agents, request_submissions = _build_workday(
         row["seed"],
         row["nr_agents"],
@@ -356,21 +353,24 @@ def _solve_one_workday(
         workday_length,
         start_time=WorkdayStartTime(row.get("start_time", WorkdayStartTime.normal)),
         base_rate_per_hour=row.get("base_rate", DEFAULT_BASE_RATE_PER_HOUR),
+        nr_surges=row["nr_surges"],
     )
     summaries = compare_solvers_one_workday(
         generator.network,
         agents,
         request_submissions,
-        workday_length=workday_length + workday_buffer,
+        workday_length=workday_length,
         model_params=model_params,
         milp_timelimit=milp_timelimit,
         alns_max_iter=alns_max_iter,
         solver_name=solver_name,
         solver_config_type=solver_config_type,
         workday_logs_out=workday_logs_out,
+        objective=objective,
     )
     return {
         "workday_name": row["workday_name"],
+        "objective_type": objective,
         "size": row["size"],
         "type": row["type"],
         "timing": row["timing"],
@@ -378,7 +378,6 @@ def _solve_one_workday(
         "nr_agents": row["nr_agents"],
         "seed": row["seed"],
         "workday_length": workday_length,
-        "workday_buffer": workday_buffer,
         "nr_submissions": len(request_submissions),
         "milp3": summaries["milp3"],
         "alns": summaries["alns"],
@@ -390,7 +389,6 @@ def solve_workday_suite(
     model_params: dict[str, Any] | None = None,
     milp_timelimit: float = DEFAULT_MILP_TIMELIMIT,
     alns_max_iter: int = DEFAULT_PARAMS_ALNS["max_iter"],
-    workday_buffer: float = DEFAULT_WORKDAY_BUFFER,
     retry_failed: bool = False,
     solver_name: str = DEFAULT_MILP_SOLVER_DATA[0],
     solver_config_type: SolverConfigType = DEFAULT_MILP_SOLVER_DATA[1],
@@ -437,7 +435,6 @@ def solve_workday_suite(
             workday_logs: dict[SolverStrategy, WorkdayLog] = {}
             result = _solve_one_workday(
                 row,
-                workday_buffer=workday_buffer,
                 model_params=model_params,
                 milp_timelimit=milp_timelimit,
                 alns_max_iter=alns_max_iter,
@@ -549,11 +546,13 @@ def build_workday_summary_table(
             rows.append(
                 {
                     "workday": workday_name,
+                    "objective_type": row.get("objective_type"),
                     "size": row.get("size"),
                     "type": row.get("type"),
                     "timing": row.get("timing"),
                     "start_time": row.get("start_time"),
                     "base_rate": row.get("base_rate"),
+                    "nr_surges": row.get("nr_surges"),
                     "nr_agents": row.get("nr_agents"),
                     "status": status,
                     "nr_submissions": None,
@@ -579,11 +578,13 @@ def build_workday_summary_table(
         rows.append(
             {
                 "workday": workday_name,
+                "objective_type": row["objective_type"],
                 "size": row["size"],
                 "type": row["type"],
                 "timing": row["timing"],
                 "start_time": row.get("start_time"),
                 "base_rate": row.get("base_rate"),
+                "nr_surges": row.get("nr_surges"),
                 "nr_agents": row["nr_agents"],
                 "status": status,
                 "nr_submissions": data["nr_submissions"],
@@ -612,11 +613,13 @@ def build_workday_summary_table(
 
     fieldnames = [
         "workday",
+        "objective_type",
         "size",
         "type",
         "timing",
         "start_time",
         "base_rate",
+        "nr_surges",
         "nr_agents",
         "status",
         "nr_submissions",
@@ -702,6 +705,7 @@ def build_workday_requests_table(
             {
                 "request_id": o_milp.request.request_id,
                 "submission_time": o_milp.submission_time,
+                "earliest_pickup": o_milp.earliest_pickup,
                 "pickup_node": o_milp.request.node_pickup_index,
                 "delivery_node": o_milp.request.node_delivery_index,
                 "load": o_milp.request.load,
@@ -728,6 +732,7 @@ def build_workday_requests_table(
     fieldnames = [
         "request_id",
         "submission_time",
+        "earliest_pickup",
         "pickup_node",
         "delivery_node",
         "load",
@@ -744,6 +749,7 @@ def build_workday_requests_table(
     ]
     time_fields = {
         "submission_time",
+        "earliest_pickup",
         "pickup_time_milp3",
         "pickup_time_alns",
         "delivery_time_milp3",
@@ -809,14 +815,14 @@ def _requests_latex_table_block(
         "\n"
         r"\hline"
         "\n"
-        r"Key & Submitted & $p^r$ & $d^r$ & $q^r$ & "
+        r"Key & Earliest & $p^r$ & $d^r$ & $q^r$ & "
         r"\multicolumn{2}{c}{Accepted?} & "
         r"\multicolumn{2}{c}{Pickup time} & "
         r"\multicolumn{2}{c}{Delivery time} & "
         r"\multicolumn{2}{c}{Delay (min)} & "
         r"\multicolumn{2}{c}{Excess ride (min)} \\"
         "\n"
-        r" & & & & & "
+        r" & pickup & & & & "
         r"{MILP3} & {ALNS} & "
         r"{MILP3} & {ALNS} & "
         r"{MILP3} & {ALNS} & "
@@ -837,7 +843,7 @@ def _requests_latex_table_block(
             " & ".join(
                 [
                     r"RQ\_" + str(row["request_id"])[:4].replace("_", r"\_"),
-                    _format_clock(row["submission_time"], clock_display_start),
+                    _format_clock(row["earliest_pickup"], clock_display_start),
                     str(row["pickup_node"]),
                     str(row["delivery_node"]),
                     str(row["load"]),

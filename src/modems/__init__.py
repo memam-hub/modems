@@ -18,6 +18,9 @@ Quickstart:
     milp.solve(solver_name="cbc", solver_config_type=SolverConfigType.cbc,
                solver_options={"timelimit": 60.0})
 
+To resolve the problem type from solver + objective, use resolve_problem_type:
+resolve_problem_type(SolverStrategy.alns, ObjectiveType.open) -> open_selective.
+
 See benchmarks/run_suite.py --smoke for a full runnable example (generate,
 solve, and build a summary table across every solver in one command).
 """
@@ -50,6 +53,7 @@ from .core import (
     ModemsAgent,
     ModemsRequest,
     ModemsScenario,
+    ObjectiveType,
     ProblemContext,
     ProblemType,
     RequestStatus,
@@ -57,6 +61,7 @@ from .core import (
     ScenarioTiming,
     ScenarioType,
     SolverStrategy,
+    resolve_problem_type,
     scenario_bucket,
     scenario_size_of,
 )
@@ -128,6 +133,7 @@ __all__ = [  # noqa: RUF022 -- grouped by module (with comments) on purpose
     "ModemsAgent",
     "ModemsRequest",
     "ModemsScenario",
+    "ObjectiveType",
     "ProblemContext",
     "ProblemType",
     "RequestStatus",
@@ -135,6 +141,7 @@ __all__ = [  # noqa: RUF022 -- grouped by module (with comments) on purpose
     "ScenarioTiming",
     "ScenarioType",
     "SolverStrategy",
+    "resolve_problem_type",
     "scenario_bucket",
     "scenario_size_of",
     # network

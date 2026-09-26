@@ -15,12 +15,13 @@ from .alns import ModemsAlns
 from .core import (
     DEFAULT_BASE_SEED,
     ModemsScenario,
+    ObjectiveType,
     ProblemContext,
-    ProblemType,
     ScenarioSize,
     ScenarioTiming,
     ScenarioType,
     SolverStrategy,
+    resolve_problem_type,
     scenario_bucket,
 )
 from .generator import ModemsScenarioGenerator, SocRangeSpec
@@ -79,11 +80,11 @@ class ManifestPhase(StrEnum):
     all = "all"
 
 
-# prefix for a deterministic scenario benchmarking result
-BNCH_SCENARIO_PFX = "DS_"
+# prefix for a (single) static scenario benchmarking result
+BNCH_SCENARIO_PFX = "S"
 
 # prefix for a workday benchmarking result
-BNCH_WORKDAY_PFX = "WD_"
+BNCH_WORKDAY_PFX = "W"
 
 # --------------------------------------------------------------------------------------
 # ModemsBenchmarkResult
@@ -199,7 +200,7 @@ class ModemsBenchmarkResult:
             or not math.isfinite(info.upper_bound)
         ):
             return None
-        return 100.0 * (info.upper_bound - info.lower_bound) / info.upper_bound
+        return 100.0 * abs((info.upper_bound - info.lower_bound) / info.upper_bound)
 
 
 # --------------------------------------------------------------------------------------
@@ -260,6 +261,7 @@ def generate_benchmark_suite(
         SocRangeSpec.stress(),
     ],
     max_feasibility_attempts: int = 5,
+    objective: ObjectiveType = ObjectiveType.closed,
     on_progress: ProgressCallback | None = None,
 ) -> list[dict[str, Any]]:
     """
@@ -289,7 +291,8 @@ def generate_benchmark_suite(
     ):
         nr_agents, (min_requests, max_requests) = scenario_bucket(sc_size)
         scenario_name = (
-            f"{BNCH_SCENARIO_PFX}{sc_size}{sc_type}{sc_timing}{i_rep}{sc_soc.suffix}"
+            f"{BNCH_SCENARIO_PFX}{objective.letter}{i_rep}_"
+            f"{sc_size.letter}{sc_type.letter}{sc_timing.letter}{sc_soc.suffix}"
         )
         if on_progress:
             on_progress(
@@ -332,7 +335,7 @@ def generate_benchmark_suite(
             # select any solver strategy, base_plan is never completed
             ctx = ProblemContext(
                 candidate,
-                ProblemType.closed_selective,
+                resolve_problem_type(SolverStrategy.alns, objective),
                 SolverStrategy.alns,
                 model_params,
             )
@@ -371,6 +374,7 @@ def generate_benchmark_suite(
                 {
                     "scenario_name": scenario_name,
                     "full_name": full_name,
+                    "objective_type": objective,
                     "size": sc_size,
                     "type": sc_type,
                     "timing": sc_timing,
@@ -433,6 +437,7 @@ def _solve_one(
     solver_name: str = DEFAULT_MILP_SOLVER_DATA[0],
     solver_config_type: SolverConfigType = DEFAULT_MILP_SOLVER_DATA[1],
     alns_stats_out: dict[str, Any] | None = None,
+    objective: ObjectiveType | str = ObjectiveType.closed,
 ) -> ModemsBenchmarkResult | None:
     """
     Solve one (scenario, solver) combo. If solver_strategy is alns and alns_stats_out
@@ -441,11 +446,7 @@ def _solve_one(
     plain JSON-serializable data rather than the live alns.Result object to enable
     calling plot_metrics() in a later build phase (separate from solve)
     """
-    problem_type = (
-        ProblemType.closed_non_selective
-        if solver_strategy == SolverStrategy.milp1
-        else ProblemType.closed_selective
-    )
+    problem_type = resolve_problem_type(solver_strategy, objective)
     ctx = ProblemContext(scenario, problem_type, solver_strategy, model_params)
     baseline, baseline_info = _compute_baseline(ctx)
 
@@ -539,6 +540,7 @@ def solve_benchmark_suite(
             )
         scenario_path = os.path.join(scenarios_dir, f"{scenario_name}.json")
         try:
+            objective = row["objective_type"]
             scenario = ModemsScenario.from_json(scenario_path)
             t_beg = time.perf_counter()
             alns_stats: dict[str, Any] = {}
@@ -552,6 +554,7 @@ def solve_benchmark_suite(
                 solver_name=solver_name,
                 solver_config_type=solver_config_type,
                 alns_stats_out=alns_stats,
+                objective=objective,
             )
             t_exe = time.perf_counter() - t_beg
             if result is None:
@@ -728,9 +731,10 @@ def build_benchmark_table(
             rows.append(
                 {
                     "scenario": scenario_name,
+                    "objective_type": row["objective_type"],
                     "nr_agents": None,
                     "nr_requests": None,
-                    "solver": solver_strategy.upper(),
+                    "solver": solver_strategy,
                     "status": status,
                     "status_symbol": "$-$",
                     "nr_accepted": None,
@@ -755,9 +759,10 @@ def build_benchmark_table(
         rows.append(
             {
                 "scenario": scenario_name,
+                "objective_type": row["objective_type"],
                 "nr_agents": len(result.final_solution.ctx.agents),
                 "nr_requests": len(result.final_solution.ctx.requests),
-                "solver": solver_strategy.upper(),
+                "solver": solver_strategy,
                 "status": sol_status,
                 "status_symbol": STATUS_SYMBOL.get(sol_status, "?"),
                 "nr_accepted": (
@@ -789,6 +794,7 @@ def build_benchmark_table(
 
     fieldnames = [
         "scenario",
+        "objective_type",
         "nr_agents",
         "nr_requests",
         "solver",

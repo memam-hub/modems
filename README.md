@@ -52,8 +52,16 @@ milp.solve(solver_name="cbc", solver_config_type=SolverConfigType.cbc,
 ```
 
 `ModemsAlns` follows analogously: build with `(scenario, problem_type, model_params)`,
-then `.solve(seed=..., max_iter=...)`. Check `benchmarks/run_suite.py --smoke` for a
-full runnable example across every solver.
+then `.solve(seed=..., max_iter=...)`.
+To get the right `ProblemType` for any solver from an objective (`ObjectiveType`),
+use `resolve_problem_type(strategy, objective)`: `closed` objective includes the
+final return-to-hub leg in the mission time, while `open` excludes it. This does not
+impact the generated routes, all routes end at a reachable hub for energy feasibility.
+All solvers support both routing objectives. In terms of selectivity:
+ALNS is selective only (by design), raising on a non-selective `problem_type`.
+MILP1 is non-selective only, MILP2 is selective only, and MILP3 supports both
+(selective by default). Try `benchmarks/run_suite.py --smoke` for a full
+runnable example across every solver.
 
 
 ## Scenario model
@@ -62,9 +70,11 @@ full runnable example across every solver.
   (`h_1`, `s_1..s_15`, `agent_1`, `request_1`) are 1-based. Travel times come from
   Euclidean coordinate distances at a calibrated shuttle speed.
 - **`ModemsScenario`**: agents + requests + network, with spatial distribution `type`
-  (`ScenarioType`:random/clustered/mixed), `timing` shifts (`ScenarioTiming`:
-  loose/tight), and a canonical `size` (`ScenarioSize`: small/medium/large, inferred
-  from agent/request counts).
+  (`ScenarioType`: random/clustered/mixed), `timing` (`ScenarioTiming`: uniform/peaks,
+  the shape of the earliest-pickup times: even, or with two rush-hour plateaus),
+  and a canonical `size` (`ScenarioSize`: small/medium/large, inferred from
+  agent/request counts). These enums also accept their first letter (`"R"`, `"T"`,
+  `"S"`, case-insensitive), which is how they appear in benchmark names.
 - **`ProblemContext(scenario, problem_type, strategy, model_params)`**:
   precomputed, read-only lookup tables shared by every solver. Default `model_params`:
   `eps=0.01, zeta=1.0, eta=100.0, rho=2.5` (enforced `eps < zeta < eta`, `rho >= 1`);
@@ -80,10 +90,11 @@ full runnable example across every solver.
 `RollingHorizonSimulator`/`WorkdaySimulation` (`rolling_horizon.py`) drive
 epoch-by-epoch replanning. `WorkdaySimulation.run()` returns `list[EpochLog]`;
 `build_workday_log(epoch_log, request_submissions)` aggregates a full day into a
-`WorkdayLog`: every submitted request's outcome/timing as `RequestRecord`s,
-every agent's full-day node-by-node walk as `AgentNodeVisit`s, both in absolute time
-offset from clock-start. `summarize_workday(epoch_log)` exports the same log into
-scalar stats: acceptance rate, waiting/excess-ride/delay time, energy, and solve time.
+`WorkdayLog`: every submitted request's outcome/timing as `RequestRecord`s, and
+every agent's full-day node-by-node walk as `AgentNodeVisit`s using physical names
+(`h_2`, `s_5`), both in absolute time offset from clock-start.
+`summarize_workday(epoch_log)` exports the same log into scalar stats:
+acceptance rate, waiting/excess-ride/delay time, energy, and solve time.
 
 `solver_mode="single"` (with `single_solver="milp3"`/`"alns"`) solves and adopts the
 same solver each epoch for a controlled comparison; `solver_mode="operational"` races
@@ -93,6 +104,22 @@ runs the identical request submission/arrival stream through two independent
 single-solver simulators; `compare_solvers_over_workdays()` repeats this across
 N seeded workdays. Every `ModemsRequest` carries a persistent `request_id`, and every
 `ModemsAgent` a persistent `agent_id`, to identify them across epochs.
+
+`objective` (`ObjectiveType`, default `closed`, accepted by the simulator and both
+`compare_solvers_*` functions) sets every solver's problem type. With `open`, an
+agent that is available after its last delivery (or while idle) remains stationary
+instead of driving to a hub; it is sent to a hub only when it needs to recharge.
+
+Workday demand comes from `ModemsScenarioGenerator.generate_workday_requests()`: a
+Poisson process over earliest-pickup times in `[15, workday_length]` whose rate is
+`base_rate_per_hour` shaped by the timing (`uniform`, or `peaks` with half the demand
+in two plateaus at 1/3 and 2/3 of the day), plus `nr_surges` 30-minute surges that each
+add one hour of base-rate demand. Surges never overlap each other or the peaks, and
+keep a timing-dependent gap from both (30 minutes for `uniform`, 15 for `peaks`);
+asking for more surges than fit raises a `ValueError` (`max_surges()`). Each request
+is submitted 15–45 minutes before its earliest pickup (never before t=0). After the
+workday, `WorkdaySimulation` keeps replanning (drains) until every accepted request is
+delivered, with a safety cap of `DEFAULT_MAX_DRAIN` minutes.
 
 
 ## Insertion algorithms
@@ -121,7 +148,8 @@ Every solved `ModemsMilp`/`ModemsAlns` exposes `.instance` (`ModemsInstance`), w
 
 ```
 src/modems/
-├── core.py               # ModemsRequest, ModemsAgent, ProblemType, SolverStrategy,
+├── core.py               # ModemsRequest, ModemsAgent, ObjectiveType, ProblemType,
+│                         # SolverStrategy, resolve_problem_type,
 │                         # ScenarioType/Timing/Size, ModemsScenario, ProblemContext
 ├── network.py            # RoadNetwork
 ├── solution.py           # NodeState, ModemsJourney, ModemsSolution,
@@ -183,14 +211,14 @@ python3 run_ablation_suite.py \
   --request-counts 10 30 60 \
   --agent-counts 1 2 \
   --types R C M \
-  --timings L T \
+  --timings U P \
   --nr-repeats 1    # insertion ablation
 
 python3 run_suite.py \
   --outdir single_suite \
   --sizes S M L \
   --types R C M \
-  --timings L T \
+  --timings U P \
   --soc-test normal \
   --nr-repeats 2 \
   --solver-name gurobi \
@@ -198,10 +226,11 @@ python3 run_suite.py \
 
 python3 run_workday_suite.py \
   --outdir workday_suite \
-  --timings L T \
+  --timings U P \
   --start-times N S \
   --base-rates 5 8 \
-  --nr-repeats 2 \
+  --nr-surges 3 \
+  --nr-repeats 3 \
   --solver-name gurobi \
   --solver-config-type gurobi \
   --plots     # multiple workdays with plots
@@ -210,7 +239,7 @@ python3 run_suite.py \
   --outdir single_plots \
   --sizes L \
   --types M \
-  --timings T \
+  --timings P \
   --soc-test stress \
   --nr-repeats 1 \
   --solver-name gurobi \

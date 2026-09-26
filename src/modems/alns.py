@@ -50,9 +50,12 @@ class ModemsAlns:
     ) -> None:
         """
         Initialize with a problem context and a dummy solution. If not given,
-        model_params defaults to DEFAULT_PARAMS_OBJ
+        model_params defaults to DEFAULT_PARAMS_OBJ. ALNS is selective by design
+        (open or closed objective), a non-selective problem_type raises ValueError
         """
         self.problem_type = ProblemType(problem_type)
+        if not ProblemType.is_selective(self.problem_type):
+            raise ValueError("ALNS only supports selective routing problems")
         self.ctx = ProblemContext(
             scenario, self.problem_type, SolverStrategy.alns, model_params
         )
@@ -489,7 +492,7 @@ class ModemsAlns:
                 status=SolutionStatus.optimal,
                 solution_time=0.0,
                 objective=initial_solution.objective(),
-                solver_name=self.ctx.strategy.value,
+                solver_name=self.ctx.strategy,
                 solver_options=self.alns_params,
                 solver_diagnostics={"iterations": 0},
             )
@@ -544,7 +547,7 @@ class ModemsAlns:
             status=SolutionStatus.feasible,
             solution_time=t_exe,
             objective=self.best_solution.objective(),
-            solver_name=self.ctx.strategy.value,
+            solver_name=self.ctx.strategy,
             solver_options=self.alns_params,
             solver_diagnostics={"iterations": len(self.result.statistics.runtimes)},
         )
@@ -632,8 +635,8 @@ def plot_alns_metrics_from_stats(
     if objectives:
         fig, ax = plt.subplots()
         fig.set_size_inches(18.5, 10.5, forward=True)
-        ax.plot(objectives)
-        ax.plot(np.minimum.accumulate(objectives))
+        ax.plot(objectives, lw=3.0)
+        ax.plot(np.minimum.accumulate(objectives), lw=2.0)
         ax.set_title("Objective value at each iteration")
         ax.set_ylabel("Objective value")
         ax.set_xlabel("Iteration (#)")

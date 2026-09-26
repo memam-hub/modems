@@ -68,7 +68,7 @@ if __name__ == "__main__":
     ]
     add_cli_arguments(parser, shared_args)
     parser.set_defaults(
-        outdir=os.path.join(os.path.dirname(__file__), "results_ablation")
+        outdir=os.path.join(os.path.dirname(__file__), "ablation_suite")
     )
 
     parser.add_argument(
@@ -133,7 +133,7 @@ if __name__ == "__main__":
         args.request_counts = [10, 20, 30, 50]
         args.agent_counts = [1, 2]
         args.types = [ScenarioType.random]
-        args.timings = [ScenarioTiming.loose]
+        args.timings = [ScenarioTiming.uniform]
         args.nr_repeats = 1
         args.nr_measure_repeats = 5
         args.corpus = "both"

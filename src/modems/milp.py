@@ -1116,13 +1116,11 @@ class ModemsMilp:
         objective = pyo.value(self.model.objective, exception=False)
         lower_bound = pyo.value(self.results.problem.lower_bound, exception=False)
         upper_bound = pyo.value(self.results.problem.upper_bound, exception=False)
-        if (
-            objective is not None
-            and lower_bound is not None
-            and upper_bound is not None
-        ):
+        if objective is not None and upper_bound is not None:
             if self._loaded_solution_is_valid():
-                if abs(lower_bound - upper_bound) > FLOAT_TOL:
+                if pyo.check_optimal_termination(self.results):
+                    lower_bound = objective  # CBC does not always report lb for opt
+                if lower_bound is None or abs(lower_bound - upper_bound) > FLOAT_TOL:
                     status = SolutionStatus.feasible
                 else:
                     status = SolutionStatus.optimal

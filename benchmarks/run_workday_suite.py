@@ -2,8 +2,9 @@
 Run the complete MODEMS workday (dynamic rolling-horizon) benchmark suite in one
 command: by default, (i) generates a fixed 3-agent, mixed-spatial-type fleet across all
 8 combinations of start_time (N: all agents start together at t=0; S: staggered,
-agent i starts at i * workday/5) x base_rate (5, 8 requests/hour) x timing (loose,
-tight: drive the surge parameters); (ii) solve every pending workday: a full simulated
+agent i starts at i * workday/5) x base_rate (5, 8 requests/hour) x timing (uniform,
+peaks: the shape of the earliest-pickup times), each with --nr-surges surges on top;
+(ii) solve every pending workday: a full simulated
 day is solved twice against the identical request submission/arrival stream using
 compare_solvers_one_workday (MILP3 vs. ALNS); (iii) build the paired comparison table
 (summary_table.{csv,json,tex}). Prints live progress during operation.
@@ -16,6 +17,7 @@ Usage:
     python3 run_workday_suite.py
     python3 run_workday_suite.py --smoke
     python3 run_workday_suite.py --phase solve --retry-failed
+    python3 run_workday_suite.py --objective open
     python3 run_workday_suite.py --solver-name appsi_highs --solver-config-type highs
 """
 
@@ -28,7 +30,9 @@ from _cli_common import (
     add_cli_arguments,
     make_progress_printer,
     resolve_cli_phase,
+    resolve_cli_sizes,
     resolve_cli_timings,
+    resolve_cli_types,
 )
 
 from modems import (
@@ -41,10 +45,9 @@ from modems import (
     solve_workday_suite,
 )
 from modems.benchmark import ManifestPhase, ManifestStatus
-from modems.core import ScenarioSize, ScenarioTiming, ScenarioType
+from modems.core import ObjectiveType, ScenarioSize, ScenarioTiming, ScenarioType
 from modems.generator import (
     DEFAULT_BASE_RATE_PER_HOUR,
-    DEFAULT_WORKDAY_BUFFER,
     DEFAULT_WORKDAY_LENGTH,
 )
 from modems.workday_benchmark import WorkdayStartTime, build_workday_requests_table
@@ -56,6 +59,8 @@ if __name__ == "__main__":
         ParserArgumentName.smoke,
         ParserArgumentName.seed,
         ParserArgumentName.phase,
+        ParserArgumentName.sizes,
+        ParserArgumentName.types,
         ParserArgumentName.timings,
         ParserArgumentName.retry_failed,
         ParserArgumentName.nr_repeats,
@@ -64,40 +69,51 @@ if __name__ == "__main__":
         ParserArgumentName.milp_timelimit,
         ParserArgumentName.alns_max_iter,
         ParserArgumentName.latex_rows_per_block,
+        ParserArgumentName.objective,
     ]
     add_cli_arguments(parser, shared_args)
-    parser.set_defaults(
-        outdir=os.path.join(os.path.dirname(__file__), "results_workday")
-    )
+    parser.set_defaults(outdir=os.path.join(os.path.dirname(__file__), "workday_suite"))
+    parser.set_defaults(sizes=[ScenarioSize.large.value])
+    parser.set_defaults(types=[ScenarioType.mixed.value])
     parser.set_defaults(nr_repeats=1)
-    start_times = [n.value for n in WorkdayStartTime]
+
     parser.add_argument(
         "--start-times",
+        type=WorkdayStartTime,
         nargs="+",
-        default=start_times,
-        choices=start_times,
-        help="N: all agents start at t=0. S: staggered, agent i starts at i*workday/5",
+        default=list(WorkdayStartTime),
+        choices=list(WorkdayStartTime),
+        metavar="{normal,staggered}",
+        help=(
+            "normal: all agents start at t=0. staggered: agent i starts at "
+            "i*workday/5. Case-insensitive, the letter is accepted as an alias"
+        ),
     )
     parser.add_argument(
         "--base-rates",
-        type=float,
+        type=int,
         nargs="+",
-        default=[DEFAULT_BASE_RATE_PER_HOUR, 8.0],
-        help="Baseline request arrivals per hour (before surges)",
+        default=[DEFAULT_BASE_RATE_PER_HOUR, 8],
+        help="Baseline request arrivals per hour (before surges), an integer",
+    )
+    parser.add_argument(
+        "--nr-surges",
+        type=int,
+        default=3,
+        help=(
+            "Number of surges per workday: 30-minute windows that each add one hour "
+            "worth of base-rate requests, never overlapping each other or the peaks, "
+            "kept 30 (uniform) or 15 (peaks) minutes apart. Raises if they do not fit, "
+            "e.g., at most 8 (uniform) or 5 (peaks) in a 480-minute workday"
+        ),
     )
     parser.add_argument(
         "--workday",
         type=float,
         default=DEFAULT_WORKDAY_LENGTH,
-        help="Simulated workday length in minutes over which requests are drawn",
-    )
-    parser.add_argument(
-        "--workday-buffer",
-        type=float,
-        default=DEFAULT_WORKDAY_BUFFER,
         help=(
-            "Extra minutes the simulator runs past the full workday, so that "
-            "late-submitted requests (near the end of workday) still resolve"
+            "Workday length in minutes over which requests are drawn; the simulation "
+            "then drains until every accepted request is delivered"
         ),
     )
     parser.add_argument(
@@ -127,32 +143,39 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.smoke:
-        args.timings = [ScenarioTiming.loose]
+        args.sizes = [ScenarioSize.large]
+        args.types = [ScenarioType.mixed]
+        args.timings = [ScenarioTiming.uniform]
         args.start_times = [WorkdayStartTime.normal, WorkdayStartTime.staggered]
         args.base_rates = [DEFAULT_BASE_RATE_PER_HOUR]
         args.nr_repeats = 1
+        args.nr_surges = 0
         args.workday = 90.0
-        args.workday_buffer = 30.0
         args.milp_timelimit = 8.0
         args.alns_max_iter = 100
     else:
+        args.sizes = resolve_cli_sizes(args.sizes)
+        args.types = resolve_cli_types(args.types)
         args.timings = resolve_cli_timings(args.timings)
         args.start_times = [WorkdayStartTime(s) for s in args.start_times]
     args.phases = resolve_cli_phase(args.phase)
+    args.objective = ObjectiveType(args.objective)
 
     on_progress = make_progress_printer()
 
     if ManifestPhase.generate in args.phases:
         summary = generate_workday_suite(
             outdir=args.outdir,
-            scenario_sizes=[ScenarioSize.large],
-            scenario_types=[ScenarioType.mixed],
+            scenario_sizes=args.sizes,
+            scenario_types=args.types,
             scenario_timings=args.timings,
             start_times=args.start_times,
             base_rates=args.base_rates,
+            nr_surges=args.nr_surges,
             nr_repeats=args.nr_repeats,
             base_seed=args.seed,
             workday_length=args.workday,
+            objective=args.objective,
             on_progress=on_progress,
         )
         nr_generated = nr_skipped = nr_failed = 0
@@ -174,7 +197,6 @@ if __name__ == "__main__":
             outdir=args.outdir,
             milp_timelimit=args.milp_timelimit,
             alns_max_iter=args.alns_max_iter,
-            workday_buffer=args.workday_buffer,
             retry_failed=args.retry_failed,
             solver_name=args.solver_name,
             solver_config_type=SolverConfigType(args.solver_config_type),
@@ -227,7 +249,7 @@ if __name__ == "__main__":
                 and row.get("workday_log_file")
             ]
             nr_done_rows = len(done_rows)
-            for idx, row in enumerate(done_rows):
+            for idx, row in enumerate(done_rows, start=1):
                 workday_name = row["workday_name"]
                 if on_progress:
                     on_progress(

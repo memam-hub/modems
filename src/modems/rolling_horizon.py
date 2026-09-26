@@ -13,10 +13,11 @@ from .core import (
     ModemsAgent,
     ModemsRequest,
     ModemsScenario,
+    ObjectiveType,
     ProblemContext,
-    ProblemType,
     RequestStatus,
     SolverStrategy,
+    resolve_problem_type,
 )
 from .generator import ModemsScenarioGenerator
 from .milp import DEFAULT_MILP_SOLVER_DATA, MilpType, ModemsMilp, SolverConfigType
@@ -49,6 +50,10 @@ REPLANNING_THRESHOLD_W = 10.0
 
 # P: full planning horizon (minutes), include submitted requests within this timeframe
 PLANNING_HORIZON_P = 60.0
+
+# safety cap (minutes past the workday) for draining a workday simulation, i.e., the
+# epochs run after the last submission until every accepted request is delivered
+DEFAULT_MAX_DRAIN = 240.0
 
 
 def charging_duration_min(soc_from: float, soc_to: float) -> float:
@@ -96,7 +101,9 @@ class AgentAdvanceResult:
         included: Whether the agent is included in the current
         absorbed: The set of requests absorbed by the agent previous/continued journey
         replan: The set of requests released/freed for scheduling re-optimization
-        travel_time: Total agent travel time across the entire workday
+        travel_time: Committed travel time of the journey, from its first node up to
+            (and including the arc into) node; RollingHorizonSimulator reports it
+            incrementally per epoch (check _travel_checkpoint)
     """
 
     __slots__ = (
@@ -192,16 +199,19 @@ def _resolve_at_depot(
     ctx: ProblemContext,
     agent: ModemsAgent,
     route: list[str],
-    state: NodeState,
+    states: list[NodeState],
     idx: int,
     t_elapsed: float,
 ) -> AgentAdvanceResult:
     """
     Resolve an agent status at a start depot (re-planning all route requests) or at a
     a final depot (absorbing all route requests), then set the availability based on
-    the SoC left, robustness margin, and possible charging duration
+    the SoC left, robustness margin, and possible charging duration. For an open
+    objective, an available agent never drives its final hub leg unless it needs to
+    recharge; instead, it stays at its last delivery node (or start node if idle)
     """
     node = route[idx]
+    state = states[idx]
     sigma = state.phi_arr
     delta = max(0.0, state.t_arr - t_elapsed)
     # either absorb or replan all route requests
@@ -212,6 +222,18 @@ def _resolve_at_depot(
         r_absorbed = _route_requests(ctx, route)
         r_replan = set()
     if sigma >= agent.soc_min_operational + SOC_ROBUSTNESS_MARGIN + FLOAT_TOL:
+        if ctx.is_open() and idx > 0:
+            # open objective: stay at the node preceding the final hub
+            s_stay = states[idx - 1]
+            return AgentAdvanceResult(
+                route[idx - 1],
+                max(0.0, s_stay.t_dep - t_elapsed),
+                s_stay.phi_dep,
+                AgentOperationalState.available,
+                True,
+                r_absorbed,
+                r_replan,
+            )
         return AgentAdvanceResult(
             node,
             delta,
@@ -252,7 +274,7 @@ def _resolve(
 
     if not ctx.is_station(node) and idx > 0:
         # final hub: route complete, everything on it is absorbed
-        return _resolve_at_depot(ctx, agent, route, state, idx, t_elapsed)
+        return _resolve_at_depot(ctx, agent, route, states, idx, t_elapsed)
 
     # if agent has on-board passengers, loop until the earliest node where all disembark
     z_hat = states[idx - 1].z_dep if idx > 0 else 0
@@ -277,7 +299,7 @@ def _resolve(
     # If there is sufficient waiting time, release all next requests
     if remain_t_wait > REPLANNING_THRESHOLD_W + FLOAT_TOL:
         if not ctx.is_station(node):
-            return _resolve_at_depot(ctx, agent, route, state, idx, t_elapsed)
+            return _resolve_at_depot(ctx, agent, route, states, idx, t_elapsed)
         # resolve at service node, previous requests already absorbed, replan the rest
         delta = max(0.0, state.t_arr - t_elapsed)
         sigma = state.phi_arr
@@ -304,29 +326,29 @@ def advance_agent_state(
     """
     Advance one agent state across an elapsed real-time gap, given its previously
     cached ModemsJourney. Returns an AgentAdvanceResult with the new (v^k, delta^k,
-    sigma^k), whether the agent is included in K this planning epoch, and the
-    absorbed/excluded vs released for scheduling re-opt (R_s) request sets
+    sigma^k), whether the agent is included in K this planning epoch, the
+    absorbed/excluded vs released for scheduling re-opt (R_s) request sets, and the
+    journey committed travel time from its first node up to the resulting node (0.0
+    if the agent stays at its start node, e.g., idle under an open objective)
     """
     agent = ctx.agents[agent_name]
     idx = _find_next_index(journey.states, t_elapsed)
-    journey_complete = idx is None
-    if journey_complete:
+    if idx is None:
         idx = len(journey.states) - 1  # resolve at the final depot
     agent_adv_res = _resolve(ctx, agent, journey.route, journey.states, idx, t_elapsed)
 
-    # Any request with t_delivery before the search even started is already absorbed
+    # any request with t_delivery before the search even started is already absorbed
     agent_adv_res.absorbed |= {
         r_name
         for r_name, delivery_index in journey.request_delivery.items()
         if delivery_index < idx
     }
 
-    # travel time actually incurred this planning cycle
+    # committed travel time of this journey up to the resulting node (independent of
+    # where t_elapsed falls), the simulator reports it incrementally per epoch
     idx_end = journey.route.index(agent_adv_res.node)
-    idx_start = 1 if journey_complete else idx
     agent_adv_res.travel_time = sum(
-        ctx.t_travel(journey.route[i], journey.route[i + 1])
-        for i in range(idx_start - 1, idx_end)
+        ctx.t_travel(journey.route[i], journey.route[i + 1]) for i in range(idx_end)
     )
     return agent_adv_res
 
@@ -355,6 +377,7 @@ class RequestRecord:
 
     request: ModemsRequest
     submission_time: float
+    earliest_pickup: float
     outcome: RequestOutcome
     pickup_time: float | None = None
     delivery_time: float | None = None
@@ -366,6 +389,7 @@ class RequestRecord:
         return {
             "request": self.request.to_dict(),
             "submission_time": self.submission_time,
+            "earliest_pickup": self.earliest_pickup,
             "outcome": self.outcome,
             "pickup_time": self.pickup_time,
             "delivery_time": self.delivery_time,
@@ -379,6 +403,7 @@ class RequestRecord:
         return cls(
             request=ModemsRequest.from_dict(data["request"]),
             submission_time=data["submission_time"],
+            earliest_pickup=data["earliest_pickup"],
             outcome=RequestOutcome(data["outcome"]),
             pickup_time=data.get("pickup_time"),
             delivery_time=data.get("delivery_time"),
@@ -394,18 +419,42 @@ class AgentNodeVisit:
     One agent node visit with arrival/departure time and SoC. Extract the data from
     NodeState (t_arr/t_start/phi_arr/phi_dep) at the moment when the node is absorbed
     by advance_epoch() using epoch-local time, later shifted to absolute time by
-    build_workday_log() using offset from workday clock-start, similar to RequestRecord
+    build_workday_log() using offset from workday clock-start, similar to RequestRecord.
+    physical_node is the epoch-agnostic physical hub/station name (<h/s>_<idx>), not
+    the epoch-local virtual node name (e.g., a_1_s_5 or r_3_d_5 are both s_5)
     """
 
-    node: str
+    physical_node: str
     arrival_time: float
     departure_time: float
     soc_arrival: float
     soc_departure: float
 
+    @staticmethod
+    def make_physical_name(node: str) -> str:
+        """Map a (virtual, epoch-local) node name to its physical hub/station name"""
+        n_idx = NetworkNodeName.get_node_index(node)
+        n_type = NetworkNodeName.get_node_type(node)
+        return (
+            NetworkNodeName.make_hub_name(n_idx)
+            if NetworkNodeType.is_hub(n_type)
+            else NetworkNodeName.make_station_name(n_idx)
+        )
+
+    @classmethod
+    def from_node_state(cls, state: NodeState) -> AgentNodeVisit:
+        """Build a visit in the state (epoch-local) time"""
+        return cls(
+            physical_node=cls.make_physical_name(state.node),
+            arrival_time=state.t_arr,
+            departure_time=state.t_dep,
+            soc_arrival=state.phi_arr,
+            soc_departure=state.phi_dep,
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
-            "node": self.node,
+            "physical_node": self.physical_node,
             "arrival_time": self.arrival_time,
             "departure_time": self.departure_time,
             "soc_arrival": self.soc_arrival,
@@ -497,6 +546,24 @@ class EpochLog:
         )
 
 
+def _append_merge_visit(visits: list[AgentNodeVisit], visit: AgentNodeVisit) -> None:
+    """
+    Append visit to visits, merging it with the last visit if both occur at the same
+    physical node (no actual movement) by updating its departure time instead
+    """
+    if visits and visits[-1].physical_node == visit.physical_node:
+        last = visits[-1]
+        visits[-1] = AgentNodeVisit(
+            physical_node=last.physical_node,
+            arrival_time=last.arrival_time,
+            departure_time=visit.departure_time,
+            soc_arrival=last.soc_arrival,
+            soc_departure=visit.soc_departure,
+        )  # do not mutate a shared node visit
+    else:
+        visits.append(visit)
+
+
 def _collect_request_metrics(
     ctx: ProblemContext, journey: ModemsJourney, request_name: str
 ) -> dict[str, float] | None:
@@ -538,6 +605,7 @@ class RollingHorizonSimulator:
     alns_max_iter: int
     solver_name: str
     solver_config_type: SolverConfigType
+    objective: ObjectiveType
     agents: dict[str, ModemsAgent]
     agent_templates: dict[str, ModemsAgent]
     parked_agents: dict[str, dict[str, Any]]
@@ -546,7 +614,9 @@ class RollingHorizonSimulator:
     time_since_last_adoption: float
     rejected_log: list[ModemsRequest]
     epoch_log: list[EpochLog]
-    _last_confirmed_node: dict[str, str]
+    lingering_request_ids: set[str]
+    _visit_checkpoint: dict[str, int]
+    _travel_checkpoint: dict[str, float]
     _energy_checkpoint: dict[str, float]
 
     def __init__(
@@ -560,8 +630,12 @@ class RollingHorizonSimulator:
         alns_max_iter: int = DEFAULT_PARAMS_ALNS["max_iter"],
         solver_name: str = DEFAULT_MILP_SOLVER_DATA[0],
         solver_config_type: SolverConfigType = DEFAULT_MILP_SOLVER_DATA[1],
+        objective: ObjectiveType = ObjectiveType.closed,
     ) -> None:
         """
+        objective: closed or open, every solver problem type is resolved from it
+            (check resolve_problem_type). With an open objective, an available agent
+            stays at its last route node instead of driving to its final hub
         solver_mode: "benchmarking" (all 4, recorded, best adopted), "operational"
             (MILP3+ALNS race, best adopted), or "single" (exactly one solver decides
             every epoch, used for MILP3-vs-ALNS comparison: run the identical request
@@ -591,6 +665,7 @@ class RollingHorizonSimulator:
         self.alns_max_iter = alns_max_iter
         self.solver_name = solver_name
         self.solver_config_type = solver_config_type
+        self.objective = objective
 
         agent_ids = [a.agent_id for a in agents]
         if len(agent_ids) != len(set(agent_ids)):
@@ -607,7 +682,7 @@ class RollingHorizonSimulator:
         )
         initial_ctx = ProblemContext(
             empty_scenario,
-            ProblemType.closed_selective,
+            resolve_problem_type(SolverStrategy.alns, self.objective),
             SolverStrategy.alns,
             self.model_params,
         )
@@ -619,13 +694,20 @@ class RollingHorizonSimulator:
         self.time_since_last_adoption = 0.0
         self.rejected_log = []
         self.epoch_log = []
+        # request_id of every accepted request not yet delivered (absorbed), as of the
+        # last epoch: the requests on the adopted plan, or those carried forward as
+        # scheduled when no plan was adopted
+        self.lingering_request_ids = set()
         # parked_agents are excluded from the active scenario since their remaining
         # charging time exceeds PLANNING_HORIZON_P, keyed by agent_id. They may appear
         # after a few epochs when the remaining charging duration to SOC_CHARGE_TARGET
         # lies within the PLANNING_HORIZON_P
         self.parked_agents = {}
-        # confirmed last visited (arrived + departed) node name per agent_id
-        self._last_confirmed_node = {}
+        # progress of each agent_id along its currently active plan (journey), reset
+        # on every (new) adoption: A plan can persist across several no-adoption
+        # epochs, and must not be re-logged/re-counted
+        self._visit_checkpoint = {}
+        self._travel_checkpoint = {}
         # SoC checkpoint per agent_id, used to measure consumed energy across epochs
         self._energy_checkpoint = {a.agent_id: a.soc_initial for a in agents}
 
@@ -789,7 +871,7 @@ class RollingHorizonSimulator:
                 if key == SolverStrategy.alns:
                     model = ModemsAlns(
                         scenario,
-                        problem_type=ProblemType.closed_selective,
+                        problem_type=resolve_problem_type(key, self.objective),
                         model_params=self.model_params,
                     )
                     model.solve(
@@ -804,11 +886,7 @@ class RollingHorizonSimulator:
                         SolverStrategy.milp2: MilpType.milp2,
                         SolverStrategy.milp3: MilpType.milp3,
                     }[SolverStrategy(key)]
-                    problem_type = (
-                        ProblemType.closed_non_selective
-                        if milp_type == MilpType.milp1
-                        else ProblemType.closed_selective
-                    )
+                    problem_type = resolve_problem_type(key, self.objective)
                     ctx = ProblemContext(
                         scenario,
                         problem_type,
@@ -867,33 +945,22 @@ class RollingHorizonSimulator:
                     request_id = self.previous_ctx.requests[r_name].request_id
                     completed_requests[request_id] = metrics
             adv_res_idx = old_journey.route.index(agent_adv_res.node)
-            # get newly visited nodes in this epoch, skipped for the very first epoch
-            visit_start_idx = (
-                1
-                if old_journey.states[0].node == self._last_confirmed_node.get(agent_id)
-                else 0
-            )
-            # get the last confirmed agent visited (arrived + departed) node
+            # newly visited nodes of the active plan: from the plan visit checkpoint
+            # up to the last node the agent has actually arrived at
+            visit_start_idx = self._visit_checkpoint.get(agent_id, 0)
             visit_end_idx = (
                 adv_res_idx
                 if self.time_since_last_adoption < old_journey.states[adv_res_idx].t_arr
                 else adv_res_idx + 1
             )
-            # compile node visits if agent actually moved across epochs
             if visit_end_idx > visit_start_idx:
-                self._last_confirmed_node[agent_id] = old_journey.states[
-                    visit_end_idx - 1
-                ].node
-                agent_node_visits[agent_id] = [
-                    AgentNodeVisit(
-                        node=state.node,
-                        arrival_time=state.t_arr,
-                        departure_time=state.t_dep,
-                        soc_arrival=state.phi_arr,
-                        soc_departure=state.phi_dep,
+                self._visit_checkpoint[agent_id] = visit_end_idx
+                node_visits: list[AgentNodeVisit] = []
+                for state in old_journey.states[visit_start_idx:visit_end_idx]:
+                    _append_merge_visit(
+                        node_visits, AgentNodeVisit.from_node_state(state)
                     )
-                    for state in old_journey.states[visit_start_idx:visit_end_idx]
-                ]
+                agent_node_visits[agent_id] = node_visits
             # energy consumed since the last-recorded checkpoint for this agent_id
             sigma_at_result_node = old_journey.states[adv_res_idx].phi_arr
             energy_consumed[agent_id] = max(0.0, old_sigma - sigma_at_result_node)
@@ -910,8 +977,14 @@ class RollingHorizonSimulator:
                     "remaining_delta": agent_adv_res.delta,
                     "sigma": agent_adv_res.sigma,
                 }
-            # compile agent travel time
-            agent_travel_time[agent_id] = agent_adv_res.travel_time
+            # compile agent travel time, incremental w.r.t. the active plan checkpoint
+            travel_reported = self._travel_checkpoint.get(agent_id, 0.0)
+            agent_travel_time[agent_id] = max(
+                0.0, agent_adv_res.travel_time - travel_reported
+            )
+            self._travel_checkpoint[agent_id] = max(
+                travel_reported, agent_adv_res.travel_time
+            )
             # checkpoint SoC for the next epoch baseline at result.sigma, either the
             # actual SoC if agent is available, or the charge target if charging
             self._energy_checkpoint[agent_id] = agent_adv_res.sigma
@@ -965,6 +1038,10 @@ class RollingHorizonSimulator:
         )
 
         if adopted_strategy is None:
+            # the previous plan stays active, only its carried requests are lingering
+            self.lingering_request_ids = {
+                r.request_id for r in scenario.scheduled_requests
+            }
             self.rejected_log.extend(new_requests)
             # any agent that would have rejoined this epoch never actually did/entered
             # a solved plan, retain it as parked
@@ -978,9 +1055,16 @@ class RollingHorizonSimulator:
             return epoch_log
 
         adopted_instance = results[adopted_strategy]
+        self.lingering_request_ids = {
+            adopted_instance.solution.ctx.requests[r_name].request_id
+            for r_name in adopted_instance.solution.accepted
+        }
         self.previous_ctx = adopted_instance.solution.ctx
         self.journeys = dict(adopted_instance.solution.journeys)
         self.time_since_last_adoption = 0.0
+        # every active agent starts a new plan (journey) from its first node
+        self._visit_checkpoint = {}
+        self._travel_checkpoint = {}
         rejected_ids = {
             adopted_instance.solution.ctx.requests[r_name].request_id
             for r_name in adopted_instance.solution.rejected
@@ -1003,9 +1087,18 @@ class RollingHorizonSimulator:
 
 
 class WorkdaySimulation:
+    """
+    Walk a RollingHorizonSimulator through a pre-defined request submission stream.
+    Requests are submitted within [0, workday_length); after that, the simulation
+    keeps running periodic epochs (drains) until every submitted request is resolved
+    and every accepted request is delivered, or max_drain minutes past the workday
+    have elapsed (a safety cap; anything still accepted then ends up unresolved)
+    """
+
     simulator: RollingHorizonSimulator
     request_submissions: list[tuple[float, ModemsRequest]]
     workday_length: float
+    max_drain: float
     clock_start: float
     _next_idx: int
     _pending: list[ModemsRequest]
@@ -1015,14 +1108,16 @@ class WorkdaySimulation:
         simulator: RollingHorizonSimulator,
         request_submissions: list[tuple[float, ModemsRequest]],
         workday_length: float,
+        max_drain: float = DEFAULT_MAX_DRAIN,
     ) -> None:
         self.simulator = simulator
         # sort requests by their submission/arrival time
         self.request_submissions = sorted(request_submissions, key=lambda x: x[0])
         self.workday_length = workday_length
+        self.max_drain = max_drain
         self.clock_start = 0.0
         self._next_idx = 0
-        # unresolved requests at the end of the workday
+        # submitted requests whose earliest pickup is still beyond the horizon P
         self._pending = []
         # absolute clock time for when the currently-active plan was last adopte, i.e.,
         # the reference point for epoch-local completed_requests/agent_node_visits
@@ -1041,12 +1136,28 @@ class WorkdaySimulation:
                 return max(t_submit, self.clock_start)  # urgent request, return (now)
         return periodic
 
+    def is_drained(self) -> bool:
+        """All requests are submitted and released, no accepted request is undelivered"""
+        return (
+            self._next_idx >= len(self.request_submissions)
+            and not self._pending
+            and not self.simulator.lingering_request_ids
+        )
+
     def run(self, max_epochs: int = 10_000) -> list[EpochLog]:
-        """Simulate the workday for max_epochs, return list of epoch logs"""
+        """
+        Simulate the workday, then drain it (check the class docstring), for at most
+        max_epochs epochs; return the list of epoch logs
+        """
         for _ in range(max_epochs):
-            if self.clock_start >= self.workday_length:
+            if self.clock_start >= self.workday_length and (
+                self.is_drained()
+                or self.clock_start >= self.workday_length + self.max_drain
+            ):
                 break
-            t_trigger = min(self._next_trigger_time(), self.workday_length)
+            t_trigger = self._next_trigger_time()
+            if self.clock_start < self.workday_length:
+                t_trigger = min(t_trigger, self.workday_length)
             t_elapsed = max(0.0, t_trigger - self.clock_start)
 
             # collect relevant requests
@@ -1079,10 +1190,6 @@ class WorkdaySimulation:
             if record.adopted_strategy is not None:
                 self._last_adoption_clock = t_trigger
             self.clock_start = t_trigger
-            if t_trigger >= self.workday_length and self._next_idx >= len(
-                self.request_submissions
-            ):
-                break
         return self.simulator.epoch_log
 
 
@@ -1201,55 +1308,28 @@ class WorkdayLog:
     requests: list[RequestRecord] = field(default_factory=list)
     agent_node_visits: dict[str, list[AgentNodeVisit]] = field(default_factory=dict)
 
-    @staticmethod
-    def _clean_visits(visits: list[AgentNodeVisit]) -> list[AgentNodeVisit]:
-        """resolve redundant visits across multiple epochs using consistent names"""
-        if not visits:
-            return []
-
-        def _make_consistent_name(node: str) -> str:
-            """make an epoch-agnositc visit name using physical hub/station entities"""
-            n_idx = NetworkNodeName.get_node_index(node)
-            n_type = NetworkNodeName.get_node_type(node)
-            return (
-                NetworkNodeName.make_hub_name(n_idx)
-                if (NetworkNodeType.is_hub(n_type))
-                else NetworkNodeName.make_station_name(n_idx)
-            )  # name follows the format <h/s>_<idx>
-
-        new_visits: list[AgentNodeVisit] = [visits[0]]
-        new_visits[0].node = _make_consistent_name(visits[0].node)
-        for visit in visits[1:]:
-            n_name = _make_consistent_name(visit.node)
-            if n_name != new_visits[-1].node:
-                new_visits.append(visit)  # new visit detected
-                new_visits[-1].node = n_name
-            else:
-                new_visits[-1].departure_time = visit.departure_time  # update t_dep
-        return new_visits
-
     def to_dict(self) -> dict[str, Any]:
         return {
             "clock_start": self.clock_start,
             "clock_end": self.clock_end,
             "requests": [r.to_dict() for r in self.requests],
             "agent_node_visits": {
-                agent_name: [v.to_dict() for v in self._clean_visits(visits)]
+                agent_name: [v.to_dict() for v in visits]
                 for agent_name, visits in self.agent_node_visits.items()
             },
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> WorkdayLog:
-        agent_node_visits: dict[str, list[AgentNodeVisit]] = {}
-        for a_name, visits in data["agent_node_visits"].items():
-            node_visits = [AgentNodeVisit.from_dict(v) for v in visits]
-            agent_node_visits[a_name] = WorkdayLog._clean_visits(node_visits)
+
         return cls(
             clock_start=data["clock_start"],
             clock_end=data["clock_end"],
             requests=[RequestRecord.from_dict(r) for r in data["requests"]],
-            agent_node_visits=agent_node_visits,
+            agent_node_visits={
+                a_name: [AgentNodeVisit.from_dict(v) for v in visits]
+                for a_name, visits in data["agent_node_visits"].items()
+            },
         )
 
 
@@ -1281,17 +1361,19 @@ def build_workday_log(
             }
         rejected_ids |= epoch.rejected_new
         for a_name, node_visits in epoch.agent_node_visits.items():
-            shifted = [
-                AgentNodeVisit(
-                    node=node_visit.node,
-                    arrival_time=node_visit.arrival_time + t_shift,
-                    departure_time=node_visit.departure_time + t_shift,
-                    soc_arrival=node_visit.soc_arrival,
-                    soc_departure=node_visit.soc_departure,
+            agent_visits = agent_node_visits.setdefault(a_name, [])
+            for node_visit in node_visits:
+                # append new visits, merge stays spanning consecutive epochs/plans
+                _append_merge_visit(
+                    agent_visits,
+                    AgentNodeVisit(
+                        physical_node=node_visit.physical_node,
+                        arrival_time=node_visit.arrival_time + t_shift,
+                        departure_time=node_visit.departure_time + t_shift,
+                        soc_arrival=node_visit.soc_arrival,
+                        soc_departure=node_visit.soc_departure,
+                    ),
                 )
-                for node_visit in node_visits
-            ]
-            agent_node_visits.setdefault(a_name, []).extend(shifted)
 
     r_records: list[RequestRecord] = []
     for t_submit, request in request_submissions:
@@ -1302,6 +1384,7 @@ def build_workday_log(
                 RequestRecord(
                     request=request,
                     submission_time=t_submit,
+                    earliest_pickup=request.earliest_pickup,
                     outcome=RequestOutcome.accepted,
                     pickup_time=metrics["pickup_time"],
                     delivery_time=metrics["delivery_time"],
@@ -1315,6 +1398,7 @@ def build_workday_log(
                 RequestRecord(
                     request=request,
                     submission_time=t_submit,
+                    earliest_pickup=request.earliest_pickup,
                     outcome=RequestOutcome.rejected,
                 )
             )
@@ -1323,6 +1407,7 @@ def build_workday_log(
                 RequestRecord(
                     request=request,
                     submission_time=t_submit,
+                    earliest_pickup=request.earliest_pickup,
                     outcome=RequestOutcome.unresolved,
                 )
             )
@@ -1352,6 +1437,7 @@ def compare_solvers_one_workday(
     solver_name: str = DEFAULT_MILP_SOLVER_DATA[0],
     solver_config_type: SolverConfigType = DEFAULT_MILP_SOLVER_DATA[1],
     workday_logs_out: dict[SolverStrategy, WorkdayLog] | None = None,
+    objective: ObjectiveType = ObjectiveType.closed,
 ) -> dict[str, dict[str, Any]]:
     """
     Run the identical submitted requests stream through two independent, single-solver
@@ -1374,6 +1460,7 @@ def compare_solvers_one_workday(
             alns_max_iter=alns_max_iter,
             solver_name=solver_name,
             solver_config_type=solver_config_type,
+            objective=objective,
         )
         workday = WorkdaySimulation(rh_simulator, request_submissions, workday_length)
         log = workday.run()
@@ -1398,6 +1485,7 @@ def compare_solvers_over_workdays(
     solver_name: str = DEFAULT_MILP_SOLVER_DATA[0],
     solver_config_type: SolverConfigType = DEFAULT_MILP_SOLVER_DATA[1],
     on_workday_done: Callable[[int, dict[str, Any]], Any] | None = None,
+    objective: ObjectiveType = ObjectiveType.closed,
 ) -> list[dict[str, Any]]:
     """
     Generate nr_workdays independent submission streams (one ModemsScenarioGenerator
@@ -1425,6 +1513,7 @@ def compare_solvers_over_workdays(
             alns_max_iter=alns_max_iter,
             solver_name=solver_name,
             solver_config_type=solver_config_type,
+            objective=objective,
         )
         record = {"workday": idx, "seed": seed, **summaries}
         results.append(record)

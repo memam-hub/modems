@@ -327,17 +327,23 @@ class ModemsJourney:
                 ):
                     state.t_wait = max(0.0, ctx.node_earliest_p[node] - state.t_arr)
                 else:
+                    # early service is bounded: t_start >= e^r - omega
                     state.t_wait = max(
                         0.0,
                         ctx.node_earliest_p[node] - state.t_arr - state.tau,
+                        ctx.node_earliest_p[node] - ctx.omega - state.t_arr,
                     )
             else:
                 early_service_allowed = request.is_new() and ctx.strategy in (
                     SolverStrategy.milp1,
                     SolverStrategy.milp3,
                 )
-                if not early_service_allowed:
-                    state.t_wait = max(0.0, ctx.node_earliest_p[node] - state.t_arr)
+                # early service (MILP1/MILP3 new requests) starts at most omega
+                # before e^r; everything else waits until e^r
+                t_start_floor = ctx.node_earliest_p[node] - (
+                    ctx.omega if early_service_allowed else 0.0
+                )
+                state.t_wait = max(0.0, t_start_floor - state.t_arr)
         # get departure state
         state.t_start = state.t_arr + state.t_wait
         if ctx.is_pickup(node) and ctx.strategy == SolverStrategy.alns:
@@ -626,6 +632,9 @@ class ModemsJourney:
             if (
                 request.is_scheduled() or not ctx.strategy.has_soft_tw()
             ) and p_state.t_start < ctx.node_earliest_p[p_state.node] - tol:
+                return False
+            # soft-TW early service is bounded: t_start >= e^r - omega
+            if p_state.t_start < ctx.node_earliest_p[p_state.node] - ctx.omega - tol:
                 return False
             if (
                 not ctx.strategy.has_soft_tw()

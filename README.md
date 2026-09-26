@@ -191,60 +191,22 @@ python3 run_workday_suite.py    # dynamic: full simulated day, MILP3 vs ALNS
 python3 run_ablation_suite.py   # Algorithm 3 V0-V3 performance ablation
 ```
 
-To run a quick sanity check, all scripts can be invoked with a `--smoke` argument:
+To run a quick sanity check (<=2 min per script), use the `--smoke` argument:
 
 ```bash
 cd benchmarks
 python3 run_suite.py --smoke
-python3 run_workday_suite.py --smoke
+python3 run_workday_suite.py --smoke --plots
 python3 run_ablation_suite.py --smoke
 ```
 
-To generate the exact results reported in the paper, run the following commands
-(note: this can span several hours depending on the hardware specs):
+To generate the exact results reported in the paper, run the following script:
+
+**Note that this spans several hours even with high-grade hardware!**
 
 ```bash
 cd benchmarks
-
-python3 run_ablation_suite.py \
-  --outdir ablation_suite \
-  --request-counts 10 30 60 \
-  --agent-counts 1 2 \
-  --types R C M \
-  --timings U P \
-  --nr-repeats 1    # insertion ablation
-
-python3 run_suite.py \
-  --outdir single_suite \
-  --sizes S M L \
-  --types R C M \
-  --timings U P \
-  --soc-test normal \
-  --nr-repeats 2 \
-  --solver-name gurobi \
-  --solver-config-type gurobi   # single scenario suite
-
-python3 run_workday_suite.py \
-  --outdir workday_suite \
-  --timings U P \
-  --start-times N S \
-  --base-rates 5 8 \
-  --nr-surges 3 \
-  --nr-repeats 3 \
-  --solver-name gurobi \
-  --solver-config-type gurobi \
-  --plots     # multiple workdays with plots
-
-python3 run_suite.py \
-  --outdir single_plots \
-  --sizes L \
-  --types M \
-  --timings P \
-  --soc-test stress \
-  --nr-repeats 1 \
-  --solver-name gurobi \
-  --solver-config-type gurobi \
-  --plots     # single scenario with plots
+bash run_full_benchmark.sh
 ```
 
 

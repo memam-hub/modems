@@ -145,10 +145,10 @@ if __name__ == "__main__":
     if args.smoke:
         args.sizes = [ScenarioSize.large]
         args.types = [ScenarioType.mixed]
-        args.timings = [ScenarioTiming.uniform]
+        args.timings = [ScenarioTiming.uniform, ScenarioTiming.peaks]
         args.start_times = [WorkdayStartTime.normal, WorkdayStartTime.staggered]
         args.base_rates = [DEFAULT_BASE_RATE_PER_HOUR]
-        args.nr_repeats = 1
+        args.nr_repeats = 2
         args.nr_surges = 0
         args.workday = 90.0
         args.milp_timelimit = 8.0

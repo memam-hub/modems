@@ -24,7 +24,10 @@ from modems.core import (
     ScenarioType,
 )
 from modems.generator import ScenarioSocRange, SocRangeSpec
-from modems.insertion_ablation import InsertionAblationMetric
+from modems.insertion_ablation import (
+    CORPUS_COMPARISON_SPEEDUPS,
+    InsertionAblationMetric,
+)
 from modems.milp import DEFAULT_MILP_SOLVER_DATA, SolverConfigType
 from modems.solution import DEFAULT_MILP_TIMELIMIT, DEFAULT_PARAMS_ALNS
 
@@ -204,10 +207,17 @@ def add_cli_arguments(
         )
     if ParserArgumentName.ablation_comparison_metric in argument_names:
         parser.add_argument(
+            "--metrics",
             "--metric",
-            default=InsertionAblationMetric.speedup_V2_V3.value,
+            dest="metric",
+            nargs="+",
+            default=[m.value for m in CORPUS_COMPARISON_SPEEDUPS],
             choices=[m.value for m in InsertionAblationMetric],
-            help="Comparison metric averaged per route-length bucket",
+            help=(
+                "Comparison metric(s) averaged per route-length bucket, one column "
+                "pair each in the .tex table (default: the four speedups V0/V1, "
+                "V1/V2, V2/V3, V0/V3)"
+            ),
         )
     if ParserArgumentName.objective in argument_names:
         parser.add_argument(

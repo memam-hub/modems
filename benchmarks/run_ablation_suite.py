@@ -231,12 +231,12 @@ if __name__ == "__main__":
             outdir_b=os.path.join(args.outdir, "stress"),
             outdir=comparison_outdir,
             bucket_size=args.bucket_size,
-            metric=args.metric,
+            metrics=args.metric,
             table_name=args.comparison_table_name,
             formats=args.export_formats,
         )
         print(
-            f"\n{len(comparison_rows)} buckets written to "
+            f"\n{len(comparison_rows)} (bucket, metric) rows written to "
             f"{comparison_outdir}/{args.comparison_table_name}.{formats_suffix(args.export_formats)}"
         )
         figure = plot_corpus_comparison(

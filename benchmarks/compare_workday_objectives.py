@@ -3,7 +3,7 @@ Compare two workday suites after run_workday_suite: one solved with --objective 
 and one with --objective open, otherwise generated with identical arguments and --seed
 (so both contain the same workdays and demand). Writes a combined manifest and summary
 table (each workday's closed row directly followed by its open row) and three figures:
-decision effects with 95% CIs, outcomes against demand load, and the four runs of the
+decision effects with 95% CIs, outcomes against demand load, and the eight runs of the
 representative workday (highest demand load among workdays with surges).
 Compares only, both suites must already be generated/solved.
 
@@ -43,7 +43,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--all-workdays",
         action="store_true",
-        help="Also plot the four runs of every paired workday into <outdir>/workdays",
+        help=(
+            "Also plot every workday (objective x start time x solver runs) into "
+            "<outdir>/workdays"
+        ),
     )
     parser.add_argument(
         "--window",
@@ -68,14 +71,14 @@ if __name__ == "__main__":
     if result["unpaired"]:
         print(f"unpaired (tables only): {', '.join(result['unpaired'])}")
     labels = {m.key: m.label for m in METRICS}
-    print(f"\n{'outcome':<24} {'decision':<11} {'group':<10} {'n':>4}  mean [95% CI]")
+    print(f"\n{'outcome':<24} {'decision':<11} {'group':<18} {'n':>4}  mean [95% CI]")
     for e in result["estimates"]:
         if e["mean"] is None:
             text = "--"
         else:
             text = f"{e['mean']:+.3f} [{e['mean'] - e['ci']:+.3f}, {e['mean'] + e['ci']:+.3f}]"
         print(
-            f"{labels[e['metric']]:<24} {e['decision']:<11} {e['group']:<10} "
+            f"{labels[e['metric']]:<24} {e['decision']:<11} {e['group']:<18} "
             f"{e['n']:>4}  {text}"
         )
     print(

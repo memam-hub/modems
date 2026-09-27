@@ -279,88 +279,126 @@ def start_time_pairs(
     return pairs
 
 
+def _start_time(run: WorkdayRun) -> WorkdayStartTime:
+    return WorkdayStartTime(run.row["start_time"])
+
+
+START_TIMES = tuple(WorkdayStartTime)
+START_LABEL = {t: t.value for t in WorkdayStartTime}
+OBJECTIVE_LABEL = {o: o.value for o in OBJECTIVES}
+
+# per decision (column of Figure 1): its difference, then the two decisions it is
+# split by, as (title, levels, label per level); groups are their combinations
+DECISION_TITLES = {
+    "objective": "Objective: closed - open",
+    "solver": "Solver: MILP3 - ALNS",
+    "start_time": "Start time: normal - staggered",
+}
+DECISION_CONDITIONS = {
+    "objective": (("solver", SOLVERS, SOLVER_LABEL), ("start time", START_TIMES, START_LABEL)),
+    "solver": (("objective", OBJECTIVES, OBJECTIVE_LABEL), ("start time", START_TIMES, START_LABEL)),
+    "start_time": (("solver", SOLVERS, SOLVER_LABEL), ("objective", OBJECTIVES, OBJECTIVE_LABEL)),
+}  # fmt: skip
+
+
 def impact_estimates(
     closed: dict[str, WorkdayRun], opened: dict[str, WorkdayRun]
 ) -> list[dict[str, Any]]:
     """
     Figure 1 data: one entry per (metric, decision, group), the mean difference and
-    95% CI half-width, and the number of workdays behind it
-      - objective, per solver: paired open - closed over workdays in both suites
-      - solver, per objective: paired ALNS - MILP3 over that suite's workdays
-      - start time, per solver: paired staggered - normal over workdays with identical
-        demand (check start_time_pairs), averaged over both objectives per workday
+    95% CI half-width, and the number of workdays behind it. Each decision's effect is
+    split by every combination of the other two decisions (DECISION_CONDITIONS), so a
+    group is one pair of levels, e.g., "MILP3 · normal":
+      - objective, per solver x start time: paired closed - open over workdays in
+        both suites (paired workdays share their start time)
+      - solver, per objective x start time: paired MILP3 - ALNS over that suite's
+        workdays with that start time
+      - start time, per solver x objective: paired normal - staggered over workdays
+        with identical demand (check start_time_pairs)
+    Every difference is first level - second level, in enum order (closed, MILP3,
+    normal first), so a positive value means the first level scores higher
+    Entries also carry "levels", the index of each of the group's two levels
     """
     pairs = sorted(closed.keys() & opened.keys())
     start_pairs = start_time_pairs(closed, opened)
     estimates = []
 
-    def add(metric, decision, group, estimate, n):
+    def add(metric, decision, levels, diffs):
+        (_, first, first_label), (_, second, second_label) = DECISION_CONDITIONS[
+            decision
+        ]
+        estimate = mean_ci(diffs)
         mean, half = estimate if estimate is not None else (None, None)
         estimates.append(
             dict(
                 metric=metric.key,
                 decision=decision,
-                group=group,
+                group=f"{first_label[first[levels[0]]]} · "
+                f"{second_label[second[levels[1]]]}",
+                levels=levels,
                 mean=mean,
                 ci=half,
-                n=n,
+                n=len(diffs),
             )
         )
 
+    def paired_diffs(metric, couples, s):
+        """first - second of solver s over (first, second) runs, where both exist"""
+        return [
+            metric.value(first.results[s]) - metric.value(second.results[s])
+            for first, second in couples
+            if metric.value(first.results[s]) is not None
+            and metric.value(second.results[s]) is not None
+        ]
+
     for metric in METRICS:
-        for s in SOLVERS:
-            diffs = [
-                metric.value(opened[p].results[s]) - metric.value(closed[p].results[s])
-                for p in pairs
-                if metric.value(opened[p].results[s]) is not None
-                and metric.value(closed[p].results[s]) is not None
-            ]
-            add(metric, "objective", SOLVER_LABEL[s], mean_ci(diffs), len(diffs))
-        for objective, runs in zip(OBJECTIVES, (closed, opened)):
-            diffs = [
-                metric.value(r.results[SolverStrategy.alns])
-                - metric.value(r.results[SolverStrategy.milp3])
-                for r in runs.values()
-                if metric.value(r.results[SolverStrategy.alns]) is not None
-                and metric.value(r.results[SolverStrategy.milp3]) is not None
-            ]
-            add(metric, "solver", objective.value, mean_ci(diffs), len(diffs))
-        for s in SOLVERS:
-            diffs = []
-            for normal, staggered in start_pairs:
-                # staggered - normal of each objective present, averaged per workday
-                per_objective = [
-                    metric.value(staggered[o].results[s])
-                    - metric.value(normal[o].results[s])
-                    for o in normal.keys() & staggered.keys()
-                    if metric.value(staggered[o].results[s]) is not None
-                    and metric.value(normal[o].results[s]) is not None
+        for a, s in enumerate(SOLVERS):
+            for b, start in enumerate(START_TIMES):
+                couples = [
+                    (closed[p], opened[p])
+                    for p in pairs
+                    if _start_time(closed[p]) == start
                 ]
-                if per_objective:
-                    diffs.append(float(np.mean(per_objective)))
-            add(metric, "start_time", SOLVER_LABEL[s], mean_ci(diffs), len(diffs))
+                add(metric, "objective", (a, b), paired_diffs(metric, couples, s))
+        for a, runs in enumerate((closed, opened)):
+            for b, start in enumerate(START_TIMES):
+                diffs = [
+                    metric.value(r.results[SolverStrategy.milp3])
+                    - metric.value(r.results[SolverStrategy.alns])
+                    for r in runs.values()
+                    if _start_time(r) == start
+                    and metric.value(r.results[SolverStrategy.alns]) is not None
+                    and metric.value(r.results[SolverStrategy.milp3]) is not None
+                ]
+                add(metric, "solver", (a, b), diffs)
+        for a, s in enumerate(SOLVERS):
+            for b, objective in enumerate(OBJECTIVES):
+                couples = [
+                    (normal[objective], staggered[objective])
+                    for normal, staggered in start_pairs
+                    if objective in normal and objective in staggered
+                ]
+                add(metric, "start_time", (a, b), paired_diffs(metric, couples, s))
     return estimates
 
 
-def _group_style(group: str) -> tuple[str, str]:
-    """(colour, marker face) of a Figure 1 group: a solver or an objective"""
-    for s, label in SOLVER_LABEL.items():
-        if group == label:
-            return SOLVER_COLOR[s], SOLVER_COLOR[s]
-    return "k", "k" if group == ObjectiveType.closed else "white"
-
-
-DECISION_TITLES = {
-    "objective": "Objective: open - closed",
-    "solver": "Solver: ALNS - MILP3",
-    "start_time": "Start time: staggered - normal",
-}
+def _estimate_style(levels: tuple[int, int]) -> tuple[Any, Any]:
+    """
+    (colour, marker face) of a Figure 1 group: colour by its first level, as in the
+    box-plot grids, marker filled for the first level of the second decision and
+    hollow for the second
+    """
+    color = _box_color(levels[0], 0)
+    return color, color if levels[1] == 0 else "white"
 
 
 def plot_impacts(estimates: list[dict[str, Any]], path: str) -> str:
-    """Figure 1: rows = outcomes, columns = decisions, dot + 95% CI per group"""
+    """
+    Figure 1: rows = outcomes, columns = decisions, dot + 95% CI per combination of
+    the other two decisions (first group on top)
+    """
     decisions = list(DECISION_TITLES)
-    fig, axes = setup_fig_grid(len(METRICS), len(decisions), 18.0, 3.0 * len(METRICS))
+    fig, axes = setup_fig_grid(len(METRICS), len(decisions), 20.0, 3.6 * len(METRICS))
     for i, metric in enumerate(METRICS):
         row = [e for e in estimates if e["metric"] == metric.key]
         finite = [
@@ -372,23 +410,25 @@ def plot_impacts(estimates: list[dict[str, Any]], path: str) -> str:
         for j, decision in enumerate(decisions):
             ax = axes[i, j]
             cells = [e for e in row if e["decision"] == decision]
+            positions = list(range(len(cells) - 1, -1, -1))
             ax.axvline(0.0, color="k", linewidth=1.5, zorder=1)
-            for y, e in enumerate(cells):
+            for y, e in zip(positions, cells):
                 if e["mean"] is None:
                     ax.text(0.0, y, "n/a", ha="center", va="center", color="gray")
                     continue
                 ci = e["ci"] if math.isfinite(e["ci"]) else 0.0
-                color, face = _group_style(e["group"])
+                color, face = _estimate_style(e["levels"])
                 ax.errorbar(
                     e["mean"],
                     y,
                     xerr=ci,
                     fmt="o",
-                    markersize=10,
-                    capsize=6,
+                    markersize=12,
+                    elinewidth=4,
+                    capsize=8,
                     color=color,
                     markerfacecolor=face,
-                    markeredgewidth=2,
+                    markeredgewidth=4,
                     zorder=3,
                 )
                 ax.text(
@@ -400,11 +440,12 @@ def plot_impacts(estimates: list[dict[str, Any]], path: str) -> str:
                     fontsize=11,
                     color="gray",
                 )
-            ax.set_yticks(range(len(cells)), [e["group"] for e in cells])
+            ax.set_yticks(positions, [e["group"] for e in cells])
             ax.set_ylim(-0.6, len(cells) - 0.4)
             ax.set_xlim(-limit, limit)
             if i == 0:
-                ax.set_title(DECISION_TITLES[decision])
+                first, second = (c[0] for c in DECISION_CONDITIONS[decision])
+                ax.set_title(f"{DECISION_TITLES[decision]}\nby {first} × {second}")
             if j == 0:
                 ax.set_ylabel(metric.label)
     fig.tight_layout()
@@ -513,23 +554,68 @@ def rolling_acceptance(
     return times, rates
 
 
+def workday_group_name(run: WorkdayRun) -> str:
+    """
+    Workday name without its objective and start-time letters, shared by the (up to)
+    four runs of one demand: WC0_LMUN5_3 -> W0_LMU5_3
+    """
+    head, tail = pair_name(run.name).split("_", 1)
+    # tail reads <size><type><timing><start><base_rate>_<nr_surges>
+    if len(tail) > 3 and tail[3] == _start_time(run).letter:
+        tail = tail[:3] + tail[4:]
+    return f"{head}_{tail}"
+
+
+WorkdayGroup = dict[tuple[ObjectiveType, WorkdayStartTime], WorkdayRun]
+
+
+def workday_groups(
+    closed: dict[str, WorkdayRun], opened: dict[str, WorkdayRun]
+) -> dict[str, WorkdayGroup]:
+    """
+    The runs of every workday demand (same demand parameters and seed), keyed by
+    (objective, start time) and grouped by workday_group_name(): up to four runs, each
+    solved by both solvers. Only groups observed with both objectives are kept
+    """
+    by_demand: dict[tuple, WorkdayGroup] = {}
+    for runs in (closed, opened):
+        for run in runs.values():
+            key = (demand_key(run), run.row["seed"])
+            by_demand.setdefault(key, {})[(run.objective, _start_time(run))] = run
+    groups = {}
+    for group in by_demand.values():
+        if {o for o, _ in group} == set(OBJECTIVES):
+            groups[workday_group_name(next(iter(group.values())))] = group
+    return dict(sorted(groups.items()))
+
+
 def plot_workday(
-    closed: WorkdayRun,
-    opened: WorkdayRun,
+    group: WorkdayGroup,
     path: str,
     window: float = DEFAULT_ROLLING_WINDOW,
     demand_bin: float = DEFAULT_DEMAND_BIN,
 ) -> str:
     """
-    Figure 3: rows = solver, columns = objective; rolling acceptance (left axis) and
-    agent SoC (right axis) per run, above one demand strip shared by all four runs
+    Figure 3: rows = objective x start time (closed before open, normal before
+    staggered; only those present), columns = solver (MILP3, ALNS); rolling acceptance
+    (left axis) and agent SoC (right axis) per run, above one demand strip shared by
+    every run (all runs of a group have identical demand)
     """
     import matplotlib.pyplot as plt
 
+    keys = [(o, t) for o in OBJECTIVES for t in START_TIMES if (o, t) in group]
     plt.rc("font", family="serif", size=16)
-    fig = plt.figure(figsize=(18.0, 12.0))
-    grid = fig.add_gridspec(3, 2, height_ratios=[3, 3, 1.2], hspace=0.35, wspace=0.25)
-    logs = {o: run.logs() for o, run in zip(OBJECTIVES, (closed, opened))}
+    fig = plt.figure(figsize=(18.0, 4.0 * len(keys) + 4.0))
+    grid = fig.add_gridspec(
+        len(keys) + 1,
+        len(SOLVERS),
+        height_ratios=[3] * len(keys) + [1.2],
+        hspace=0.4,
+        wspace=0.25,
+        top=0.93,
+        bottom=0.08,
+    )
+    logs = {key: group[key].logs() for key in keys}
     # the day ends at clock_end, or at the last committed arrival if later
     t_end = max(
         t[-1]
@@ -537,17 +623,17 @@ def plot_workday(
         for log in by_solver.values()
         for _, t, _ in agent_soc_series(log)
     )
-    strip = fig.add_subplot(grid[2, :])
+    strip = fig.add_subplot(grid[len(keys), :])
     handles = []
-    for i, s in enumerate(SOLVERS):
-        for j, objective in enumerate(OBJECTIVES):
-            log = logs[objective][s]
+    for i, (objective, start) in enumerate(keys):
+        for j, s in enumerate(SOLVERS):
+            log = logs[(objective, start)][s]
             ax = fig.add_subplot(grid[i, j], sharex=strip)
             ax.grid(True, alpha=0.5, zorder=-2)
             ax.set_ylim(-2, 102)
-            ax.set_title(f"{SOLVER_LABEL[s]}, {objective}")
+            ax.set_title(f"{SOLVER_LABEL[s]}, {objective}, {start} start")
             if j == 0:
-                ax.set_ylabel(f"Acceptance, last {window:g} min (%)")
+                ax.set_ylabel(f"Accept., last {window:g} min (%)")
             ax.tick_params(labelbottom=False)
             times, rates = rolling_acceptance(log, window)
             if times:
@@ -562,7 +648,7 @@ def plot_workday(
             )
             ax_soc = ax.twinx()
             ax_soc.set_ylim(-0.02, 1.02)
-            if j == 1:
+            if j == len(SOLVERS) - 1:
                 ax_soc.set_ylabel("Agent SoC")
             soc_lines = [
                 ax_soc.plot(
@@ -577,31 +663,48 @@ def plot_workday(
             ]
             if not handles:
                 handles = [acc, *soc_lines]
-    submissions = [
-        r.submission_time
-        for r in logs[ObjectiveType.closed][SolverStrategy.milp3].requests
-    ]
+    submissions = [r.submission_time for r in logs[keys[0]][SOLVERS[0]].requests]
     bins = np.arange(0.0, t_end + demand_bin, demand_bin)
     strip.hist(submissions, bins=bins, color="gray", edgecolor="white")
     strip.grid(True, alpha=0.5, zorder=-2)
     strip.set_xlim(0.0, t_end)
     strip.set_xlabel("Time (min)")
     strip.set_ylabel(f"Requests / {demand_bin:g} min")
-    fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0.05), ncol=4)
+    # legend right below the strip's x-axis label, title right above the top row
+    fig.legend(
+        handles=handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, strip.get_position().y0 - 0.04),
+        ncol=4,
+    )
+    first = group[keys[0]]
     fig.suptitle(
-        f"{closed.pair}: demand load {closed.demand_load:.1f} requests per agent-hour"
+        f"{workday_group_name(first)}: demand load {first.demand_load:.1f} requests "
+        "per agent-hour",
+        y=0.965,
     )
     return save_figure(fig, path)
 
 
-def representative_pair(
-    closed: dict[str, WorkdayRun], opened: dict[str, WorkdayRun]
-) -> str | None:
-    """Highest demand load among paired workdays with surges (else among all)"""
-    pairs = sorted(closed.keys() & opened.keys())
-    with_surges = [p for p in pairs if closed[p].row["nr_surges"] > 0]
-    candidates = with_surges or pairs
-    return max(candidates, key=lambda p: (closed[p].demand_load, p), default=None)
+def representative_group(groups: dict[str, WorkdayGroup]) -> str | None:
+    """
+    Highest demand load among workday groups with surges (else among all), preferring
+    groups observed with every objective x start time
+    """
+    names = list(groups)
+    complete = [
+        n for n in names if len(groups[n]) == len(OBJECTIVES) * len(START_TIMES)
+    ]
+    candidates = complete or names
+    with_surges = [
+        n for n in candidates if next(iter(groups[n].values())).row["nr_surges"] > 0
+    ]
+    candidates = with_surges or candidates
+    return max(
+        candidates,
+        key=lambda n: (next(iter(groups[n].values())).demand_load, n),
+        default=None,
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -775,23 +878,20 @@ def compare_workday_objectives(
         figures["demand_boxes"] = plot_demand_boxes(
             runs, os.path.join(outdir, "demand_param_boxes.png")
         )
-    representative = representative_pair(closed, opened)
+    groups = workday_groups(closed, opened)
+    representative = representative_group(groups)
     if representative is not None:
         figures["workday"] = plot_workday(
-            closed[representative],
-            opened[representative],
+            groups[representative],
             os.path.join(outdir, f"most_demand_{representative}.png"),
             window=window,
         )
     if all_workdays:
         workdays_dir = os.path.join(outdir, "workdays")
         os.makedirs(workdays_dir, exist_ok=True)
-        for p in sorted(closed.keys() & opened.keys()):
+        for name, group in groups.items():
             plot_workday(
-                closed[p],
-                opened[p],
-                os.path.join(workdays_dir, f"{p}.png"),
-                window=window,
+                group, os.path.join(workdays_dir, f"{name}.png"), window=window
             )
     return {
         "rows": summary_rows,

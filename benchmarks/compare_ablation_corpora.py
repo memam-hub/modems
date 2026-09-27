@@ -2,14 +2,14 @@
 Compare two insertion-ablation corpora after run_ablation_suite: [A] normal-SoC corpus
 with default SoC ranges and [B] SoC-stress corpus with lower SoC ranges. Bucket results
 using traversed mean_route_length (not nr_requests, it is nonrepresentative once
-soc_range(s) differ), then select a metric to report/compare for each bucket plus the
-B/A ratio. Compares only, both corpora must already be generated/solved.
+soc_range(s) differ), then report/compare the selected metric(s) for each bucket plus
+the B/A ratio (default: the four speedups V0/V1, V1/V2, V2/V3, V0/V3). Compares only, both corpora must already be generated/solved.
 
 Usage:
     python3 compare_ablation_corpora.py --corpus-a results_ablation
                                         --corpus-b results_ablation_soc
     python3 compare_ablation_corpora.py --corpus-a A --corpus-b B
-                                        --metric speedup_V0_V3 --bucket-size 5
+                                        --metrics speedup_V0_V3 --bucket-size 5
 """
 
 import argparse
@@ -36,7 +36,6 @@ if __name__ == "__main__":
         outdir=os.path.join(os.path.dirname(__file__), "results_ablation_comparison"),
     )
 
-    parser.add_argument
     parser.add_argument("--corpus-a", required=True, help="Outdir of first corpus A")
     parser.add_argument("--corpus-b", required=True, help="Outdir of second corpus B")
     parser.add_argument(
@@ -46,34 +45,42 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    labels = (
+        os.path.basename(os.path.normpath(args.corpus_a)),
+        os.path.basename(os.path.normpath(args.corpus_b)),
+    )
     rows = write_corpus_comparison(
         outdir_a=args.corpus_a,
         outdir_b=args.corpus_b,
         outdir=args.outdir,
         bucket_size=args.bucket_size,
-        metric=args.metric,
+        metrics=args.metric,
         table_name=args.table_name,
         formats=args.export_formats,
+        labels=labels,
     )
 
-    print(f"{'route bucket':>14}  {'A: n, mean':>16}  {'B: n, mean':>16}  {'B/A':>6}")
-    for row in rows:
-        a_str = f"{row['nr_a']}, {row['mean_a']:.1f}" if row["nr_a"] else "--"
-        b_str = f"{row['nr_b']}, {row['mean_b']:.1f}" if row["nr_b"] else "--"
-        ratio_str = f"{row['ratio_b_to_a']:.1f}" if row["ratio_b_to_a"] else "--"
-        bucket_str = f"{row['route_bucket_start']}-{row['route_bucket_end']}"
-        print(f"{bucket_str:>14}  {a_str:>16}  {b_str:>16}  {ratio_str:>6}")
+    for metric in dict.fromkeys(row["metric"] for row in rows):
+        print(f"\n{metric}")
+        print(
+            f"{'route bucket':>14}  {'A: n, mean':>16}  {'B: n, mean':>16}  {'B/A':>6}"
+        )
+        for row in rows:
+            if row["metric"] != metric:
+                continue
+            a_str = f"{row['nr_a']}, {row['mean_a']:.1f}" if row["nr_a"] else "--"
+            b_str = f"{row['nr_b']}, {row['mean_b']:.1f}" if row["nr_b"] else "--"
+            ratio_str = f"{row['ratio_b_to_a']:.1f}" if row["ratio_b_to_a"] else "--"
+            bucket_str = f"{row['route_bucket_start']}-{row['route_bucket_end']}"
+            print(f"{bucket_str:>14}  {a_str:>16}  {b_str:>16}  {ratio_str:>6}")
 
     print(
-        f"\n{len(rows)} buckets written to {args.outdir}/{args.table_name}.{formats_suffix(args.export_formats)}"
+        f"\n{len(rows)} (bucket, metric) rows written to {args.outdir}/{args.table_name}.{formats_suffix(args.export_formats)}"
     )
     figure = plot_corpus_comparison(
         ablation_table_rows(args.corpus_a),
         ablation_table_rows(args.corpus_b),
         os.path.join(args.outdir, "corpus_comparison.png"),
-        labels=(
-            os.path.basename(os.path.normpath(args.corpus_a)),
-            os.path.basename(os.path.normpath(args.corpus_b)),
-        ),
+        labels=labels,
     )
     print(f"comparison figure: {figure}")

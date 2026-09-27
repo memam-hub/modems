@@ -10,8 +10,6 @@ from collections.abc import Callable, Iterable
 from enum import StrEnum
 from typing import Any, cast
 
-import numpy as np
-
 from .algorithms import greedy_complete, preprocess
 from .alns import ModemsAlns
 from .core import (
@@ -917,14 +915,6 @@ def build_benchmark_table(
 # Figures
 # --------------------------------------------------------------------------------------
 
-BENCHMARK_STATUS_COLOR = {
-    SolutionStatus.optimal: "tab:green",
-    SolutionStatus.feasible: "tab:blue",
-    SolutionStatus.unknown: "tab:gray",
-    SolutionStatus.infeasible: "tab:red",
-    ManifestStatus.failed: "k",
-}
-
 
 def gap_to_best(rows: list[dict[str, Any]]) -> dict[tuple[str, str], float]:
     """
@@ -951,8 +941,11 @@ def plot_benchmark_figure(rows: list[dict[str, Any]], path: str) -> str:
     """
     One figure summarizing a (static) benchmark suite, by solver and size bucket:
     gap to the per-scenario best objective, improvement over the constructive
-    baseline, solve time (log scale) as horizontal boxes, and the share of each final
-    status (so the boxes can be read against the runs that have no objective)
+    baseline, solve time (log scale), and, for the MILPs only, the duality gap
+    100 x (UB - LB) / UB (gap_pct), all as horizontal boxes. ALNS has no bounds (it
+    never proves optimality), so it is left out of the gap panel; so is any MILP run
+    missing a bound (no incumbent, or a solver such as CBC that reports no lower bound
+    when stopped by the time limit), which the per-box n= counts reveal
     """
     from .plotting import draw_hboxes, save_figure, setup_fig_grid
 
@@ -962,9 +955,10 @@ def plot_benchmark_figure(rows: list[dict[str, Any]], path: str) -> str:
     groups = [(s, w) for s in solvers for w in sizes]
     labels = [f"{s.upper()} · {w}" for s, w in groups]
     colors = [size_color[w] for _, w in groups]
+    milp_groups = [(s, w) for s, w in groups if s != SolverStrategy.alns]
     gaps = gap_to_best(rows)
 
-    def select(value) -> list[list[float]]:
+    def select(value, selected=groups) -> list[list[float]]:
         return [
             [
                 v
@@ -973,7 +967,7 @@ def plot_benchmark_figure(rows: list[dict[str, Any]], path: str) -> str:
                 for v in [value(r)]
                 if v is not None
             ]
-            for s, w in groups
+            for s, w in selected
         ]
 
     fig, axes = setup_fig_grid(2, 2, 18.0, max(8.0, 0.5 * len(groups) * 2 + 4))
@@ -996,24 +990,14 @@ def plot_benchmark_figure(rows: list[dict[str, Any]], path: str) -> str:
     axes[1, 0].set_xscale("log")
 
     ax = axes[1, 1]
-    y = list(range(len(solvers), 0, -1))
-    left = np.zeros(len(solvers))
-    for status in list(BENCHMARK_STATUS_COLOR):
-        share = np.array(
-            [
-                100.0
-                * sum(row["status"] == status for row in rows if row["solver"] == s)
-                / max(1, sum(row["solver"] == s for row in rows))
-                for s in solvers
-            ]
-        )
-        ax.barh(y, share, left=left, color=BENCHMARK_STATUS_COLOR[status],
-                label=str(status), height=0.6)  # fmt: skip
-        left += share
-    ax.set_yticks(y, [s.upper() for s in solvers])
-    ax.set_xlim(0, 100)
-    ax.set_title("Final status (% of runs)")
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=3, fontsize=12)
+    draw_hboxes(
+        ax,
+        select(lambda r: r.get("gap_pct"), milp_groups),
+        [f"{s.upper()} · {w}" for s, w in milp_groups],
+        [size_color[w] for _, w in milp_groups],
+    )
+    ax.set_xlim(left=0.0)
+    ax.set_title("MILP duality gap (%)")
     fig.tight_layout()
     return save_figure(fig, path)
 

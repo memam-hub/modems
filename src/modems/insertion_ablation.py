@@ -90,6 +90,18 @@ class InsertionAblationMetric(StrEnum):
     t_exe_V3 = "t_exe_V3"
     speedup_V0_V3 = "speedup_V0_V3"
     speedup_V2_V3 = "speedup_V2_V3"
+    speedup_V0_V1 = "speedup_V0_V1"
+    speedup_V1_V2 = "speedup_V1_V2"
+
+
+# speedups of the corpus comparison, in table order: each optimization step on its own
+# (V0/V1, V1/V2, V2/V3), then the overall one (V0/V3)
+CORPUS_COMPARISON_SPEEDUPS = (
+    InsertionAblationMetric.speedup_V0_V1,
+    InsertionAblationMetric.speedup_V1_V2,
+    InsertionAblationMetric.speedup_V2_V3,
+    InsertionAblationMetric.speedup_V0_V3,
+)
 
 
 # prefix for the insertion ablation benchmarking result
@@ -882,6 +894,8 @@ def ablation_table_rows(outdir: str) -> list[dict[str, Any]]:
                 metric.t_exe_V3: t_exe_variants[3],
                 metric.speedup_V0_V3: _speedup(t_exe_variants[0], t_exe_variants[3]),
                 metric.speedup_V2_V3: _speedup(t_exe_variants[2], t_exe_variants[3]),
+                metric.speedup_V0_V1: _speedup(t_exe_variants[0], t_exe_variants[1]),
+                metric.speedup_V1_V2: _speedup(t_exe_variants[1], t_exe_variants[2]),
                 "V3_pairs_pruned": v3_stat("mean_position_pairs_pruned"),
                 "V3_prefix_propagations": v3_stat("mean_prefix_node_propagations"),
                 "V3_suffix_propagations": v3_stat("mean_suffix_node_propagations"),
@@ -1073,18 +1087,30 @@ def write_corpus_comparison(
     outdir_b: str,
     outdir: str,
     bucket_size: int = 10,
-    metric: InsertionAblationMetric | str = InsertionAblationMetric.speedup_V2_V3,
+    metrics: Iterable[InsertionAblationMetric | str] = CORPUS_COMPARISON_SPEEDUPS,
     table_name: str = "corpus_comparison",
     formats: str | Iterable[str] | None = None,
+    labels: tuple[str, str] = ("normal", "stress"),
 ) -> list[dict[str, Any]]:
     """
     Read both corpora's manifests/results directly (do not re-solve), bucket results
-    per achieved route length, and write {table_name}.{csv,json,tex} (the selected
-    formats) to outdir. Uses ablation_table_rows(), so the corpora are left untouched
+    per achieved route length for every metric (default: the four speedups V0/V1,
+    V1/V2, V2/V3, V0/V3), and write {table_name}.{csv,json,tex} (the selected
+    formats) to outdir. The csv/json rows are compare_route_length_buckets()'s, one
+    block per metric, appended in the given order; the tex table has one column pair
+    (labels: corpus A, corpus B) per metric. Uses ablation_table_rows(), so the
+    corpora are left untouched
     """
+    metrics = [InsertionAblationMetric(m) for m in metrics]
+    if not metrics:
+        raise ValueError("at least one comparison metric is required")
     rows_a = ablation_table_rows(outdir_a)
     rows_b = ablation_table_rows(outdir_b)
-    comparison = compare_route_length_buckets(rows_a, rows_b, bucket_size, metric)
+    comparison = [
+        row
+        for metric in metrics
+        for row in compare_route_length_buckets(rows_a, rows_b, bucket_size, metric)
+    ]
 
     fieldnames = [
         "route_bucket_start",
@@ -1102,7 +1128,9 @@ def write_corpus_comparison(
         table_name,
         fieldnames,
         formats,
-        write_tex=lambda path: _write_corpus_comparison_latex(comparison, path, metric),
+        write_tex=lambda path: _write_corpus_comparison_latex(
+            comparison, path, metrics, labels
+        ),
     )
     return comparison
 
@@ -1235,47 +1263,93 @@ def plot_corpus_comparison(
     return save_figure(fig, path)
 
 
+def _speedup_label(metric: InsertionAblationMetric) -> str:
+    """$V0/V1$ from speedup_V0_V1; the metric name itself for any other metric"""
+    prefix = "speedup_"
+    if metric.value.startswith(prefix):
+        slow, fast = metric.value[len(prefix) :].split("_")
+        return f"${slow}/{fast}$"
+    return metric.value.replace("_", r"\_")
+
+
 def _write_corpus_comparison_latex(
     comparison: list[dict[str, Any]],
     tex_path: str,
-    metric: InsertionAblationMetric | str,
+    metrics: list[InsertionAblationMetric],
+    labels: tuple[str, str] = ("normal", "stress"),
 ) -> None:
-    """Write the corpus-comparison table as a single table"""
+    """
+    Write the corpus-comparison table as a single (portrait) table: one row per
+    route-length bucket, one column pair (corpus A, corpus B) per metric. The overall
+    V0/V3 speedup, when present, is set apart from the per-step ones by a double rule
+    """
+    overall = InsertionAblationMetric.speedup_V0_V3
+    buckets = sorted(
+        {(r["route_bucket_start"], r["route_bucket_end"]) for r in comparison}
+    )
+    by_key = {(r["route_bucket_start"], r["metric"]): r for r in comparison}
+
+    def rule_after(k: int) -> str:
+        """Double rule between the column pair k and a following V0/V3 pair"""
+        return "||" if k + 1 < len(metrics) and metrics[k + 1] == overall else ""
+
+    column_spec = "c " + " ".join(f"cc{rule_after(k)}" for k in range(len(metrics)))
+    label_a, label_b = (str(label).replace("_", r"\_") for label in labels)
+    metric_cells = " & ".join(
+        rf"\multicolumn{{2}}{{c{rule_after(k)}}}{{{_speedup_label(m)}}}"
+        for k, m in enumerate(metrics)
+    )
+    corpus_cells = " & ".join(f"{label_a} & {label_b}" for _ in metrics)
     header = (
         r"\begin{table}[t]"
         "\n"
         r"\centering"
         "\n"
-        r"\begin{tabular}{c c c c c c}"
+        rf"\begin{{tabular}}{{{column_spec}}}"
         "\n"
         r"\hline"
         "\n"
-        r"Route range & {$|X|$} & {Mean X} & {$|Y|$} & {Mean Y} & {Y/X} \\"
+        rf"Bucket & {metric_cells} \\"
+        "\n"
+        rf"\cline{{2-{1 + 2 * len(metrics)}}}"
+        "\n"
+        rf" & {corpus_cells} \\"
         "\n"
         r"\hline"
     )
+
+    def mean_cell(start: int, metric: InsertionAblationMetric, side: str) -> str:
+        row = by_key.get((start, metric))
+        return _latex_fmt(None if row is None else row[f"mean_{side}"], "{:.2f}")
+
     body_lines = [
         " & ".join(
-            [
-                f"{row['route_bucket_start']}--{row['route_bucket_end']}",
-                _latex_fmt(row["nr_a"], "{:.0f}"),
-                _latex_fmt(row["mean_a"], "{:.3f}"),
-                _latex_fmt(row["nr_b"], "{:.0f}"),
-                _latex_fmt(row["mean_b"], "{:.3f}"),
-                _latex_fmt(row["ratio_b_to_a"], "{:.2f}"),
+            # braced: a row starting with "[" would be read as \\[<length>]
+            [rf"{{$[{start}, {end})$}}"]
+            + [
+                cell
+                for m in metrics
+                for cell in (mean_cell(start, m, "a"), mean_cell(start, m, "b"))
             ]
         )
         + r" \\"
-        for row in comparison
+        for start, end in buckets
     ]
+    speedup_note = (
+        r" $Vi/Vj$ is the runtime of $Vi$ over that of $Vj$, so values $>1$ favor "
+        r"$Vj$: $V0/V1$, $V1/V2$ and $V2/V3$ isolate each optimization step, $V0/V3$ "
+        r"is the overall speedup."
+        if all(m.value.startswith("speedup_") for m in metrics)
+        else ""
+    )
     footer = (
         r"\hline"
         "\n"
         r"\end{tabular}"
         "\n"
-        r"\caption{Corpus X against Y: Comparison of "
-        + str(metric).replace("_", r"\_")
-        + r", bucketed by achieved (mean) route length. X/Y $>$ 1 favors corpus Y.}"
+        rf"\caption{{Feasible-insertion ablation, {label_a} against {label_b} corpus: "
+        r"means per bucket $[a, b)$ of achieved (mean) route length, in route nodes."
+        f"{speedup_note}}}"
         "\n"
         r"\end{table}"
     )

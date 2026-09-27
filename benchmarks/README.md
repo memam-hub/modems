@@ -38,7 +38,9 @@ every pending `(scenario, solver)` row (ALNS + MILP1/2/3, each MILP warm-started
 `greedy_complete`'s baseline), and writes `benchmark_table.{csv,json,tex}` plus
 `solver_comparison.png`: per solver and size, the gap to the best objective found on
 each scenario, the improvement over the constructive baseline, the solve time (log
-scale), and the share of each final status.
+scale), and, for the MILPs only, the duality gap (%) of runs with both bounds (see
+`n=`). HiGHS and Gurobi report a lower bound for time-limited runs; CBC does not, so
+with CBC the gap panel only holds proven optima.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -163,7 +165,7 @@ hardware (288 points per corpus).
 | `--table-name` | `ablation_table` | Per-corpus output file basename |
 | `--comparison-table-name` | `corpus_comparison` | Comparison output file basename |
 | `--bucket-size` | `10` | Comparison route-length bucket width (stops) |
-| `--metric` | `speedup_V2_V3` | Comparison metric: `InsertionAblationMetric` |
+| `--metrics` | `speedup_V0_V1 speedup_V1_V2 speedup_V2_V3 speedup_V0_V3` | Comparison metric(s): `InsertionAblationMetric` (`--metric` is an alias) |
 
 Plus `--phase`/`--types`/`--timings`/`--nr-repeats` (default 3)/`--seed`/`--smoke`/
 `--retry-failed`/`--export-formats`/`--rows-per-block` as `run_suite.py`. The built-in SoC ranges are `(0.8, 1.0)` normal,
@@ -175,8 +177,10 @@ Generated table columns: one row per point (`nr_agents`,`nr_requests`, spatial t
 timing, SoC range, repetition), each variant's mean per-probe wall-clock time, `V0/V3` and
 `V2/V3` speedup ratios, achieved `mean_route_length`, and V3's own analysis metrics:
 pruned-pairs and prefix/suffix-propagation. The comparison table buckets both corpora
-by `mean_route_length` and reports the chosen `metric`'s mean per bucket side by side,
-in addition to the B/A ratio.
+by `mean_route_length` and reports each chosen metric's mean per bucket side by side
+(csv/json: one block of bucket rows per metric, with the B/A ratio). The `.tex` table
+is one portrait table: one row per bucket `[a, b)`, and per metric a `normal`/`stress` column
+pair, in the order V0/V1, V1/V2, V2/V3, then V0/V3 after a double rule.
 
 ### Naming convention
 
@@ -207,7 +211,8 @@ repetitions stays readable.
 ## compare_ablation_corpora.py
 
 Buckets two already-solved ablation corpora by achieved `mean_route_length`, reports
-the mean of chosen `metric` per bucket side by side, plus the B/A ratio; useful to
+the mean of each chosen metric (default: the four speedups) per bucket side by side,
+plus the B/A ratio, with the corpora's folder names as `.tex` column labels; useful to
 compare arbitrary corpora. The default `run_ablation_suite.py` run calls this after
 solving/generating the two corpora.
 
@@ -217,7 +222,7 @@ solving/generating the two corpora.
 | `--outdir` | `results_ablation_comparison/` | Output directory |
 | `--table-name` | `corpus_comparison` | Output file basename (`.csv`/`.json`/`.tex`) |
 
-Plus `--bucket-size`, `--metric`, and `--export-formats` as `run_ablation_suite.py`.
+Plus `--bucket-size`, `--metrics`, and `--export-formats` as `run_ablation_suite.py`.
 Also writes `corpus_comparison.png` (same panels as `normal_vs_stress.png`).
 
 ## compare_workday_objectives.py
@@ -234,11 +239,11 @@ travel time/energy) and five figures:
 
 | Figure | Content |
 |---|---|
-| `var_decision_impact.png` | Rows: acceptance, mean delay, mean excess ride, travel time and energy per served request. Columns: objective (open - closed, per solver), solver (ALNS - MILP3, per objective), start time (staggered - normal, per solver). Mean of the per-workday differences on identical demand, with its 95% CI (Student t). Suites generated while the start time was still part of the seed have no start-time pairs: that column then shows n/a |
+| `var_decision_impact.png` | Rows: acceptance, mean delay, mean excess ride, travel time and energy per served request. Columns: objective (closed - open, per solver x start time), solver (MILP3 - ALNS, per objective x start time), start time (normal - staggered, per solver x objective). Mean of the per-workday differences on identical demand, with its 95% CI (Student t). Suites generated while the start time was still part of the seed have no start-time pairs: that column then shows n/a |
 | `var_decision_boxes.png` | Same grid as box plots of the actual values: objective x solver, solver x start time, start time x objective (4 boxes each, pooling the third decision) |
 | `demand_param_boxes.png` | Same layout for the demand parameters: base rate x solver, timing x solver, base rate x timing |
 | `demand_vs_accept_delay.png` | Acceptance and mean delay against the demand load (requests per agent-hour): binned means with 95% CI bands per solver x objective, one marker per workday (hollow: with surges) |
-| `most_demand_<name>.png` | The representative workday (highest demand load among workdays with surges): rolling acceptance and agent SoC for its four runs, above the shared demand |
+| `most_demand_<name>.png` | The representative workday (highest demand load among workdays with surges; `<name>` is its name without objective and start-time letters): rolling acceptance and agent SoC for its eight runs, rows objective x start time, columns MILP3/ALNS, above the shared demand |
 
 Delay and excess ride time are means over served requests only.
 
@@ -247,7 +252,7 @@ Delay and excess ride time are means over served requests only.
 | `--closed` / `--open` | required | Outdirs of the closed and open suites |
 | `--outdir` | `results_workday_comparison/` | Output directory |
 | `--table-name` | `combined_summary` | Combined table basename (`.csv`/`.json`/`.tex`) |
-| `--all-workdays` | off | Also plot every paired workday into `<outdir>/workdays/` |
+| `--all-workdays` | off | Also plot every workday (all its runs, same layout as `most_demand_<name>.png`) into `<outdir>/workdays/` |
 | `--window` | `30` | Minutes of submissions behind each rolling acceptance point |
 | `--export-formats` | `csv,json` | Table formats, as `run_suite.py` |
 

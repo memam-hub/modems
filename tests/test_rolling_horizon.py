@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import pytest
 
+import modems.milp as milp_module
 from modems import (
     ModemsAgent,
     ModemsScenarioGenerator,
@@ -535,6 +537,79 @@ def test_simulator_initializes_idle_and_feasible() -> None:
     rh_simulator, _ = _tiny_simulator()
     assert list(rh_simulator.agents.keys()) == ["agent_1"]
     assert rh_simulator.time_since_last_adoption == 0.0
+
+
+def _requests(generator: ModemsScenarioGenerator, count: int = 2) -> list:
+    return [
+        generator.generate_random_request(
+            load_lb=1,
+            load_ub=3,
+            earliest_pickup=35.0,
+            tw_length=5.0,
+            status=RequestStatus.new,
+        )
+        for _ in range(count)
+    ]
+
+
+def _cbc_messages(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage() == milp_module.CBC_LIMITATIONS_MESSAGE
+    ]
+
+
+def _unavailable_solver(*args: Any, **kwargs: Any) -> None:
+    raise RuntimeError("stub: no optimizer in unit tests")
+
+
+def test_cbc_limitations_are_shown_once_per_simulation(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Three MILPs per epoch over several epochs, but one notice per simulator"""
+    monkeypatch.setattr(milp_module, "SolverFactory", _unavailable_solver)
+    caplog.set_level(logging.WARNING, logger="modems.milp")
+    rh_simulator, generator = _tiny_simulator(solver_mode="benchmarking")
+    rh_simulator.alns_max_iter = 10
+    rh_simulator.advance_epoch([])  # trivial: the optimizer never runs, no notice
+    assert _cbc_messages(caplog) == []
+    for _ in range(2):
+        record = rh_simulator.advance_epoch(_requests(generator))
+        # the stubbed MILPs fail after the notice, and the epoch goes on regardless
+        assert set(record.solver_errors) == {"milp1", "milp2", "milp3"}
+    assert len(_cbc_messages(caplog)) == 1
+    other, _ = _tiny_simulator(solver_mode="operational")
+    other.alns_max_iter = 10
+    other.advance_epoch(_requests(generator))
+    assert len(_cbc_messages(caplog)) == 2  # a new simulation shows it again
+
+
+def test_simulations_without_cbc_milps_show_no_notice(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(milp_module, "SolverFactory", _unavailable_solver)
+    caplog.set_level(logging.WARNING, logger="modems.milp")
+    generator = ModemsScenarioGenerator(seed=1)
+    agent = ModemsAgent(node_type=NetworkNodeType.hub, node_index=1, load_max=6)
+    alns_only = RollingHorizonSimulator(
+        generator.network,
+        [agent],
+        solver_mode="single",
+        single_solver="alns",
+        alns_max_iter=10,
+    )
+    alns_only.advance_epoch(_requests(generator))
+    highs = RollingHorizonSimulator(
+        generator.network,
+        [agent],
+        solver_mode="single",
+        single_solver="milp3",
+        solver_name="appsi_highs",
+        solver_config_type="highs",
+    )
+    highs.advance_epoch(_requests(generator))
+    assert _cbc_messages(caplog) == []
 
 
 @pytest.mark.integration

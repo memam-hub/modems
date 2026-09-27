@@ -8,6 +8,7 @@ installed) and check exact, hand-derived optima
 from __future__ import annotations
 
 import importlib.util
+import logging
 from types import SimpleNamespace
 from typing import Any
 
@@ -22,7 +23,7 @@ from modems.algorithms import (
     preprocess,
 )
 from modems.core import ModemsAgent, ModemsRequest, ModemsScenario, SolverStrategy
-from modems.milp import MilpType, ModemsMilp
+from modems.milp import CBC_LIMITATIONS_MESSAGE, MilpType, ModemsMilp
 from modems.solution import FLOAT_INF, ModemsInstance, SolutionStatus
 
 from .builders import generated, greedy_solution, line_network, line_scenario, make_ctx
@@ -254,6 +255,59 @@ def test_no_requests_is_solved_exactly_without_the_optimizer(monkeypatch) -> Non
     assert (info.status, info.objective) == (SolutionStatus.optimal, 0.0)
     assert info.lower_bound is info.upper_bound is None
     assert info.solver_diagnostics == {"trivial_solution": 1}
+
+
+class _SolverReached(Exception):
+    """Raised by a stub SolverFactory: the solve got as far as the optimizer"""
+
+
+def _stub_solver(*args: Any, **kwargs: Any) -> None:
+    raise _SolverReached
+
+
+def _cbc_messages(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "modems.milp" and r.levelno == logging.WARNING
+    ]
+
+
+def test_every_cbc_solve_warns_about_its_limitations(monkeypatch, caplog) -> None:
+    monkeypatch.setattr(milp_module, "SolverFactory", _stub_solver)
+    model = ModemsMilp(line_scenario(ONE_REQUEST), "milp3", "closed_selective")
+    for _ in range(2):
+        with pytest.raises(_SolverReached):
+            model.solve("cbc", "cbc")
+    assert _cbc_messages(caplog) == [CBC_LIMITATIONS_MESSAGE] * 2
+    for topic in ("lower bound", "duality gap", "unknown", "appsi_highs"):
+        assert topic in CBC_LIMITATIONS_MESSAGE
+
+
+@pytest.mark.parametrize(
+    "solver, warn_cbc", [(("appsi_highs", "highs"), True), (("cbc", "cbc"), False)]
+)
+def test_other_solvers_and_opted_out_solves_do_not_warn(
+    monkeypatch, caplog, solver: tuple[str, str], warn_cbc: bool
+) -> None:
+    monkeypatch.setattr(milp_module, "SolverFactory", _stub_solver)
+    model = ModemsMilp(line_scenario(ONE_REQUEST), "milp3", "closed_selective")
+    with pytest.raises(_SolverReached):
+        model.solve(*solver, warn_cbc=warn_cbc)
+    assert _cbc_messages(caplog) == []
+
+
+def test_trivial_instances_do_not_warn_about_cbc(monkeypatch, caplog) -> None:
+    """The optimizer never runs on a trivial instance, so CBC is not involved"""
+    monkeypatch.setattr(milp_module, "SolverFactory", _no_solver)
+    ModemsMilp(line_scenario([]), "milp3", "closed_selective").solve("cbc", "cbc")
+    assert _cbc_messages(caplog) == []
+
+
+def test_the_cbc_warning_can_be_silenced(caplog) -> None:
+    caplog.set_level(logging.ERROR, logger="modems.milp")
+    milp_module.warn_cbc_limitations()
+    assert _cbc_messages(caplog) == []
 
 
 @pytest.mark.parametrize(

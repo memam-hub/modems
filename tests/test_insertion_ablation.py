@@ -19,9 +19,11 @@ from modems.benchmark import ManifestPhase, ManifestStatus
 from modems.core import DEFAULT_PARAMS_OBJ, ScenarioTiming, ScenarioType
 from modems.generator import SocRangeSpec
 from modems.insertion_ablation import (
+    CORPUS_COMPARISON_SPEEDUPS,
     INSERTION_VARIANT_FCNS,
     InsertionAblationMetric,
     InsertionVariant,
+    _write_corpus_comparison_latex,
     ablation_table_rows,
     build_ablation_table,
     build_measurement_scenario,
@@ -255,13 +257,20 @@ def test_pipeline_measures_every_variant_and_builds_the_table(tmp_path) -> None:
         for r in build_ablation_table(str(tmp_path), rows_per_block=1, formats="all")
     }
     small_row, large_row = rows["I0_a1r6RU80_100"], rows["I0_a1r12RU80_100"]
-    assert small_row[InsertionAblationMetric.speedup_V0_V3] == pytest.approx(
-        small_row[InsertionAblationMetric.t_exe_V0]
-        / small_row[InsertionAblationMetric.t_exe_V3]
-    )
-    assert large_row[InsertionAblationMetric.t_exe_V0] is None
-    assert large_row[InsertionAblationMetric.speedup_V0_V3] is None
-    assert large_row[InsertionAblationMetric.speedup_V2_V3] is not None
+    metric = InsertionAblationMetric
+    for speedup, slow, fast in (
+        (metric.speedup_V0_V1, metric.t_exe_V0, metric.t_exe_V1),
+        (metric.speedup_V1_V2, metric.t_exe_V1, metric.t_exe_V2),
+        (metric.speedup_V2_V3, metric.t_exe_V2, metric.t_exe_V3),
+        (metric.speedup_V0_V3, metric.t_exe_V0, metric.t_exe_V3),
+    ):
+        assert small_row[speedup] == pytest.approx(small_row[slow] / small_row[fast])
+    assert large_row[metric.t_exe_V0] is None
+    # V0/V1 are skipped on the large point: only V2/V3 can be computed
+    assert large_row[metric.speedup_V0_V1] is None
+    assert large_row[metric.speedup_V1_V2] is None
+    assert large_row[metric.speedup_V0_V3] is None
+    assert large_row[metric.speedup_V2_V3] is not None
     assert (tmp_path / "ablation_table.tex").read_text().count(r"\begin{table") == 2
     with open(tmp_path / "ablation_table.csv") as f:
         assert len(list(csv.DictReader(f))) == 2
@@ -363,13 +372,18 @@ def test_corpus_comparison_end_to_end(tmp_path) -> None:
         str(tmp_path / "stress"),
         str(tmp_path / "cmp"),
         bucket_size=100,
+        formats="all",
     )
-    (bucket,) = comparison
-    assert bucket["nr_a"] == bucket["nr_b"] == 1
-    assert math.isclose(bucket["ratio_b_to_a"], bucket["mean_b"] / bucket["mean_a"])
+    # one bucket per metric, the four speedups by default, appended in table order
+    assert [row["metric"] for row in comparison] == list(CORPUS_COMPARISON_SPEEDUPS)
+    for bucket in comparison:
+        assert bucket["nr_a"] == bucket["nr_b"] == 1
+        assert math.isclose(bucket["ratio_b_to_a"], bucket["mean_b"] / bucket["mean_a"])
     assert json.loads(
         (tmp_path / "cmp" / "corpus_comparison.json").read_text()
     ) == json.loads(json.dumps(comparison, default=str))
+    tex = (tmp_path / "cmp" / "corpus_comparison.tex").read_text()
+    assert r"{$[0, 100)$}" in tex and "landscape" not in tex
     assert (tmp_path / "cmp" / "corpus_comparison.csv").exists()
     # the comparison only reads the corpora, it never writes into them
     for name in ("normal", "stress"):
@@ -380,3 +394,72 @@ def test_corpus_comparison_end_to_end(tmp_path) -> None:
     assert (rows_a[0]["nr_requests"], rows_a[0]["nr_agents"]) == (6, 1)
     figure = plot_corpus_comparison(rows_a, rows_b, str(tmp_path / "cmp" / "c.png"))
     assert os.path.getsize(figure) > 0
+
+
+def test_corpus_comparison_selects_metrics(tmp_path) -> None:
+    for name, soc in (
+        ("normal", SocRangeSpec.normal()),
+        ("stress", SocRangeSpec.stress()),
+    ):
+        generate(tmp_path / name, soc_range=soc)
+        solve_ablation_suite(str(tmp_path / name), nr_measure_repeats=1)
+    args = (str(tmp_path / "normal"), str(tmp_path / "stress"), str(tmp_path / "cmp"))
+    comparison = write_corpus_comparison(
+        *args, bucket_size=100, metrics=["speedup_V0_V3", "t_exe_V3"]
+    )
+    assert [row["metric"] for row in comparison] == ["speedup_V0_V3", "t_exe_V3"]
+    with pytest.raises(ValueError, match="at least one"):
+        write_corpus_comparison(*args, metrics=[])
+    with pytest.raises(ValueError):
+        write_corpus_comparison(*args, metrics=["no_such_metric"])
+
+
+def _bucket(start: int, metric: str, mean_a: float | None, mean_b: float | None):
+    return {
+        "route_bucket_start": start,
+        "route_bucket_end": start + 10,
+        "metric": metric,
+        "mean_a": mean_a,
+        "mean_b": mean_b,
+    }
+
+
+def test_corpus_comparison_latex_layout(tmp_path) -> None:
+    """One row per bucket, one (A, B) column pair per metric, V0/V3 set apart"""
+    metrics = list(CORPUS_COMPARISON_SPEEDUPS)
+    comparison = [
+        _bucket(start, m.value, 1.0 + k, 2.0 + k)
+        for k, m in enumerate(metrics)
+        for start in (0, 10)
+    ]
+    comparison.append(_bucket(20, "speedup_V2_V3", 7.0, None))  # B has no data
+    path = tmp_path / "t.tex"
+    _write_corpus_comparison_latex(comparison, str(path), metrics, ("A_x", "B"))
+    tex = path.read_text()
+    assert r"\begin{tabular}{c cc cc cc|| cc}" in tex
+    assert (
+        r"Bucket & \multicolumn{2}{c}{$V0/V1$} & \multicolumn{2}{c}{$V1/V2$} & "
+        r"\multicolumn{2}{c||}{$V2/V3$} & \multicolumn{2}{c}{$V0/V3$} \\"
+    ) in tex
+    assert tex.count(r"A\_x & B") == 4  # corpus labels under every metric, escaped
+    rows = [line for line in tex.splitlines() if line.startswith("{$[")]
+    assert rows[0] == (
+        r"{$[0, 10)$} & 1.00 & 2.00 & 2.00 & 3.00 & 3.00 & 4.00 & 4.00 & 5.00 \\"
+    )
+    # a bucket with data for only some metrics or one corpus shows a dash elsewhere
+    assert rows[2].startswith(r"{$[20, 30)$} & $\mathrm{-}$ & $\mathrm{-}$")
+    assert r"& 7.00 & $\mathrm{-}$ &" in rows[2]
+    assert len(rows) == 3 and tex.count(r"\begin{table}") == 1
+    assert "landscape" not in tex
+
+
+def test_corpus_comparison_latex_without_the_overall_speedup(tmp_path) -> None:
+    path = tmp_path / "t.tex"
+    metrics = [InsertionAblationMetric.t_exe_V3]
+    _write_corpus_comparison_latex(
+        [_bucket(0, "t_exe_V3", 1.0, 2.0)], str(path), metrics
+    )
+    tex = path.read_text()
+    assert r"\begin{tabular}{c cc}" in tex and "||" not in tex
+    assert r"\multicolumn{2}{c}{t\_exe\_V3}" in tex
+    assert "Vi/Vj" not in tex  # the speedup note only applies to speedups

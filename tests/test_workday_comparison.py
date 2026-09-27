@@ -15,7 +15,11 @@ import pytest
 from modems.benchmark import ManifestStatus
 from modems.core import ModemsRequest, ObjectiveType, SolverStrategy
 from modems.rolling_horizon import RequestOutcome, WorkdayLog
-from modems.workday_benchmark import generate_workday_suite, solve_workday_suite
+from modems.workday_benchmark import (
+    WorkdayStartTime,
+    generate_workday_suite,
+    solve_workday_suite,
+)
 from modems.workday_comparison import (
     WorkdayRun,
     _check_pairs,
@@ -24,10 +28,12 @@ from modems.workday_comparison import (
     impact_estimates,
     mean_ci,
     pair_name,
-    representative_pair,
+    representative_group,
     rolling_acceptance,
     start_time_pairs,
     t_critical,
+    workday_group_name,
+    workday_groups,
 )
 
 # --------------------------------------------------------------------------------------
@@ -125,24 +131,67 @@ def _estimate(estimates: list, metric: str, decision: str, group: str) -> dict:
     return match
 
 
-def test_effects_are_paired_differences_with_the_right_groups() -> None:
+def test_each_decision_is_split_by_the_other_two() -> None:
     estimates = impact_estimates(*_suites())
-    objective_milp3 = _estimate(estimates, "delay", "objective", "MILP3")
-    assert (objective_milp3["mean"], objective_milp3["ci"], objective_milp3["n"]) == (
-        1.0,
-        0.0,
-        4,
-    )
-    assert _estimate(estimates, "delay", "objective", "ALNS")["mean"] == 2.0
-    assert _estimate(estimates, "acceptance", "objective", "ALNS")[
+    groups = {
+        decision: [
+            e["group"]
+            for e in estimates
+            if e["metric"] == "delay" and e["decision"] == decision
+        ]
+        for decision in ("objective", "solver", "start_time")
+    }
+    assert groups == {
+        "objective": [
+            "MILP3 · normal",
+            "MILP3 · staggered",
+            "ALNS · normal",
+            "ALNS · staggered",
+        ],
+        "solver": [
+            "closed · normal",
+            "closed · staggered",
+            "open · normal",
+            "open · staggered",
+        ],
+        "start_time": [
+            "MILP3 · closed",
+            "MILP3 · open",
+            "ALNS · closed",
+            "ALNS · open",
+        ],
+    }
+    levels = [
+        e["levels"]
+        for e in estimates
+        if e["metric"] == "delay" and e["decision"] == "objective"
+    ]
+    assert levels == [(0, 0), (0, 1), (1, 0), (1, 1)]
+
+
+def test_effects_are_first_level_minus_second_level() -> None:
+    """closed - open, MILP3 - ALNS, normal - staggered, on paired workdays"""
+    estimates = impact_estimates(*_suites())
+    for start in ("normal", "staggered"):
+        # one workday pair per demand (rep 0 and 1) with this start time
+        milp3 = _estimate(estimates, "delay", "objective", f"MILP3 · {start}")
+        assert (milp3["mean"], milp3["ci"], milp3["n"]) == (-1.0, 0.0, 2)
+        assert _estimate(estimates, "delay", "objective", f"ALNS · {start}")[
+            "mean"
+        ] == pytest.approx(-2.0)
+        assert _estimate(estimates, "delay", "solver", f"closed · {start}")[
+            "mean"
+        ] == pytest.approx(-0.5)
+        assert _estimate(estimates, "delay", "solver", f"open · {start}")[
+            "mean"
+        ] == pytest.approx(-1.5)
+    assert _estimate(estimates, "acceptance", "objective", "ALNS · normal")[
         "mean"
-    ] == pytest.approx(10.0)
-    assert _estimate(estimates, "delay", "solver", "closed")["mean"] == 0.5
-    assert _estimate(estimates, "delay", "solver", "open")["mean"] == 1.5
-    # start time: paired on identical demand, one pair per demand (rep 0 and 1)
-    start = _estimate(estimates, "delay", "start_time", "MILP3")
-    assert (start["mean"], start["ci"], start["n"]) == (2.0, 0.0, 2)
-    travel = _estimate(estimates, "travel", "objective", "MILP3")
+    ] == pytest.approx(-10.0)
+    for group in ("MILP3 · closed", "MILP3 · open", "ALNS · closed", "ALNS · open"):
+        start = _estimate(estimates, "delay", "start_time", group)
+        assert (start["mean"], start["ci"], start["n"]) == (-2.0, 0.0, 2)
+    travel = _estimate(estimates, "travel", "objective", "MILP3 · normal")
     assert travel["mean"] == 0.0  # 10 min per served request in every run
 
 
@@ -150,20 +199,57 @@ def test_metrics_without_served_requests_are_skipped() -> None:
     closed, opened = _suites()
     opened["W0_SRUN5_0"].results[SolverStrategy.milp3] = _result(0.0, 0.0, served=0)
     estimates = impact_estimates(closed, opened)
-    assert _estimate(estimates, "delay", "objective", "MILP3")["n"] == 3
-    assert _estimate(estimates, "acceptance", "objective", "MILP3")["n"] == 4
+    assert _estimate(estimates, "delay", "objective", "MILP3 · normal")["n"] == 1
+    assert _estimate(estimates, "delay", "objective", "MILP3 · staggered")["n"] == 2
+    assert _estimate(estimates, "acceptance", "objective", "MILP3 · normal")["n"] == 2
 
 
-def test_representative_pair_prefers_the_busiest_workday_with_surges() -> None:
+def test_group_name_drops_the_objective_and_start_time_letters() -> None:
     closed, opened = _suites()
-    assert representative_pair(closed, opened) == "W1_SRUS5_0"  # busiest overall
-    busy = _run("closed", 1, "normal", _result(1, 1), _result(1, 1), surges=2)
-    closed[busy.pair] = busy
-    opened[busy.pair] = _run(
-        "open", 1, "normal", _result(1, 1), _result(1, 1), surges=2
+    names = {workday_group_name(r) for r in [*closed.values(), *opened.values()]}
+    assert names == {"W0_SRU5_0", "W1_SRU5_0"}
+    assert workday_group_name(_run("open", 3, "staggered", {}, {}, surges=4)) == (
+        "W3_SRU5_4"
     )
-    assert representative_pair(closed, opened) == busy.pair
-    assert representative_pair({}, {}) is None
+
+
+def test_workday_groups_gather_every_run_of_one_demand() -> None:
+    closed, opened = _suites()
+    groups = workday_groups(closed, opened)
+    assert list(groups) == ["W0_SRU5_0", "W1_SRU5_0"]
+    assert set(groups["W0_SRU5_0"]) == {
+        (ObjectiveType(o), WorkdayStartTime(t))
+        for o in ("closed", "open")
+        for t in ("normal", "staggered")
+    }
+    assert all(run.row["repetition"] == 0 for run in groups["W0_SRU5_0"].values())
+    # a different seed is a different demand, and one objective alone is no group
+    for run in (closed["W0_SRUS5_0"], opened["W0_SRUS5_0"]):
+        run.row["seed"] = 99
+    del opened["W1_SRUN5_0"], opened["W1_SRUS5_0"]
+    groups = workday_groups(closed, opened)
+    assert {name: len(group) for name, group in groups.items()} == {"W0_SRU5_0": 2}
+    assert workday_groups({}, {}) == {}
+
+
+def test_representative_group_prefers_complete_busy_groups_with_surges() -> None:
+    closed, opened = _suites()
+    groups = workday_groups(closed, opened)
+    assert representative_group(groups) == "W1_SRU5_0"  # busiest overall
+    assert representative_group({}) is None
+
+    def add(objective: str, start: str, surges: int) -> None:
+        run = _run(objective, 0, start, _result(1, 1), _result(1, 1), surges=surges)
+        (closed if objective == "closed" else opened)[run.pair] = run
+
+    # with surges but only one start time: complete groups come first
+    for objective in ("closed", "open"):
+        add(objective, "normal", surges=2)
+    assert representative_group(workday_groups(closed, opened)) == "W1_SRU5_0"
+    # complete and with surges: preferred over a busier group without surges
+    for objective in ("closed", "open"):
+        add(objective, "staggered", surges=2)
+    assert representative_group(workday_groups(closed, opened)) == "W0_SRU5_2"
 
 
 def test_start_times_pair_only_on_identical_demand() -> None:
@@ -175,7 +261,8 @@ def test_start_times_pair_only_on_identical_demand() -> None:
             if run.row["start_time"] == "staggered":
                 run.row["seed"] += 100
     assert start_time_pairs(closed, opened) == []
-    start = _estimate(impact_estimates(closed, opened), "delay", "start_time", "ALNS")
+    estimates = impact_estimates(closed, opened)
+    start = _estimate(estimates, "delay", "start_time", "ALNS · closed")
     assert (start["mean"], start["n"]) == (None, 0)
 
 
@@ -275,12 +362,22 @@ def test_comparison_end_to_end(tmp_path: Path, suites: tuple[Path, Path]) -> Non
     }
     assert result["nr_start_time_pairs"] == 2
     assert all(Path(p).stat().st_size > 0 for p in result["figures"].values())
-    assert len(list((tmp_path / "workdays").glob("*.png"))) == 4
+    # one figure per demand: 2 repetitions, each with both start times
+    assert sorted(p.name for p in (tmp_path / "workdays").glob("*.png")) == [
+        "W0_SRU8_0.png",
+        "W1_SRU8_0.png",
+    ]
+    assert Path(result["figures"]["workday"]).name == (
+        f"most_demand_{result['representative']}.png"
+    )
     assert {e["decision"] for e in result["estimates"]} == {
         "objective",
         "solver",
         "start_time",
     }
+    # at most one workday pair per demand; acceptance is defined for every run
+    assert all(e["n"] <= 2 for e in result["estimates"])
+    assert all(e["n"] == 2 for e in result["estimates"] if e["metric"] == "acceptance")
 
 
 @pytest.mark.integration

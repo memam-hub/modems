@@ -14,18 +14,22 @@ python3 compare_workday_objectives.py --closed C --open O      # closed vs open 
 ```
 
 `_cli_common.py` is utility to handle shared arguments and progress printing.
-`run_full_benchmark.sh` runs every suite with the paper's settings (several hours).
+`run_full_benchmark.sh` runs every suite with the paper's settings (several hours): the
+insertion ablation (1-3 agents, 10-60 requests, both SoC corpora), one plotted static
+scenario, the static suite (54 scenarios x 4 solvers), both workday suites (24
+workdays per objective), and their comparison, all with seed 42 and Gurobi. Every
+suite resumes from its manifest, so delete the previous output folders for a clean run.
 
 **Outputs.** Each suite writes figures (PNG) and result tables. Tables are written as
 `csv,json` by default; every script takes `--export-formats` with a comma-separated
-selection of `csv`, `json`, `tex`, or `all` (e.g., `--export-formats all` to also get
+selection of `csv`, `json`, `tex`, or `all` (e.g. `--export-formats all` to also get
 the LaTeX tables).
 
 **Seeds.** A seed depends only on what defines a scenario or workday, never on a
 decision (solver, objective, workday start time, insertion variant), so every decision
 is compared on identical demand. Scenario parameters left out of a seed pair up too:
-static scenarios that differ only in timing (or SoC range) share their agents,
-stations, and loads, and the two ablation corpora share their scenarios.
+static scenarios that differ only in SoC range share everything else, and the two
+ablation corpora share their scenarios.
 
 ## run_suite.py
 
@@ -56,7 +60,7 @@ scale), and the share of each final status.
 | `--alns-max-iter` | `1000` | ALNS exit criteria, number of `NoImprovement` iterations |
 | `--table-name` | `benchmark_table` | Output file basename |
 | `--export-formats` | `csv,json` | Table formats: any of `csv`,`json`,`tex`, or `all` |
-| `--rows-per-block` | `40` | `.tex` rows per `table*` block |
+| `--rows-per-block` | `36` | `.tex` rows per `table*` block |
 | `--plots` | off | Per-result `instance.plot()` + ALNS convergence/operator charts |
 
 Generated table columns: scenario, objective type, solver, baseline objective, status,
@@ -104,7 +108,7 @@ workday) plus a per-workday `requests_table.{csv,json,tex}`.
 | `--timings` | `uniform peaks` | `ScenarioTiming`: shape of the base demand over the workday; `peaks` puts half of it in two plateaus at 1/3 and 2/3 of the day |
 | `--start-times` | `normal staggered` | `WorkdayStartTime`: `normal`, all agents start at t=0; `staggered`, agent i (0-indexed) starts at `i * workday/5` |
 | `--base-rates` | `5 8` | Baseline request submissions per hour (integers) |
-| `--nr-surges` | `1` | Surges per workday: 30-minute windows that each add one hour of base-rate demand, never overlapping each other or the peaks, and kept 30 (`uniform`) or 15 (`peaks`) minutes apart from both. Raises if they do not fit: at most 8 (`uniform`) or 5 (`peaks`) in a 480-minute workday |
+| `--nr-surges` | `3` | Surges per workday: 30-minute windows that each add one hour of base-rate demand, never overlapping each other or the peaks, and kept 30 (`uniform`) or 15 (`peaks`) minutes apart from both. Raises if they do not fit: at most 8 (`uniform`) or 5 (`peaks`) in a 480-minute workday |
 | `--objective` | `closed` | Same as above; with `open`, an available agent stays at its last node, going to a hub only to recharge |
 | `--workday` | `480.0` | Workday length (minutes) over which requests are submitted; each simulation then drains until every accepted request is delivered (capped at 240 minutes past the workday) |
 | `--table-name` | `summary_table` | Output file basename for the workday summary |
@@ -112,7 +116,7 @@ workday) plus a per-workday `requests_table.{csv,json,tex}`.
 | `--clock-display-start` | `08:00` | Workday starting clock time for formatting clock-time columns |
 | `--plots` | off | Dual-axis (cumulative accept/reject rate vs. agent SoC) plot per (workday, solver) |
 
-Plus `--nr-repeats` (default **1**) / `--seed`/`--smoke`/`--retry-failed`/
+Plus `--nr-repeats` (default **1**) / `--phase`/`--seed`/`--smoke`/`--retry-failed`/
 `--solver-name`/`--solver-config-type`/`--milp-timelimit`/`--alns-max-iter`/
 `--export-formats`/`--rows-per-block` as `run_suite.py`.
 
@@ -133,16 +137,17 @@ where `obj`, `idx`, `size`, `type`, and `timing` read as in the scenario names, 
 
 Examples:
 
-- `WC0_LMUN5_2`: closed objective, repetition 0, large (3 agents), mixed, uniform,
-  normal start, 5 requests per hour, 2 surges.
-- `WO1_MRPS8_3`: open objective, repetition 1, medium (2 agents), random, peaks,
-  staggered start, 8 requests per hour, 3 surges.
+- `WC0_LMUN5_3`: closed objective, repetition 0, large (3 agents), mixed, uniform,
+  normal start, 5 requests per hour, 3 surges.
+- `WO1_MRPS8_4`: open objective, repetition 1, medium (2 agents), random, peaks,
+  staggered start, 8 requests per hour, 4 surges.
 
 
 ## run_ablation_suite.py
 
 By default, generates + solves + builds **both** corpora (normal-SoC and SoC-stress)
-and their comparison, in one command. Full default run: ~25 minutes at normal hardware.
+and their comparison, in one command. Full default run: roughly half an hour on normal
+hardware (288 points per corpus).
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -150,7 +155,7 @@ and their comparison, in one command. Full default run: ~25 minutes at normal ha
 | `--corpus` | `both` | `both`/`normal`/`stress`/`custom` -- which corpus/corpora to generate/solve/build. `normal`/`stress`/`custom` alone skip the comparison |
 | `--soc-custom` | none | `LB UB` custom SoC bounds (`0 < LB <= UB <= 1.0`), with `--corpus custom` |
 | `--agent-counts` | `1 2` | Agent counts to sweep |
-| `--request-counts` | `10 15 ... 60` | Request counts to sweep, shared by both corpora |
+| `--request-counts` | `10 15 20 25 30 40 50 60` | Request counts to sweep, shared by both corpora |
 | `--nr-probes` | `3` | Requests held out per point/combination as insertion probes |
 | `--variants` | all four | Which `InsertionVariant`s to measure |
 | `--nr-measure-repeats` | `5` | Repeated timed calls per (point, probe, variant), averaged for stability |
@@ -160,14 +165,14 @@ and their comparison, in one command. Full default run: ~25 minutes at normal ha
 | `--bucket-size` | `10` | Comparison route-length bucket width (stops) |
 | `--metric` | `speedup_V2_V3` | Comparison metric: `InsertionAblationMetric` |
 
-Plus `--types`/`--timings`/`--nr-repeats`/`--seed`/`--smoke`/`--retry-failed`/
-`--rows-per-block` as `run_suite.py`. The built-in SoC ranges are `(0.8, 1.0)` normal,
+Plus `--phase`/`--types`/`--timings`/`--nr-repeats` (default 3)/`--seed`/`--smoke`/
+`--retry-failed`/`--export-formats`/`--rows-per-block` as `run_suite.py`. The built-in SoC ranges are `(0.8, 1.0)` normal,
 `(0.5, 0.7)` stress; `--corpus custom --soc-custom LB UB` tests any other range,
 written under its own `custom/` subdirectory (comparison against it is skipped,
 same as `normal`/`stress` alone).
 
 Generated table columns: one row per point (`nr_agents`,`nr_requests`, spatial type,
-timing, repetition), each variant's mean per-probe wall-clock time, `V0/V3` and
+timing, SoC range, repetition), each variant's mean per-probe wall-clock time, `V0/V3` and
 `V2/V3` speedup ratios, achieved `mean_route_length`, and V3's own analysis metrics:
 pruned-pairs and prefix/suffix-propagation. The comparison table buckets both corpora
 by `mean_route_length` and reports the chosen `metric`'s mean per bucket side by side,
@@ -196,7 +201,7 @@ Each corpus also gets `insertion_variants.png` (per agent count: time per probe 
 every variant and the V3 speedups, as boxes per request count), and `comparison/`
 gets `normal_vs_stress.png` (one panel per metric: time, speedups, pruned position
 pairs, route length, the two corpora side by side per request count). With figures,
-the default grid (11 request counts x 2 agent counts x 3 types x 2 timings) plus a few
+the default grid (8 request counts x 2 agent counts x 3 types x 2 timings) plus a few
 repetitions stays readable.
 
 ## compare_ablation_corpora.py

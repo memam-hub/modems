@@ -3,7 +3,7 @@ Run the Algorithm 3 insertion-candidate ablation (check modems.insertion_ablatio
 by default, generates + solves + builds both corpora (normal-SoC and SoC-stress)
 and their comparison.
 
-Full default run: ~25 minutes. Use --smoke for a small (~1-2 minute) sanity run
+Full default run: roughly half an hour. Use --smoke for a small (~1-2 minute) sanity run
 that exercises the exact same pipeline (both corpora, both tables, the comparison)
 at a small enough scale to finish quickly, including exporting/writing every file.
 

@@ -31,6 +31,7 @@ from modems.benchmark import (
     write_table_files,
 )
 from modems.core import (
+    DEFAULT_BASE_SEED,
     ModemsAgent,
     ModemsRequest,
     ScenarioSize,
@@ -213,7 +214,7 @@ def test_generation_writes_one_scenario_and_one_pending_row_per_solver(
     assert set(manifest) == {(n, s) for n in names for s in ("milp3", "alns")}
     for row in manifest.values():
         assert row["status"] == "pending" and row["objective_type"] == objective
-        assert row["nr_agents"] == 1 and 4 <= row["nr_requests"] <= 6
+        assert row["nr_agents"] == 1 and 4 <= row["nr_requests"] <= 8
     raw = json.loads((tmp_path / "manifest.json").read_text())
     assert isinstance(raw, dict) and len(raw) == 4
 
@@ -424,13 +425,21 @@ def test_alns_seed_is_the_scenario_seed_shared_by_every_decision(
     assert len(received) == 4 and set(received) == seeds
 
 
-def test_rows_without_a_stored_seed_fail_with_a_clear_error(tmp_path) -> None:
+def test_rows_without_a_stored_seed_fall_back_to_the_default_seed(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     generate(tmp_path, solver_strategies=["alns"])
     path = tmp_path / "manifest.json"
     data = json.loads(path.read_text())
     for row in data.values():
         row.pop("seed")
     path.write_text(json.dumps(data))
-    (outcome,) = solve_benchmark_suite(str(tmp_path))
-    assert outcome["status"] == ManifestStatus.failed
-    assert "regenerate the suite" in outcome["error"]
+    received: list[int] = []
+
+    def fake_solve_one(*args: Any, seed: int, **kwargs: Any) -> None:
+        received.append(seed)
+        raise RuntimeError("stop after recording the seed")
+
+    monkeypatch.setattr(benchmark_module, "_solve_one", fake_solve_one)
+    solve_benchmark_suite(str(tmp_path))
+    assert received == [DEFAULT_BASE_SEED]

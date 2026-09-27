@@ -260,10 +260,10 @@ def test_resolve_problem_type_default_and_explicit_selectivity(
 @pytest.mark.parametrize(
     "nr_agents, nr_requests, size",
     [
-        (1, 6, ScenarioSize.small),
-        (1, 7, ScenarioSize.medium),
-        (2, 10, ScenarioSize.medium),
-        (2, 11, ScenarioSize.large),
+        (1, 8, ScenarioSize.small),
+        (1, 9, ScenarioSize.medium),
+        (2, 12, ScenarioSize.medium),
+        (2, 13, ScenarioSize.large),
         (3, 1, ScenarioSize.large),
         (9, 99, ScenarioSize.large),
     ],

@@ -56,7 +56,7 @@ with CBC the gap panel only holds proven optima.
 | `--seed` | `42` | Base seed |
 | `--smoke` | off | Small, quick sanity run (<=2 min) |
 | `--retry-failed` | off | Also retry `failed` runs/rows |
-| `--solver-name` | `cbc` | Passed to pyomo's `SolverFactory` for MILP1/2/3 |
+| `--solver-name` | `cbc` | Passed to pyomo's `SolverFactory` for MILP1/2/3. With CBC, each MILP solve logs a notice of its limitations (once per simulation in the workday suite); `appsi_highs` with `--solver-config-type highs` avoids them |
 | `--solver-config-type` | `cbc` | `cbc`/`gurobi`/`highs` (option-key convention) |
 | `--milp-timelimit` | `60.0` | Seconds, MILP solving budget |
 | `--alns-max-iter` | `1000` | ALNS exit criteria, number of `NoImprovement` iterations |

@@ -39,7 +39,18 @@ print(milp.instance.solution_info.objective, alns.instance.solution_info.objecti
 
 `solver_name` is the name passed to pyomo's `SolverFactory` (`"cbc"`, `"appsi_highs"`,
 `"gurobi"`); `solver_config_type` (`cbc`, `highs`, `gurobi`) selects how generic options
-such as `timelimit` are translated for that solver. Every solved model exposes
+such as `timelimit` are translated for that solver.
+
+> **CBC limitations.** CBC is the default because it needs no extra install or license,
+> but it is the least reliable backend here: a CBC run stopped by its time limit reports
+> no lower bound (so no duality gap), and time-limited runs often end without a valid
+> incumbent (status `unknown`, no objective; in a workday simulation that epoch adopts no
+> plan and rejects its new requests). Every CBC MILP solve logs this notice (once per
+> simulation for workdays); silence it with
+> `logging.getLogger("modems.milp").setLevel(logging.ERROR)`. Prefer HiGHS
+> (`solver_name="appsi_highs", solver_config_type="highs"`) or Gurobi.
+
+Every solved model exposes
 `.instance` (`ModemsInstance`), which round-trips losslessly through
 `to_json()`/`from_json()` and plots everything with `.plot(outdir)`.
 

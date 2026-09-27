@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from enum import StrEnum
 from typing import Any
@@ -55,6 +56,29 @@ _SOLVER_OPTION_KEY_MAP = {
 
 # default MILP solver data
 DEFAULT_MILP_SOLVER_DATA: tuple[str, SolverConfigType] = ("cbc", SolverConfigType.cbc)
+
+
+logger = logging.getLogger(__name__)
+
+CBC_LIMITATIONS_MESSAGE = (
+    "MILP solved with CBC, which limits the results: (1) a CBC run stopped by its "
+    "time limit reports no lower bound, so it has no duality gap (blank Gap%, left out "
+    "of the solver_comparison gap panel); (2) time-limited CBC runs often end without "
+    "a valid incumbent and are reported as 'unknown' with no objective, and in a "
+    "workday simulation such an epoch adopts no plan and rejects its new requests, "
+    "lowering the MILP acceptance rate; (3) the 'threads' option is ignored. Prefer "
+    "HiGHS (pip install -e \".[highs]\"; solver_name='appsi_highs', "
+    "solver_config_type='highs') or Gurobi"
+)
+
+
+def warn_cbc_limitations() -> None:
+    """
+    Log CBC's limitations and their impact (logger "modems.milp", WARNING level):
+    printed to stderr every time unless logging is configured otherwise, e.g.,
+    logging.getLogger("modems.milp").setLevel(logging.ERROR) silences it
+    """
+    logger.warning(CBC_LIMITATIONS_MESSAGE)
 
 
 class MilpType(StrEnum):
@@ -973,6 +997,7 @@ class ModemsMilp:
         tee: bool = False,
         print_results: bool = False,
         warm_start_solution: ModemsSolution | None = None,
+        warn_cbc: bool = True,
     ) -> Any | None:
         """
         Solve the MILP model
@@ -988,6 +1013,9 @@ class ModemsMilp:
             tee: Print solver output
             print_results: Print solver results
             warm_start_solution: Optional incumbent used to warm-start the solver
+            warn_cbc: Log CBC's limitations (check warn_cbc_limitations) when the
+                optimizer runs with the cbc configuration; callers that solve many
+                MILPs in one run (e.g., a workday simulation) warn once themselves
         """
         self.solver_type = solver_name
         self.solver_config_type = SolverConfigType(solver_config_type)
@@ -1004,6 +1032,8 @@ class ModemsMilp:
                 )
             return None
 
+        if warn_cbc and self.solver_config_type == SolverConfigType.cbc:
+            warn_cbc_limitations()
         self.solver = SolverFactory(solver_name)
         if solver_name == "cbc" and not self.solver.available(exception_flag=False):
             # PuLP wheels bundle CBC but do not consistently expose it on PATH

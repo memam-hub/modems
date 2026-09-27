@@ -668,6 +668,8 @@ class RollingHorizonSimulator:
         self.alns_seed = alns_seed
         self.solver_name = solver_name
         self.solver_config_type = solver_config_type
+        # CBC's limitations are shown once per simulation, not once per epoch
+        self._cbc_warned = False
         self.objective = objective
 
         agent_ids = [a.agent_id for a in agents]
@@ -907,11 +909,16 @@ class RollingHorizonSimulator:
                         problem_type=problem_type,
                         milp_params=self.model_params,
                     )
+                    # warn at the first solve that runs the optimizer (a trivial
+                    # instance does not), even if that solve then fails
+                    warn_cbc = not self._cbc_warned and not model.is_trivial
+                    self._cbc_warned = self._cbc_warned or warn_cbc
                     model.solve(
                         solver_name=self.solver_name,
                         solver_config_type=self.solver_config_type,
                         solver_options={"timelimit": self.milp_timelimit},
                         warm_start_solution=warm_start,
+                        warn_cbc=warn_cbc,
                     )
                     results[key] = model.instance
             except Exception as excp:

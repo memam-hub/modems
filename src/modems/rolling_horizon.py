@@ -631,8 +631,10 @@ class RollingHorizonSimulator:
         solver_name: str = DEFAULT_MILP_SOLVER_DATA[0],
         solver_config_type: SolverConfigType = DEFAULT_MILP_SOLVER_DATA[1],
         objective: ObjectiveType = ObjectiveType.closed,
+        alns_seed: int = DEFAULT_BASE_SEED,
     ) -> None:
         """
+        alns_seed: pass the workday seed to the ALNS solver for consistent results
         objective: closed or open, every solver problem type is resolved from it
             (check resolve_problem_type). With an open objective, an available agent
             stays at its last route node instead of driving to its final hub
@@ -663,6 +665,7 @@ class RollingHorizonSimulator:
         self.single_solver = single_solver
         self.milp_timelimit = milp_timelimit
         self.alns_max_iter = alns_max_iter
+        self.alns_seed = alns_seed
         self.solver_name = solver_name
         self.solver_config_type = solver_config_type
         self.objective = objective
@@ -875,7 +878,7 @@ class RollingHorizonSimulator:
                         model_params=self.model_params,
                     )
                     model.solve(
-                        seed=DEFAULT_BASE_SEED,
+                        seed=self.alns_seed,
                         max_iter=self.alns_max_iter,
                         partial_plan=partial_plan,
                     )
@@ -1438,6 +1441,7 @@ def compare_solvers_one_workday(
     solver_config_type: SolverConfigType = DEFAULT_MILP_SOLVER_DATA[1],
     workday_logs_out: dict[SolverStrategy, WorkdayLog] | None = None,
     objective: ObjectiveType = ObjectiveType.closed,
+    alns_seed: int = DEFAULT_BASE_SEED,
 ) -> dict[str, dict[str, Any]]:
     """
     Run the identical submitted requests stream through two independent, single-solver
@@ -1461,6 +1465,7 @@ def compare_solvers_one_workday(
             solver_name=solver_name,
             solver_config_type=solver_config_type,
             objective=objective,
+            alns_seed=alns_seed,
         )
         workday = WorkdaySimulation(rh_simulator, request_submissions, workday_length)
         log = workday.run()
@@ -1514,6 +1519,7 @@ def compare_solvers_over_workdays(
             solver_name=solver_name,
             solver_config_type=solver_config_type,
             objective=objective,
+            alns_seed=seed,
         )
         record = {"workday": idx, "seed": seed, **summaries}
         results.append(record)

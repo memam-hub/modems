@@ -28,6 +28,7 @@ import os
 from _cli_common import (
     ParserArgumentName,
     add_cli_arguments,
+    formats_suffix,
     make_progress_printer,
     resolve_cli_phase,
     resolve_cli_sizes,
@@ -69,6 +70,7 @@ if __name__ == "__main__":
         ParserArgumentName.milp_timelimit,
         ParserArgumentName.alns_max_iter,
         ParserArgumentName.latex_rows_per_block,
+        ParserArgumentName.export_formats,
         ParserArgumentName.objective,
     ]
     add_cli_arguments(parser, shared_args)
@@ -216,11 +218,14 @@ if __name__ == "__main__":
 
     if ManifestPhase.build in args.phases:
         rows = build_workday_summary_table(
-            args.outdir, table_name=args.table_name, rows_per_block=args.rows_per_block
+            args.outdir,
+            table_name=args.table_name,
+            rows_per_block=args.rows_per_block,
+            formats=args.export_formats,
         )
         print(
             f"{len(rows)} rows written to "
-            f"{args.outdir}/{args.table_name}.{{csv,json,tex}}"
+            f"{args.outdir}/{args.table_name}.{formats_suffix(args.export_formats)}"
         )
         manifest = read_workday_manifest(args.outdir)
         for workday_name, row in sorted(manifest.items()):
@@ -233,10 +238,11 @@ if __name__ == "__main__":
                 table_name=args.requests_table_name,
                 rows_per_block=args.rows_per_block,
                 clock_display_start=args.clock_display_start,
+                formats=args.export_formats,
             )
             print(
                 f"{len(rows)} rows written to {args.outdir}/requests_tables/"
-                f"{workday_name}_{args.requests_table_name}.{{csv,json,tex}}"
+                f"{workday_name}_{args.requests_table_name}.{formats_suffix(args.export_formats)}"
             )
 
         if args.plots:

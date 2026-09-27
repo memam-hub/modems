@@ -22,6 +22,7 @@ import os
 from _cli_common import (
     ParserArgumentName,
     add_cli_arguments,
+    formats_suffix,
     make_progress_printer,
     resolve_cli_phase,
     resolve_cli_sizes,
@@ -43,6 +44,7 @@ from modems.benchmark import (
     ManifestStatus,
     ModemsBenchmarkResult,
     SolverStrategy,
+    plot_benchmark_figure,
     read_manifest,
 )
 from modems.core import ObjectiveType, ScenarioSize, ScenarioTiming, ScenarioType
@@ -70,6 +72,7 @@ if __name__ == "__main__":
         ParserArgumentName.milp_timelimit,
         ParserArgumentName.alns_max_iter,
         ParserArgumentName.latex_rows_per_block,
+        ParserArgumentName.export_formats,
         ParserArgumentName.objective,
     ]
     add_cli_arguments(parser, shared_args)
@@ -159,7 +162,6 @@ if __name__ == "__main__":
     if ManifestPhase.solve in args.phases:
         outcomes = solve_benchmark_suite(
             outdir=args.outdir,
-            seed=args.seed,
             alns_max_iter=args.alns_max_iter,
             milp_timelimit=args.milp_timelimit,
             retry_failed=args.retry_failed,
@@ -181,12 +183,19 @@ if __name__ == "__main__":
 
     if ManifestPhase.build in args.phases:
         rows = build_benchmark_table(
-            args.outdir, table_name=args.table_name, rows_per_block=args.rows_per_block
+            args.outdir,
+            table_name=args.table_name,
+            rows_per_block=args.rows_per_block,
+            formats=args.export_formats,
         )
         print(
             f"{len(rows)} rows written to "
-            f"{args.outdir}/{args.table_name}.{{csv,json,tex}}"
+            f"{args.outdir}/{args.table_name}.{formats_suffix(args.export_formats)}"
         )
+        figure = plot_benchmark_figure(
+            rows, os.path.join(args.outdir, "solver_comparison.png")
+        )
+        print(f"summary figure: {figure}")
 
         if args.plots:
             plots_dir = os.path.join(args.outdir, "plots")

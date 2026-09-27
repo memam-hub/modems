@@ -532,11 +532,11 @@ def scenario_bucket(size: ScenarioSize | str) -> tuple[int, tuple[int, int]]:
     """Return the (nr_agents, (min_requests, max_requests)) bucket data for the size"""
     size = ScenarioSize(size)
     if size == ScenarioSize.small:
-        return (1, (4, 6))
+        return (1, (4, 8))
     elif size == ScenarioSize.medium:
-        return (2, (5, 10))
+        return (2, (5, 12))
     else:
-        return (3, (10, 15))
+        return (3, (10, 20))
 
 
 def scenario_size_of(nr_agents: int, nr_requests: int) -> ScenarioSize:

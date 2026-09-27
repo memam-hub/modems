@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -11,6 +12,7 @@ import numpy as np
 from .benchmark import ManifestStatus
 from .core import ObjectiveType, SolverStrategy
 from .network import RoadNetwork
+from .plotting import draw_hboxes, save_figure, setup_fig_grid
 from .rolling_horizon import RequestOutcome, WorkdayLog
 from .workday_benchmark import (
     BNCH_WORKDAY_PFX,
@@ -29,7 +31,7 @@ SOLVER_COLOR = {SolverStrategy.milp3: "tab:blue", SolverStrategy.alns: "tab:red"
 OBJECTIVE_STYLE = {ObjectiveType.closed: "-", ObjectiveType.open: "--"}
 OBJECTIVE_MARKER = {ObjectiveType.closed: "o", ObjectiveType.open: "^"}
 DEFAULT_ROLLING_WINDOW = 30.0  # minutes of submissions behind each acceptance point
-DEFAULT_DEMAND_BIN = 10.0  # minutes per bar of the demand strip
+DEFAULT_DEMAND_BIN = 15.0  # minutes per bar of the demand strip
 COMBINED_EXTRA_FIELDS = [
     "pair",
     "demand_load",
@@ -87,14 +89,11 @@ _T975 = [12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
          2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042]  # fmt: skip
 
 
-def t_critical(df: float) -> float:
-    """Two-sided 95% t critical value (Cornish-Fisher expansion beyond df = 30)"""
+def t_critical(df: int) -> float:
+    """Two-sided 95% t critical value (the normal 1.96 beyond df = 30)"""
     if df < 1:
         return math.inf
-    if df <= 30:
-        return _T975[int(df) - 1]  # conservative for non-integer (Welch) df
-    z = 1.959964
-    return z + (z**3 + z) / (4 * df) + (5 * z**5 + 16 * z**3 + 3 * z) / (96 * df**2)
+    return _T975[df - 1] if df <= 30 else 1.96
 
 
 def mean_ci(values: list[float]) -> tuple[float, float] | None:
@@ -107,19 +106,6 @@ def mean_ci(values: list[float]) -> tuple[float, float] | None:
     return float(x.mean()), t_critical(len(x) - 1) * float(x.std(ddof=1)) / math.sqrt(
         len(x)
     )
-
-
-def welch_ci(a: list[float], b: list[float]) -> tuple[float, float] | None:
-    """(mean(b) - mean(a), Welch 95% CI half-width); None unless both have n >= 2"""
-    if len(a) < 2 or len(b) < 2:
-        return None
-    xa, xb = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
-    va, vb = xa.var(ddof=1) / len(xa), xb.var(ddof=1) / len(xb)
-    diff = float(xb.mean() - xa.mean())
-    if va + vb == 0.0:
-        return diff, 0.0
-    df = (va + vb) ** 2 / (va**2 / (len(xa) - 1) + vb**2 / (len(xb) - 1))
-    return diff, t_critical(df) * math.sqrt(va + vb)
 
 
 # --------------------------------------------------------------------------------------
@@ -159,10 +145,30 @@ class WorkdayRun:
         return {SolverStrategy(k): WorkdayLog.from_dict(v) for k, v in raw_json.items()}
 
 
+_PATH_FIELDS = ("result_file", "workday_log_file")
+
+
+def _read_manifest_resolved(outdir: str) -> dict[str, dict[str, Any]]:
+    """
+    read_workday_manifest() with file paths usable from any working directory: paths
+    are stored as given at solve time, e.g., relative to the folder the suite was run
+    from (the suite's parent), so a relative path that does not exist as-is is
+    resolved against the suite's parent folder
+    """
+    parent = os.path.dirname(os.path.abspath(outdir))
+    manifest = read_workday_manifest(outdir)
+    for row in manifest.values():
+        for field in _PATH_FIELDS:
+            path = row.get(field)
+            if path and not os.path.isabs(path) and not os.path.exists(path):
+                row[field] = os.path.join(parent, path)
+    return manifest
+
+
 def _load_suite(outdir: str, objective: ObjectiveType) -> dict[str, WorkdayRun]:
     """Solved workdays of one suite keyed by pair name; raises on a wrong objective"""
     runs = {}
-    for name, row in read_workday_manifest(outdir).items():
+    for name, row in _read_manifest_resolved(outdir).items():
         if ObjectiveType(row["objective_type"]) != objective:
             raise ValueError(
                 f"{outdir!r} must only contain {objective} workdays, found {name!r} "
@@ -202,7 +208,7 @@ def _combined_rows(closed_dir: str, open_dir: str) -> tuple[list[dict], list[dic
     """Both manifests and both summaries, ordered by workday, closed before open"""
     manifest_rows, summary_rows = [], []
     for _, outdir in zip(OBJECTIVES, (closed_dir, open_dir)):
-        for name, row in read_workday_manifest(outdir).items():
+        for name, row in _read_manifest_resolved(outdir).items():
             manifest_rows.append({**row, "pair": pair_name(name)})
             summary = workday_summary_row(name, row)
             summary["pair"] = pair_name(name)
@@ -236,23 +242,41 @@ def _combined_rows(closed_dir: str, open_dir: str) -> tuple[list[dict], list[dic
 # --------------------------------------------------------------------------------------
 
 
-def _setup_fig_grid(nrows: int, ncols: int, width: float, height: float, **kwargs):
-    import matplotlib.pyplot as plt
-
-    plt.rc("font", family="serif", size=16)
-    fig, axes = plt.subplots(nrows, ncols, squeeze=False, **kwargs)
-    fig.set_size_inches(width, height, forward=True)
-    for ax in axes.flat:
-        ax.grid(True, alpha=0.5, zorder=-2)
-    return fig, axes
+def demand_key(run: WorkdayRun) -> tuple:
+    """The workday parameters that define its demand, i.e., everything but decisions"""
+    row = run.row
+    return tuple(
+        row[k]
+        for k in ("size", "type", "timing", "base_rate", "nr_surges", "repetition")
+    )
 
 
-def _save(fig, path: str) -> str:
-    import matplotlib.pyplot as plt
-
-    fig.savefig(path, bbox_inches="tight", dpi=300)
-    plt.close(fig)
-    return path
+def start_time_pairs(
+    closed: dict[str, WorkdayRun], opened: dict[str, WorkdayRun]
+) -> list[tuple[dict[ObjectiveType, WorkdayRun], dict[ObjectiveType, WorkdayRun]]]:
+    """
+    (normal, staggered) runs per objective of every workday observed with both start
+    times on identical demand (same seed)
+    """
+    by_key: dict[tuple, dict[WorkdayStartTime, dict[ObjectiveType, WorkdayRun]]] = {}
+    for runs in (closed, opened):
+        for run in runs.values():
+            start = WorkdayStartTime(run.row["start_time"])
+            by_key.setdefault(demand_key(run), {}).setdefault(start, {})[
+                run.objective
+            ] = run
+    pairs = []
+    for key in sorted(by_key, key=str):
+        normal = by_key[key].get(WorkdayStartTime.normal, {})
+        staggered = by_key[key].get(WorkdayStartTime.staggered, {})
+        same_demand = {
+            o: normal[o]
+            for o in normal.keys() & staggered.keys()
+            if normal[o].row["seed"] == staggered[o].row["seed"]
+        }
+        if same_demand:
+            pairs.append((same_demand, {o: staggered[o] for o in same_demand}))
+    return pairs
 
 
 def impact_estimates(
@@ -263,10 +287,11 @@ def impact_estimates(
     95% CI half-width, and the number of workdays behind it
       - objective, per solver: paired open - closed over workdays in both suites
       - solver, per objective: paired ALNS - MILP3 over that suite's workdays
-      - start time, per solver: Welch difference of means, staggered - normal, of the
-        per-workday average over both objectives (closed/open share their demand)
+      - start time, per solver: paired staggered - normal over workdays with identical
+        demand (check start_time_pairs), averaged over both objectives per workday
     """
     pairs = sorted(closed.keys() & opened.keys())
+    start_pairs = start_time_pairs(closed, opened)
     estimates = []
 
     def add(metric, decision, group, estimate, n):
@@ -301,28 +326,19 @@ def impact_estimates(
             ]
             add(metric, "solver", objective.value, mean_ci(diffs), len(diffs))
         for s in SOLVERS:
-            by_start: dict[WorkdayStartTime, list[float]] = {}
-            for p in closed.keys() | opened.keys():
-                values = [
-                    metric.value(runs[p].results[s])
-                    for runs in (closed, opened)
-                    if p in runs and metric.value(runs[p].results[s]) is not None
+            diffs = []
+            for normal, staggered in start_pairs:
+                # staggered - normal of each objective present, averaged per workday
+                per_objective = [
+                    metric.value(staggered[o].results[s])
+                    - metric.value(normal[o].results[s])
+                    for o in normal.keys() & staggered.keys()
+                    if metric.value(staggered[o].results[s]) is not None
+                    and metric.value(normal[o].results[s]) is not None
                 ]
-                if values:
-                    run = closed.get(p) or opened[p]
-                    start = WorkdayStartTime(run.row["start_time"])
-                    by_start.setdefault(start, []).append(float(np.mean(values)))
-            normal, staggered = (
-                by_start.get(WorkdayStartTime.normal, []),
-                by_start.get(WorkdayStartTime.staggered, []),
-            )
-            add(
-                metric,
-                "start_time",
-                SOLVER_LABEL[s],
-                welch_ci(normal, staggered),
-                len(normal) + len(staggered),
-            )
+                if per_objective:
+                    diffs.append(float(np.mean(per_objective)))
+            add(metric, "start_time", SOLVER_LABEL[s], mean_ci(diffs), len(diffs))
     return estimates
 
 
@@ -344,7 +360,7 @@ DECISION_TITLES = {
 def plot_impacts(estimates: list[dict[str, Any]], path: str) -> str:
     """Figure 1: rows = outcomes, columns = decisions, dot + 95% CI per group"""
     decisions = list(DECISION_TITLES)
-    fig, axes = _setup_fig_grid(len(METRICS), len(decisions), 18.0, 3.0 * len(METRICS))
+    fig, axes = setup_fig_grid(len(METRICS), len(decisions), 18.0, 3.0 * len(METRICS))
     for i, metric in enumerate(METRICS):
         row = [e for e in estimates if e["metric"] == metric.key]
         finite = [
@@ -392,7 +408,7 @@ def plot_impacts(estimates: list[dict[str, Any]], path: str) -> str:
             if j == 0:
                 ax.set_ylabel(metric.label)
     fig.tight_layout()
-    return _save(fig, path)
+    return save_figure(fig, path)
 
 
 def plot_demand(runs: list[WorkdayRun], path: str) -> str:
@@ -401,7 +417,7 @@ def plot_demand(runs: list[WorkdayRun], path: str) -> str:
     binned means with 95% CI band per solver x objective; workdays with surges hollow
     """
     panels = [METRICS[0], METRICS[1]]
-    fig, axes = _setup_fig_grid(1, len(panels), 18.0, 7.0)
+    fig, axes = setup_fig_grid(1, len(panels), 18.0, 7.0)
     loads = np.array([r.demand_load for r in runs])
     nr_bins = int(min(6, max(1, len(set(loads.round(6))) // 3)))
     edges = np.unique(np.quantile(loads, np.linspace(0, 1, nr_bins + 1)))
@@ -477,7 +493,7 @@ def plot_demand(runs: list[WorkdayRun], path: str) -> str:
         title="circles: closed, triangles: open, hollow: workdays with surges",
     )
     fig.tight_layout()
-    return _save(fig, path)
+    return save_figure(fig, path)
 
 
 def rolling_acceptance(
@@ -575,7 +591,7 @@ def plot_workday(
     fig.suptitle(
         f"{closed.pair}: demand load {closed.demand_load:.1f} requests per agent-hour"
     )
-    return _save(fig, path)
+    return save_figure(fig, path)
 
 
 def representative_pair(
@@ -586,6 +602,123 @@ def representative_pair(
     with_surges = [p for p in pairs if closed[p].row["nr_surges"] > 0]
     candidates = with_surges or pairs
     return max(candidates, key=lambda p: (closed[p].demand_load, p), default=None)
+
+
+# --------------------------------------------------------------------------------------
+# Box-plot figures (alternative views of Figures 1 and 2)
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Factor:
+    """A grouping axis of the box-plot grids: its levels and how to read one run"""
+
+    title: str
+    levels: tuple[str, ...]
+    level: Callable[[WorkdayRun, SolverStrategy], str]
+
+
+def _solver_factor() -> Factor:
+    return Factor(
+        "Solver", tuple(SOLVER_LABEL[s] for s in SOLVERS), lambda r, s: SOLVER_LABEL[s]
+    )
+
+
+def _row_factor(title: str, field: str, levels: list) -> Factor:
+    return Factor(title, tuple(str(v) for v in levels), lambda r, s: str(r.row[field]))
+
+
+def _box_records(runs: list[WorkdayRun]) -> list[tuple[WorkdayRun, SolverStrategy]]:
+    """One record per run and solver: 2 objectives x 2 solvers per workday"""
+    return [(r, s) for r in runs for s in SOLVERS]
+
+
+def _box_color(level_index: int, shade_index: int) -> tuple:
+    """Colour by the first factor's level, lighter for the second factor's 2nd level"""
+    import matplotlib.colors as mcolors
+
+    base = mcolors.to_rgb(
+        ("tab:blue", "tab:orange", "tab:green", "tab:purple")[level_index % 4]
+    )
+    return tuple(c + (1.0 - c) * 0.55 * shade_index for c in base)
+
+
+def plot_box_grid(
+    runs: list[WorkdayRun],
+    columns: list[tuple[Factor, Factor]],
+    path: str,
+    title: str = "",
+) -> str:
+    """
+    Rows = outcomes, columns = pairs of factors; each cell draws one horizontal
+    box-and-whisker per combination of its two factors' levels, pooling everything
+    else. Whiskers extend to the furthest value within 1.5 x IQR (Tukey), with
+    outliers as dots. Every cell of a row shares the x-axis [min, max] of that
+    outcome across all runs
+    """
+    records = _box_records(runs)
+    fig, axes = setup_fig_grid(len(METRICS), len(columns), 18.0, 3.2 * len(METRICS))
+    for i, metric in enumerate(METRICS):
+        values = [metric.value(r.results[s]) for r, s in records]
+        values = [v for v in values if v is not None]
+        low, high = (min(values), max(values)) if values else (0.0, 1.0)
+        pad = 0.05 * (high - low) or 0.05 * max(abs(high), 1.0)
+        for j, (first, second) in enumerate(columns):
+            ax = axes[i, j]
+            data, labels, colors = [], [], []
+            for a, level_a in enumerate(first.levels):
+                for b, level_b in enumerate(second.levels):
+                    group = [
+                        metric.value(r.results[s])
+                        for r, s in records
+                        if first.level(r, s) == level_a
+                        and second.level(r, s) == level_b
+                        and metric.value(r.results[s]) is not None
+                    ]
+                    data.append(group)
+                    labels.append(f"{level_a} · {level_b}")
+                    colors.append(_box_color(a, b))
+            draw_hboxes(ax, data, labels, colors)
+            ax.set_xlim(low - pad, high + pad)
+            if i == 0:
+                ax.set_title(f"{first.title} × {second.title}")
+            if j == 0:
+                ax.set_ylabel(metric.label.replace("(pp)", "(%)"))
+    if title:
+        fig.suptitle(title)
+    fig.tight_layout()
+    return save_figure(fig, path)
+
+
+def plot_impact_boxes(runs: list[WorkdayRun], path: str) -> str:
+    """Box-plot view of the decision impacts: the three decisions, pairwise"""
+    objective = Factor(
+        "Objective", tuple(o.value for o in OBJECTIVES), lambda r, s: r.objective.value
+    )
+    start = _row_factor("Start time", "start_time", [t.value for t in WorkdayStartTime])
+    solver = _solver_factor()
+    columns = [(objective, solver), (solver, start), (start, objective)]
+    return plot_box_grid(runs, columns, path)
+
+
+def plot_demand_boxes(runs: list[WorkdayRun], path: str) -> str:
+    """
+    Box-plot view of the demand figure: the solver against the demand parameters varied by the
+    suite (base arrival rate and timing profile), pairwise
+    """
+    rates = sorted({r.row["base_rate"] for r in runs})
+    timings = [
+        t for t in ("uniform", "peaks") if any(r.row["timing"] == t for r in runs)
+    ]
+    rate = Factor(
+        "Base rate (req/h)",
+        tuple(str(v) for v in rates),
+        lambda r, s: str(r.row["base_rate"]),
+    )
+    timing = _row_factor("Timing", "timing", timings)
+    solver = _solver_factor()
+    columns = [(rate, solver), (timing, solver), (rate, timing)]
+    return plot_box_grid(runs, columns, path)
 
 
 # --------------------------------------------------------------------------------------
@@ -600,11 +733,15 @@ def compare_workday_objectives(
     table_name: str = "combined_summary",
     all_workdays: bool = False,
     window: float = DEFAULT_ROLLING_WINDOW,
+    formats: str | Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """
-    Compare a closed-objective and an open-objective workday suite (see the module
-    docstring). Returns the combined summary rows, the Figure 1 estimates, and the
-    paths of every written figure
+    Compare a closed-objective and an open-objective workday suite generated with the
+    same arguments and seed, so every workday is observed on identical demand with
+    each objective, solver, and start time. Writes combined_manifest.json, the
+    combined summary table (the selected formats, check resolve_export_formats), and
+    the figures. Returns the combined summary rows, the decision impact estimates, the
+    written figure paths, and the number of workday pairs per decision
     """
     closed = _load_suite(closed_dir, ObjectiveType.closed)
     opened = _load_suite(open_dir, ObjectiveType.open)
@@ -619,6 +756,7 @@ def compare_workday_objectives(
         outdir,
         table_name,
         fieldnames=SUMMARY_FIELDS + COMBINED_EXTRA_FIELDS,
+        formats=formats,
     )
 
     figures: dict[str, str] = {}
@@ -630,6 +768,12 @@ def compare_workday_objectives(
         runs = [*closed.values(), *opened.values()]
         figures["demand"] = plot_demand(
             runs, os.path.join(outdir, "demand_vs_accept_delay.png")
+        )
+        figures["impact_boxes"] = plot_impact_boxes(
+            runs, os.path.join(outdir, "var_decision_boxes.png")
+        )
+        figures["demand_boxes"] = plot_demand_boxes(
+            runs, os.path.join(outdir, "demand_param_boxes.png")
         )
     representative = representative_pair(closed, opened)
     if representative is not None:
@@ -654,6 +798,7 @@ def compare_workday_objectives(
         "estimates": estimates,
         "representative": representative,
         "figures": figures,
+        "nr_start_time_pairs": len(start_time_pairs(closed, opened)),
         "nr_paired": len(closed.keys() & opened.keys()),
         "unpaired": sorted(closed.keys() ^ opened.keys()),
     }

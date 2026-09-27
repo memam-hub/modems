@@ -17,7 +17,7 @@ Usage:
 import argparse
 import os
 
-from _cli_common import ParserArgumentName, add_cli_arguments
+from _cli_common import ParserArgumentName, add_cli_arguments, formats_suffix
 
 from modems.workday_comparison import (
     DEFAULT_ROLLING_WINDOW,
@@ -27,7 +27,9 @@ from modems.workday_comparison import (
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    add_cli_arguments(parser, [ParserArgumentName.outdir])
+    add_cli_arguments(
+        parser, [ParserArgumentName.outdir, ParserArgumentName.export_formats]
+    )
     parser.set_defaults(
         outdir=os.path.join(os.path.dirname(__file__), "results_workday_comparison"),
     )
@@ -58,9 +60,11 @@ if __name__ == "__main__":
         table_name=args.table_name,
         all_workdays=args.all_workdays,
         window=args.window,
+        formats=args.export_formats,
     )
 
-    print(f"{result['nr_paired']} paired workdays")
+    print(f"{result['nr_paired']} workdays paired across objectives")
+    print(f"{result['nr_start_time_pairs']} workdays paired across start times")
     if result["unpaired"]:
         print(f"unpaired (tables only): {', '.join(result['unpaired'])}")
     labels = {m.key: m.label for m in METRICS}
@@ -75,7 +79,7 @@ if __name__ == "__main__":
             f"{e['n']:>4}  {text}"
         )
     print(
-        f"\n{len(result['rows'])} rows written to {args.outdir}/{args.table_name}.{{csv,json,tex}}"
+        f"\n{len(result['rows'])} rows written to {args.outdir}/{args.table_name}.{formats_suffix(args.export_formats)}"
     )
     for name, path in result["figures"].items():
         print(f"{name} figure: {path}")

@@ -28,6 +28,7 @@ import os
 from _cli_common import (
     ParserArgumentName,
     add_cli_arguments,
+    formats_suffix,
     make_progress_printer,
     resolve_cli_phase,
     resolve_cli_soc,
@@ -42,13 +43,16 @@ from modems.insertion_ablation import (
     DEFAULT_MAX_REQUESTS_FOR_NAIVE_VARIANTS,
     INSERTION_VARIANT_FCNS,
     ManifestStatus,
+    ablation_table_rows,
     build_ablation_table,
     generate_ablation_suite,
+    plot_ablation_figure,
+    plot_corpus_comparison,
     solve_ablation_suite,
     write_corpus_comparison,
 )
 
-DEFAULT_REQUEST_COUNTS = [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60]
+DEFAULT_REQUEST_COUNTS = [10, 15, 20, 25, 30, 40, 50, 60]
 DEFAULT_AGENT_COUNTS = [1, 2]
 
 if __name__ == "__main__":
@@ -63,6 +67,7 @@ if __name__ == "__main__":
         ParserArgumentName.smoke,
         ParserArgumentName.retry_failed,
         ParserArgumentName.latex_rows_per_block,
+        ParserArgumentName.export_formats,
         ParserArgumentName.ablation_bucket_size,
         ParserArgumentName.ablation_comparison_metric,
     ]
@@ -208,11 +213,16 @@ if __name__ == "__main__":
                 corpus_outdir,
                 table_name=args.table_name,
                 rows_per_block=args.rows_per_block,
+                formats=args.export_formats,
             )
             print(
                 f"{len(rows)} rows written to "
-                f"{corpus_outdir}/{args.table_name}.{{csv,json,tex}}"
+                f"{corpus_outdir}/{args.table_name}.{formats_suffix(args.export_formats)}"
             )
+            figure = plot_ablation_figure(
+                rows, os.path.join(corpus_outdir, "insertion_variants.png")
+            )
+            print(f"variants figure: {figure}")
 
     if ManifestPhase.build in args.phases and both_requested:
         comparison_outdir = os.path.join(args.outdir, "comparison")
@@ -223,8 +233,15 @@ if __name__ == "__main__":
             bucket_size=args.bucket_size,
             metric=args.metric,
             table_name=args.comparison_table_name,
+            formats=args.export_formats,
         )
         print(
             f"\n{len(comparison_rows)} buckets written to "
-            f"{comparison_outdir}/{args.comparison_table_name}.{{csv,json,tex}}"
+            f"{comparison_outdir}/{args.comparison_table_name}.{formats_suffix(args.export_formats)}"
         )
+        figure = plot_corpus_comparison(
+            ablation_table_rows(os.path.join(args.outdir, "normal")),
+            ablation_table_rows(os.path.join(args.outdir, "stress")),
+            os.path.join(comparison_outdir, "normal_vs_stress.png"),
+        )
+        print(f"comparison figure: {figure}")

@@ -220,7 +220,8 @@ def test_generate_suite_bakes_objective_into_name_and_row(
     assert (
         ObjectiveType(manifest["WO0_SRUN5_1"]["objective_type"]) == ObjectiveType.open
     )
-    assert screened == [ObjectiveType.open]
+    # the fleet is screened once per start time, so both settle on the same seed
+    assert screened == [ObjectiveType.open] * len(WorkdayStartTime)
 
 
 def test_generate_suite_retries_infeasible_fleets_and_reports_progress(
@@ -252,13 +253,55 @@ def test_generate_suite_retries_infeasible_fleets_and_reports_progress(
         on_progress=events.append,
     )
 
-    assert attempts == 2
+    # attempt 1 fails on its first start time; attempt 2 screens every start time
+    assert attempts == 1 + len(WorkdayStartTime)
     assert result[0]["status"] == ManifestStatus.created
     assert [event["status"] for event in events] == [
         ManifestStatus.starting,
         ManifestStatus.created,
     ]
     assert all(event["phase"] == "generate" for event in events)
+
+
+def test_start_times_share_the_seed_and_the_demand(tmp_path: Path) -> None:
+    """The start time is a decision: it must never change the generated demand"""
+    generate_workday_suite(
+        outdir=str(tmp_path),
+        scenario_sizes=[ScenarioSize.medium],  # 2 agents, so staggering shows
+        scenario_types=[ScenarioType.clustered],
+        scenario_timings=[ScenarioTiming.peaks],
+        start_times=[WorkdayStartTime.normal, WorkdayStartTime.staggered],
+        base_rates=[8],
+        nr_surges=1,
+        workday_length=240.0,
+    )
+    normal, staggered = (
+        read_workday_manifest(str(tmp_path))[name]
+        for name in ("WC0_MCPN8_1", "WC0_MCPS8_1")
+    )
+    assert normal["seed"] == staggered["seed"]
+    workdays = [
+        workday_benchmark._build_workday(
+            r["seed"],
+            r["nr_agents"],
+            r["type"],
+            r["timing"],
+            r["workday_length"],
+            r["start_time"],
+            r["base_rate"],
+            r["nr_surges"],
+        )  # fmt: skip
+        for r in (normal, staggered)
+    ]
+    (_, fleet_n, requests_n), (_, fleet_s, requests_s) = workdays
+    assert [(t, r.to_dict()) for t, r in requests_n] == [
+        (t, r.to_dict()) for t, r in requests_s
+    ]
+    assert len(requests_n) > 0
+    assert [(a.node_type, a.node_index, a.load_max) for a in fleet_n] == [
+        (a.node_type, a.node_index, a.load_max) for a in fleet_s
+    ]
+    assert [a.time_initial for a in fleet_n] != [a.time_initial for a in fleet_s]
 
 
 def test_generate_suite_does_not_persist_an_infeasible_combination(
@@ -454,7 +497,7 @@ def test_build_workday_table_writes_all_formats_and_pending_rows(
     with (tmp_path / "manifest.json").open("w") as file:
         json.dump({"W_done": done, "W_pending": pending}, file, default=str)
 
-    rows = build_workday_summary_table(str(tmp_path), rows_per_block=1)
+    rows = build_workday_summary_table(str(tmp_path), rows_per_block=1, formats="all")
 
     by_name = {row["workday"]: row for row in rows}
     assert by_name["W_done"]["accept_delta_pp"] == pytest.approx(12.5)
@@ -524,6 +567,7 @@ def test_build_requests_table_joins_by_id_and_preserves_raw_json_times(
         manifest_row["workday_name"],
         rows_per_block=1,
         clock_display_start="08:00",
+        formats="all",
     )
 
     assert [row["request_id"] for row in rows] == ["request-a", "request-b"]
@@ -616,3 +660,31 @@ def test_workday_pipeline_end_to_end(tmp_path: Path, objective: ObjectiveType) -
         )
         assert Path(path).stat().st_size > 0
     assert solve_workday_suite(outdir) == []
+
+
+def test_soc_acceptance_plot_handles_a_workday_without_submissions(
+    tmp_path: Path,
+) -> None:
+    log = WorkdayLog(clock_start=0.0, clock_end=30.0, agent_node_visits={}, requests=[])
+    path = plot_workday_soc_acceptance(log, str(tmp_path), "empty")
+    assert Path(path).stat().st_size > 0
+
+
+def test_workday_alns_is_seeded_with_the_workday_seed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both objectives and start times of a workday share its seed, so the search too"""
+    received: list[int] = []
+
+    class Recorded(Exception):
+        pass
+
+    def fake_compare(*args: Any, alns_seed: int, **kwargs: Any) -> None:
+        received.append(alns_seed)
+        raise Recorded
+
+    monkeypatch.setattr(workday_benchmark, "compare_solvers_one_workday", fake_compare)
+    row = _manifest_row()
+    with pytest.raises(Recorded):
+        workday_benchmark._solve_one_workday(row, {}, 1.0, 1, "cbc", "cbc")
+    assert received == [row["seed"]]

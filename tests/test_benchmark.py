@@ -1,5 +1,5 @@
 """
-Tests for modems.benchmark: result bookkeeping, and the resumable generate and/or solve 
+Tests for modems.benchmark: result bookkeeping, and the resumable generate and/or solve
 and/or build pipeline at benchmarks/run_suite.py. Phase 1 generation tests do not solve;
 Phase 2 runs real solvers on the smallest (smoke) instances
 """
@@ -12,17 +12,23 @@ from typing import Any
 
 import pytest
 
+import modems.benchmark as benchmark_module
 from modems.benchmark import (
+    ExportFormat,
     ManifestPhase,
     ManifestStatus,
     ModemsBenchmarkResult,
     _latex_fmt,
     _solve_one,
     build_benchmark_table,
+    gap_to_best,
     generate_benchmark_suite,
+    plot_benchmark_figure,
     read_manifest,
+    resolve_export_formats,
     solve_benchmark_suite,
     stable_seed,
+    write_table_files,
 )
 from modems.core import (
     ModemsAgent,
@@ -298,7 +304,10 @@ def test_pipeline_solves_every_strategy_and_builds_the_table(
     results = os.listdir(tmp_path / "results")
     assert sum(f.endswith("_alns_stats.json") for f in results) == 1
 
-    rows = build_benchmark_table(str(tmp_path), rows_per_block=2)
+    rows = build_benchmark_table(str(tmp_path), rows_per_block=2, formats="all")
+    figure = plot_benchmark_figure(rows, str(tmp_path / "solver_comparison.png"))
+    assert os.path.getsize(figure) > 0
+    assert {r["size"] for r in rows} == {"small"}
     assert [r["solver"] for r in rows] == ["alns", "milp1", "milp2", "milp3"]
     assert all(r["status_symbol"] in (r"$\star$", r"$\dagger$") for r in rows)
     tex = (tmp_path / "benchmark_table.tex").read_text()
@@ -328,3 +337,100 @@ def test_failed_rows_are_kept_and_only_retried_on_request(tmp_path) -> None:
     scenario_file.write_text(content)
     (outcome,) = solve(tmp_path, retry_failed=True)
     assert outcome["status"] == ManifestStatus.done
+
+
+# --------------------------------------------------------------------------------------
+# Export formats and the summary figure
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "selection, expected",
+    [
+        (None, {"csv", "json"}),
+        ("csv,json", {"csv", "json"}),
+        (" TEX , csv", {"csv", "tex"}),
+        (["json"], {"json"}),
+        ("all", {"csv", "json", "tex"}),
+        ("csv,all", {"csv", "json", "tex"}),
+    ],
+)
+def test_export_format_selection(selection, expected: set) -> None:
+    assert resolve_export_formats(selection) == {ExportFormat(f) for f in expected}
+
+
+def test_export_format_selection_rejects_unknown_formats() -> None:
+    with pytest.raises(ValueError):
+        resolve_export_formats("csv,xlsx")
+
+
+@pytest.mark.parametrize("selection", ["csv", "json,tex", "all"])
+def test_table_files_are_written_only_for_the_selected_formats(
+    tmp_path, selection: str
+) -> None:
+    rows = [{"a": 1, "b": "x", "ignored": 0}]
+    written = write_table_files(
+        rows,
+        str(tmp_path),
+        "t",
+        ["a", "b"],
+        selection,
+        write_tex=lambda path: open(path, "w").write("tex"),
+        csv_rows=[{"a": 1, "b": "display"}],
+    )
+    expected = {f"t.{f}" for f in resolve_export_formats(selection)}
+    assert {os.path.basename(p) for p in written} == expected
+    assert sorted(os.listdir(tmp_path)) == sorted(expected)
+    if "t.csv" in expected:
+        assert (tmp_path / "t.csv").read_text().splitlines() == ["a,b", "1,display"]
+    if "t.json" in expected:
+        assert json.loads((tmp_path / "t.json").read_text()) == rows
+
+
+def test_gap_to_best_is_relative_to_each_scenarios_best_objective() -> None:
+    rows = [
+        {"scenario": "A", "solver": "alns", "objective": 100.0},
+        {"scenario": "A", "solver": "milp1", "objective": 125.0},
+        {"scenario": "A", "solver": "milp2", "objective": None},
+        {"scenario": "B", "solver": "alns", "objective": 10.0},
+        {"scenario": "B", "solver": "milp1", "objective": 10.0},
+    ]
+    assert gap_to_best(rows) == {
+        ("A", "alns"): 0.0,
+        ("A", "milp1"): 25.0,
+        ("B", "alns"): 0.0,
+        ("B", "milp1"): 0.0,
+    }
+
+
+def test_alns_seed_is_the_scenario_seed_shared_by_every_decision(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scenario name encodes the objective, so it must not seed the search"""
+    for objective in ("closed", "open"):
+        generate(tmp_path, objective=objective, solver_strategies=["milp3", "alns"])
+    manifest = read_manifest(str(tmp_path))
+    seeds = {row["seed"] for row in manifest.values()}
+    assert len(seeds) == 1  # closed and open rows of one scenario share its seed
+
+    received: list[int] = []
+
+    def fake_solve_one(*args: Any, seed: int, **kwargs: Any) -> None:
+        received.append(seed)
+        raise RuntimeError("stop after recording the seed")
+
+    monkeypatch.setattr(benchmark_module, "_solve_one", fake_solve_one)
+    solve_benchmark_suite(str(tmp_path))
+    assert len(received) == 4 and set(received) == seeds
+
+
+def test_rows_without_a_stored_seed_fail_with_a_clear_error(tmp_path) -> None:
+    generate(tmp_path, solver_strategies=["alns"])
+    path = tmp_path / "manifest.json"
+    data = json.loads(path.read_text())
+    for row in data.values():
+        row.pop("seed")
+    path.write_text(json.dumps(data))
+    (outcome,) = solve_benchmark_suite(str(tmp_path))
+    assert outcome["status"] == ManifestStatus.failed
+    assert "regenerate the suite" in outcome["error"]

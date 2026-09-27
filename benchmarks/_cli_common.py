@@ -10,7 +10,12 @@ import os
 from enum import StrEnum
 from typing import Any, Callable
 
-from modems.benchmark import MAX_ROWS_PER_BLOCK, ManifestPhase
+from modems.benchmark import (
+    MAX_ROWS_PER_BLOCK,
+    ExportFormat,
+    ManifestPhase,
+    resolve_export_formats,
+)
 from modems.core import (
     DEFAULT_BASE_SEED,
     ObjectiveType,
@@ -44,6 +49,12 @@ class ParserArgumentName(StrEnum):
     ablation_bucket_size = "bucket_size"
     ablation_comparison_metric = "metric"
     objective = "objective"
+    export_formats = "export_formats"
+
+
+def formats_suffix(formats: frozenset[ExportFormat]) -> str:
+    """'{csv,json}'-style suffix of the written table files, for messages"""
+    return "{" + ",".join(f for f in ExportFormat if f in formats) + "}"
 
 
 def add_cli_arguments(
@@ -99,7 +110,7 @@ def add_cli_arguments(
         parser.add_argument(
             "--nr-repeats",
             type=int,
-            default=2,
+            default=3,
             help="Number of repetitions for a scenario combination",
         )
     if ParserArgumentName.phase in argument_names:
@@ -164,6 +175,23 @@ def add_cli_arguments(
             type=int,
             default=DEFAULT_PARAMS_ALNS["max_iter"],
             help="Per-epoch ALNS iteration budget",
+        )
+    if ParserArgumentName.export_formats in argument_names:
+
+        def export_formats(text: str) -> frozenset[ExportFormat]:
+            try:
+                return resolve_export_formats(text)
+            except ValueError as e:
+                raise argparse.ArgumentTypeError(
+                    f"{e}; choose from csv,json,tex or all"
+                ) from None
+
+        parser.add_argument(
+            "--export-formats",
+            type=export_formats,
+            default=resolve_export_formats("csv,json"),
+            metavar="csv,json,tex|all",
+            help="comma-separated table file formats to write (default csv,json)",
         )
     if ParserArgumentName.latex_rows_per_block in argument_names:
         parser.add_argument("--rows-per-block", type=int, default=MAX_ROWS_PER_BLOCK)

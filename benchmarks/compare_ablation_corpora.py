@@ -15,9 +15,13 @@ Usage:
 import argparse
 import os
 
-from _cli_common import ParserArgumentName, add_cli_arguments
+from _cli_common import ParserArgumentName, add_cli_arguments, formats_suffix
 
-from modems.insertion_ablation import write_corpus_comparison
+from modems.insertion_ablation import (
+    ablation_table_rows,
+    plot_corpus_comparison,
+    write_corpus_comparison,
+)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
@@ -25,6 +29,7 @@ if __name__ == "__main__":
         ParserArgumentName.outdir,
         ParserArgumentName.ablation_bucket_size,
         ParserArgumentName.ablation_comparison_metric,
+        ParserArgumentName.export_formats,
     ]
     add_cli_arguments(parser, shared_args)
     parser.set_defaults(
@@ -48,6 +53,7 @@ if __name__ == "__main__":
         bucket_size=args.bucket_size,
         metric=args.metric,
         table_name=args.table_name,
+        formats=args.export_formats,
     )
 
     print(f"{'route bucket':>14}  {'A: n, mean':>16}  {'B: n, mean':>16}  {'B/A':>6}")
@@ -59,5 +65,15 @@ if __name__ == "__main__":
         print(f"{bucket_str:>14}  {a_str:>16}  {b_str:>16}  {ratio_str:>6}")
 
     print(
-        f"\n{len(rows)} buckets written to {args.outdir}/{args.table_name}.{{csv,json,tex}}"
+        f"\n{len(rows)} buckets written to {args.outdir}/{args.table_name}.{formats_suffix(args.export_formats)}"
     )
+    figure = plot_corpus_comparison(
+        ablation_table_rows(args.corpus_a),
+        ablation_table_rows(args.corpus_b),
+        os.path.join(args.outdir, "corpus_comparison.png"),
+        labels=(
+            os.path.basename(os.path.normpath(args.corpus_a)),
+            os.path.basename(os.path.normpath(args.corpus_b)),
+        ),
+    )
+    print(f"comparison figure: {figure}")

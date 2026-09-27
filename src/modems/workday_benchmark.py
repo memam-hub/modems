@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import csv
 import json
 import os
 import time
+from collections.abc import Iterable
 from typing import Any
 
 from modems.network import RoadNetwork
@@ -25,6 +25,7 @@ from .benchmark import (
     _latex_fmt_min,
     _latex_fmt_pct,
     stable_seed,
+    write_table_files,
 )
 from .core import (
     DEFAULT_BASE_SEED,
@@ -256,21 +257,23 @@ def generate_workday_suite(
                 sc_size,
                 sc_type,
                 sc_timing,
-                start_time,
                 base_rate,
                 nr_surges,
                 i_rep,
                 attempt,
             )
-            generator = ModemsScenarioGenerator(seed=candidate_seed)
-            agents = _build_fleet(generator, nr_agents, start_time, workday_length)
             try:
-                RollingHorizonSimulator(
-                    generator.network,
-                    agents,
-                    model_params=model_params,
-                    objective=objective,
-                )
+                for fleet_start in WorkdayStartTime:
+                    generator = ModemsScenarioGenerator(seed=candidate_seed)
+                    agents = _build_fleet(
+                        generator, nr_agents, fleet_start, workday_length
+                    )
+                    RollingHorizonSimulator(
+                        generator.network,
+                        agents,
+                        model_params=model_params,
+                        objective=objective,
+                    )
             except ValueError:
                 continue
             # feasible seed found, continue
@@ -371,6 +374,7 @@ def _solve_one_workday(
         solver_config_type=solver_config_type,
         workday_logs_out=workday_logs_out,
         objective=objective,
+        alns_seed=row["seed"],
     )
     return {
         "workday_name": row["workday_name"],
@@ -615,18 +619,21 @@ def write_workday_summary_files(
     table_name: str,
     fieldnames: list[str] = SUMMARY_FIELDS,
     rows_per_block: int = MAX_ROWS_PER_BLOCK,
-) -> None:
-    """Write summary rows to {outdir}/{table_name}.{csv,json,tex}"""
-    os.makedirs(outdir, exist_ok=True)
-    with open(os.path.join(outdir, f"{table_name}.csv"), "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        for r in rows:
-            writer.writerow(r)
-    with open(os.path.join(outdir, f"{table_name}.json"), "w") as f:
-        json.dump(rows, f, indent=4, default=str)
-    _write_latex_file(
-        rows, os.path.join(outdir, f"{table_name}.tex"), rows_per_block=rows_per_block
+    formats: str | Iterable[str] | None = None,
+) -> list[str]:
+    """
+    Write summary rows to {outdir}/{table_name}.{csv,json,tex}, the selected formats
+    (check resolve_export_formats); return the written paths
+    """
+    return write_table_files(
+        rows,
+        outdir,
+        table_name,
+        fieldnames,
+        formats,
+        write_tex=lambda path: _write_latex_file(
+            rows, path, rows_per_block=rows_per_block
+        ),
     )
 
 
@@ -634,17 +641,21 @@ def build_workday_summary_table(
     outdir: str,
     table_name: str = "summary_table",
     rows_per_block: int = MAX_ROWS_PER_BLOCK,
+    formats: str | Iterable[str] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Build the paired MILP3-vs-ALNS workday comparison table from the manifest + result
-    files; write {table_name}.csv, {table_name}.json, and {table_name}.tex to outdir.
+    files; write {table_name}.csv, {table_name}.json, and {table_name}.tex to outdir
+    (the selected formats, check resolve_export_formats).
     The tex file is landscape, booktabs/siunitx, split into multiple table* blocks
     past rows_per_block rows. Return the list of row dicts, one row per workday, with
     side-by-side MILP3 and ALNS metrics
     """
     manifest = read_workday_manifest(outdir)
     rows = [workday_summary_row(name, row) for name, row in sorted(manifest.items())]
-    write_workday_summary_files(rows, outdir, table_name, rows_per_block=rows_per_block)
+    write_workday_summary_files(
+        rows, outdir, table_name, rows_per_block=rows_per_block, formats=formats
+    )
     return rows
 
 
@@ -671,6 +682,7 @@ def build_workday_requests_table(
     table_name: str = "requests_table",
     rows_per_block: int = MAX_ROWS_PER_BLOCK,
     clock_display_start: str | None = None,
+    formats: str | Iterable[str] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Build the per-request table for one workday (one row per submitted request,
@@ -721,11 +733,7 @@ def build_workday_requests_table(
         )
 
     tables_dir = os.path.join(outdir, "requests_tables")
-    os.makedirs(tables_dir, exist_ok=True)
     base_name = f"{workday_name}_{table_name}"
-    csv_path = os.path.join(tables_dir, f"{base_name}.csv")
-    json_path = os.path.join(tables_dir, f"{base_name}.json")
-    tex_path = os.path.join(tables_dir, f"{base_name}.tex")
 
     fieldnames = [
         "request_id",
@@ -753,20 +761,24 @@ def build_workday_requests_table(
         "delivery_time_milp3",
         "delivery_time_alns",
     }
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        for r in rows:
-            display_row = {
-                k: (_format_clock(v, clock_display_start) if k in time_fields else v)
-                for k, v in r.items()
-            }
-            writer.writerow(display_row)
-
-    with open(json_path, "w") as f:
-        json.dump(rows, f, indent=2, default=str)
-
-    _write_requests_latex_file(rows, tex_path, rows_per_block, clock_display_start)
+    display_rows = [
+        {
+            k: (_format_clock(v, clock_display_start) if k in time_fields else v)
+            for k, v in row.items()
+        }
+        for row in rows
+    ]
+    write_table_files(
+        rows,
+        tables_dir,
+        base_name,
+        fieldnames,
+        formats,
+        write_tex=lambda path: _write_requests_latex_file(
+            rows, path, rows_per_block, clock_display_start
+        ),
+        csv_rows=display_rows,
+    )
     return rows
 
 
@@ -956,10 +968,11 @@ def plot_workday_soc_acceptance(
         t_submissions.append(r_record.submission_time)
         r_accepted_pct.append(100.0 * nr_accepted / idx)
         r_rejected_pct.append(100.0 * nr_rejected / idx)
-    # extend flat to t_final
-    t_submissions.append(t_final)
-    r_accepted_pct.append(r_accepted_pct[-1])
-    r_rejected_pct.append(r_rejected_pct[-1])
+    # extend flat to t_final (a workday without submissions draws empty lines)
+    if submission_records:
+        t_submissions.append(t_final)
+        r_accepted_pct.append(r_accepted_pct[-1])
+        r_rejected_pct.append(r_rejected_pct[-1])
     (line_accept,) = ax1.plot(
         t_submissions,
         r_accepted_pct,

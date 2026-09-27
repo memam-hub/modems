@@ -26,8 +26,8 @@ from modems.workday_comparison import (
     pair_name,
     representative_pair,
     rolling_acceptance,
+    start_time_pairs,
     t_critical,
-    welch_ci,
 )
 
 # --------------------------------------------------------------------------------------
@@ -36,10 +36,11 @@ from modems.workday_comparison import (
 
 
 @pytest.mark.parametrize(
-    "df, value", [(1, 12.706), (4, 2.776), (30, 2.042), (60, 2.000), (1e9, 1.960)]
+    "df, value", [(1, 12.706), (4, 2.776), (30, 2.042), (31, 1.96), (10**6, 1.96)]
 )
-def test_t_critical_values(df: float, value: float) -> None:
-    assert t_critical(df) == pytest.approx(value, abs=2e-3)
+def test_t_critical_values(df: int, value: float) -> None:
+    assert t_critical(df) == pytest.approx(value)
+    assert t_critical(0) == math.inf
 
 
 def test_mean_ci_matches_the_t_interval() -> None:
@@ -48,14 +49,6 @@ def test_mean_ci_matches_the_t_interval() -> None:
     assert half == pytest.approx(3.182 * math.sqrt(5 / 3) / 2, rel=1e-4)
     assert mean_ci([]) is None
     assert mean_ci([5.0]) == (5.0, math.inf)
-
-
-def test_welch_ci_is_the_difference_b_minus_a() -> None:
-    diff, half = welch_ci([1.0, 2.0, 3.0], [4.0, 5.0, 6.0])
-    assert diff == 3.0
-    assert half == pytest.approx(2.776 * math.sqrt(2 / 3), rel=1e-3)  # df = 4
-    assert welch_ci([1.0], [2.0, 3.0]) is None
-    assert welch_ci([1.0, 1.0], [2.0, 2.0]) == (1.0, 0.0)
 
 
 # --------------------------------------------------------------------------------------
@@ -86,7 +79,12 @@ def _run(
         name=f"W{letter}{rep}_SRU{start[0].upper()}5_{surges}",
         objective=ObjectiveType(objective),
         row={
-            "seed": rep,
+            "seed": rep,  # the seed depends on the demand only
+            "size": "small",
+            "type": "random",
+            "timing": "uniform",
+            "base_rate": 5,
+            "repetition": rep,
             "start_time": start,
             "nr_surges": surges,
             "workday_length": 60.0,
@@ -98,15 +96,18 @@ def _run(
 
 
 def _suites() -> tuple[dict, dict]:
-    """Two workdays per start time; open adds +1 min delay (MILP3) / +2 (ALNS)"""
+    """
+    Two demands, each run with both start times: staggered adds +2 min delay, open
+    adds +1 min (MILP3) / +2 (ALNS), ALNS adds +0.5 over MILP3 (closed)
+    """
     closed, opened = {}, {}
     for rep, start in [
         (0, "normal"),
+        (0, "staggered"),
         (1, "normal"),
-        (2, "staggered"),
-        (3, "staggered"),
+        (1, "staggered"),
     ]:
-        delay = 1.0 + rep
+        delay = 1.0 + rep + (2.0 if start == "staggered" else 0.0)
         c = _run("closed", rep, start, _result(0.8, delay), _result(0.9, delay + 0.5))
         o = _run(
             "open", rep, start, _result(0.8, delay + 1.0), _result(1.0, delay + 2.5)
@@ -138,9 +139,9 @@ def test_effects_are_paired_differences_with_the_right_groups() -> None:
     ] == pytest.approx(10.0)
     assert _estimate(estimates, "delay", "solver", "closed")["mean"] == 0.5
     assert _estimate(estimates, "delay", "solver", "open")["mean"] == 1.5
-    # start time: staggered (reps 2, 3) - normal (reps 0, 1) of per-workday averages
+    # start time: paired on identical demand, one pair per demand (rep 0 and 1)
     start = _estimate(estimates, "delay", "start_time", "MILP3")
-    assert start["mean"] == pytest.approx(2.0) and start["n"] == 4
+    assert (start["mean"], start["ci"], start["n"]) == (2.0, 0.0, 2)
     travel = _estimate(estimates, "travel", "objective", "MILP3")
     assert travel["mean"] == 0.0  # 10 min per served request in every run
 
@@ -155,7 +156,7 @@ def test_metrics_without_served_requests_are_skipped() -> None:
 
 def test_representative_pair_prefers_the_busiest_workday_with_surges() -> None:
     closed, opened = _suites()
-    assert representative_pair(closed, opened) == "W3_SRUS5_0"  # busiest overall
+    assert representative_pair(closed, opened) == "W1_SRUS5_0"  # busiest overall
     busy = _run("closed", 1, "normal", _result(1, 1), _result(1, 1), surges=2)
     closed[busy.pair] = busy
     opened[busy.pair] = _run(
@@ -163,6 +164,19 @@ def test_representative_pair_prefers_the_busiest_workday_with_surges() -> None:
     )
     assert representative_pair(closed, opened) == busy.pair
     assert representative_pair({}, {}) is None
+
+
+def test_start_times_pair_only_on_identical_demand() -> None:
+    closed, opened = _suites()
+    assert len(start_time_pairs(closed, opened)) == 2
+    # suites generated with the start time in the seed: no identical demand
+    for runs in (closed, opened):
+        for run in runs.values():
+            if run.row["start_time"] == "staggered":
+                run.row["seed"] += 100
+    assert start_time_pairs(closed, opened) == []
+    start = _estimate(impact_estimates(closed, opened), "delay", "start_time", "ALNS")
+    assert (start["mean"], start["n"]) == (None, 0)
 
 
 def test_pairs_must_share_their_seed() -> None:
@@ -216,9 +230,9 @@ def suites(tmp_path_factory) -> tuple[Path, Path]:
             scenario_types=["random"],
             scenario_timings=["uniform"],
             start_times=["normal", "staggered"],
-            base_rates=[5],
+            base_rates=[8],
             nr_surges=0,
-            workday_length=40.0,
+            workday_length=45.0,
             nr_repeats=2,
             objective=objective,
         )
@@ -230,7 +244,7 @@ def suites(tmp_path_factory) -> tuple[Path, Path]:
 def test_comparison_end_to_end(tmp_path: Path, suites: tuple[Path, Path]) -> None:
     closed_dir, open_dir = suites
     result = compare_workday_objectives(
-        str(closed_dir), str(open_dir), str(tmp_path), all_workdays=True
+        str(closed_dir), str(open_dir), str(tmp_path), all_workdays=True, formats="all"
     )
     assert result["nr_paired"] == 4 and result["unpaired"] == []
 
@@ -252,7 +266,14 @@ def test_comparison_end_to_end(tmp_path: Path, suites: tuple[Path, Path]) -> Non
     assert [m["workday_name"] for m in manifest] == [r["workday"] for r in rows]
     assert (tmp_path / "combined_summary.tex").read_text().count("WO") == 4
 
-    assert set(result["figures"]) == {"impacts", "demand", "workday"}
+    assert set(result["figures"]) == {
+        "impacts",
+        "demand",
+        "impact_boxes",
+        "demand_boxes",
+        "workday",
+    }
+    assert result["nr_start_time_pairs"] == 2
     assert all(Path(p).stat().st_size > 0 for p in result["figures"].values())
     assert len(list((tmp_path / "workdays").glob("*.png"))) == 4
     assert {e["decision"] for e in result["estimates"]} == {

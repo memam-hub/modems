@@ -31,11 +31,11 @@ exported from modems.__init__
 
 from __future__ import annotations
 
-import csv
 import json
 import os
 import statistics
 import time
+from collections.abc import Iterable
 from enum import StrEnum
 from typing import Any, Callable
 
@@ -56,6 +56,7 @@ from .benchmark import (
     _latex_fmt,
     _latex_fmt_s_to_ms,
     stable_seed,
+    write_table_files,
 )
 from .core import (
     DEFAULT_BASE_SEED,
@@ -67,6 +68,7 @@ from .core import (
     SolverStrategy,
 )
 from .generator import ModemsScenarioGenerator, SocRangeSpec
+from .plotting import values_of
 from .solution import ModemsJourney, ModemsSolution
 
 
@@ -793,17 +795,32 @@ def _speedup(slow: float | None, fast: float | None) -> float | None:
     return slow / fast
 
 
-def build_ablation_table(
-    outdir: str,
-    table_name: str = "ablation_table",
-    rows_per_block: int = MAX_ROWS_PER_BLOCK,
-) -> list[dict[str, Any]]:
+ABLATION_TABLE_FIELDS = (
+    [
+        "point_name",
+        "status",
+        "nr_requests",
+        "nr_agents",
+        "scenario_type",
+        "scenario_timing",
+        "soc_range",
+        "repetition",
+        "nr_probes",
+        "nr_measure_repeats",
+        "nr_accepted",
+        "mean_route_length",
+    ]
+    + [m.value for m in InsertionAblationMetric]
+    + ["V3_pairs_pruned", "V3_prefix_propagations", "V3_suffix_propagations"]
+)
+
+
+def ablation_table_rows(outdir: str) -> list[dict[str, Any]]:
     """
-    Build the V0-V3 comparison table from the manifest + result files; write a
-    {table_name}.csv, {table_name}.json, and {table_name}.tex to outdir. Each row
-    per measurement point (nr_requests, nr_agents, spatial_type, timing, repetition)
-    includes the mean per-probe wall-clock time for each variant and V3's own internal
-    breakdown (position pairs pruned, prefix/suffix node propagations)
+    One row per measurement point (nr_requests, nr_agents, spatial_type, timing,
+    SoC range, repetition), read from the manifest + result files without writing
+    anything: the mean per-probe wall-clock time of each variant, the speedups, and
+    V3's own internal breakdown (position pairs pruned, prefix/suffix propagations)
     """
     manifest = read_ablation_manifest(outdir)
     rows: list[dict[str, Any]] = []
@@ -811,6 +828,12 @@ def build_ablation_table(
         base = {
             "point_name": point_name,
             "status": row["status"],
+            "nr_requests": row["nr_requests"],
+            "nr_agents": row["nr_agents"],
+            "scenario_type": row["scenario_type"],
+            "scenario_timing": row["scenario_timing"],
+            "soc_range": SocRangeSpec.from_dict(row["soc_range"]).label,
+            "repetition": row["repetition"],
         }
         if ManifestStatus(row["status"]) != ManifestStatus.done:
             rows.append(
@@ -865,34 +888,28 @@ def build_ablation_table(
             }
         )
 
-    os.makedirs(outdir, exist_ok=True)
-    fieldnames = (
-        [
-            "point_name",
-            "status",
-            "nr_probes",
-            "nr_measure_repeats",
-            "nr_accepted",
-            "mean_route_length",
-        ]
-        + [m.value for m in InsertionAblationMetric]
-        + [
-            "V3_pairs_pruned",
-            "V3_prefix_propagations",
-            "V3_suffix_propagations",
-        ]
-    )
-    # export/write data files
-    with open(os.path.join(outdir, f"{table_name}.csv"), "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        for r in rows:
-            writer.writerow(r)
-    with open(os.path.join(outdir, f"{table_name}.json"), "w") as f:
-        json.dump(rows, f, indent=2, default=str)
+    return rows
 
-    _write_ablation_latex_table(
-        rows, os.path.join(outdir, f"{table_name}.tex"), rows_per_block
+
+def build_ablation_table(
+    outdir: str,
+    table_name: str = "ablation_table",
+    rows_per_block: int = MAX_ROWS_PER_BLOCK,
+    formats: str | Iterable[str] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Build the V0-V3 comparison table (check ablation_table_rows) and write
+    {table_name}.{csv,json,tex} to outdir, the selected formats (check
+    resolve_export_formats). Return the rows
+    """
+    rows = ablation_table_rows(outdir)
+    write_table_files(
+        rows,
+        outdir,
+        table_name,
+        ABLATION_TABLE_FIELDS,
+        formats,
+        write_tex=lambda path: _write_ablation_latex_table(rows, path, rows_per_block),
     )
     return rows
 
@@ -1058,18 +1075,17 @@ def write_corpus_comparison(
     bucket_size: int = 10,
     metric: InsertionAblationMetric | str = InsertionAblationMetric.speedup_V2_V3,
     table_name: str = "corpus_comparison",
+    formats: str | Iterable[str] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Read both corpora's manifests/results directly (do not re-solve), bucket results
-    per achieved route length, and write {table_name}.{csv,json} to outdir. Use the
-    row shape from build_ablation_table() to match the per-corpus tables
+    per achieved route length, and write {table_name}.{csv,json,tex} (the selected
+    formats) to outdir. Uses ablation_table_rows(), so the corpora are left untouched
     """
-    rows_a = build_ablation_table(outdir_a)
-    rows_b = build_ablation_table(outdir_b)
+    rows_a = ablation_table_rows(outdir_a)
+    rows_b = ablation_table_rows(outdir_b)
     comparison = compare_route_length_buckets(rows_a, rows_b, bucket_size, metric)
 
-    # export/write data files
-    os.makedirs(outdir, exist_ok=True)
     fieldnames = [
         "route_bucket_start",
         "route_bucket_end",
@@ -1080,17 +1096,143 @@ def write_corpus_comparison(
         "mean_b",
         "ratio_b_to_a",
     ]
-    with open(os.path.join(outdir, f"{table_name}.csv"), "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in comparison:
-            writer.writerow(row)
-    with open(os.path.join(outdir, f"{table_name}.json"), "w") as f:
-        json.dump(comparison, f, indent=2, default=str)
-    _write_corpus_comparison_latex(
-        comparison, os.path.join(outdir, f"{table_name}.tex"), metric
+    write_table_files(
+        comparison,
+        outdir,
+        table_name,
+        fieldnames,
+        formats,
+        write_tex=lambda path: _write_corpus_comparison_latex(comparison, path, metric),
     )
     return comparison
+
+
+# --------------------------------------------------------------------------------------
+# Figures
+# --------------------------------------------------------------------------------------
+
+VARIANT_COLOR = {
+    InsertionVariant.v0: "tab:red",
+    InsertionVariant.v1: "tab:orange",
+    InsertionVariant.v2: "tab:blue",
+    InsertionVariant.v3: "tab:green",
+}
+VARIANT_TIME = {
+    InsertionVariant.v0: InsertionAblationMetric.t_exe_V0,
+    InsertionVariant.v1: InsertionAblationMetric.t_exe_V1,
+    InsertionVariant.v2: InsertionAblationMetric.t_exe_V2,
+    InsertionVariant.v3: InsertionAblationMetric.t_exe_V3,
+}
+# (row key, axis label, log scale, value scale) of the corpus comparison panels
+CORPUS_COMPARISON_METRICS = [
+    (InsertionAblationMetric.t_exe_V3, "V3 time per probe (ms)", True, 1.0e3),
+    (InsertionAblationMetric.speedup_V2_V3, "Speedup V2 / V3", True, 1.0),
+    (InsertionAblationMetric.speedup_V0_V3, "Speedup V0 / V3", True, 1.0),
+    ("V3_pairs_pruned", "V3 position pairs pruned", False, 1.0),
+    ("mean_route_length", "Mean route length (nodes)", False, 1.0),
+]
+
+
+def _done(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [r for r in rows if ManifestStatus(r["status"]) == ManifestStatus.done]
+
+
+def plot_ablation_figure(rows: list[dict[str, Any]], path: str) -> str:
+    """
+    One corpus: per agent count (columns), the time per probe of every variant (top,
+    ms, log scale) and the speedups of V3 over V0 and V2 (bottom, log scale), as boxes
+    grouped by request count; each box pools the types, timings, and repetitions
+    """
+    from .plotting import draw_grouped_vboxes, save_figure, setup_fig_grid
+
+    rows = _done(rows)
+    agents = sorted({r["nr_agents"] for r in rows}) or [1]
+    counts = sorted({r["nr_requests"] for r in rows})
+    fig, axes = setup_fig_grid(2, len(agents), 9.0 * len(agents), 12.0)
+    for idx, nr_agents in enumerate(agents):
+        subset = [r for r in rows if r["nr_agents"] == nr_agents]
+        times = [
+            (
+                variant.value,
+                VARIANT_COLOR[variant],
+                [
+                    [
+                        1e3 * v
+                        for v in values_of(subset, VARIANT_TIME[variant], nr_requests=n)
+                    ]
+                    for n in counts
+                ],
+            )
+            for variant in InsertionVariant
+        ]
+        handles = draw_grouped_vboxes(axes[0, idx], counts, times)
+        axes[0, idx].set_yscale("log")
+        axes[0, idx].set_title(f"{nr_agents} agent(s)")
+        speedups = [
+            (
+                label,
+                color,
+                [values_of(subset, metric, nr_requests=n) for n in counts],
+            )
+            for label, color, metric in (
+                ("V0 / V3", "tab:red", InsertionAblationMetric.speedup_V0_V3),
+                ("V2 / V3", "tab:blue", InsertionAblationMetric.speedup_V2_V3),
+            )
+        ]
+        speedup_handles = draw_grouped_vboxes(axes[1, idx], counts, speedups)
+        axes[1, idx].set_yscale("log")
+        axes[1, idx].axhline(1.0, color="k", linewidth=1)
+        axes[1, idx].set_xlabel("Requests per scenario")
+        if idx == 0:
+            axes[0, idx].set_ylabel("Time per probe (ms)")
+            axes[1, idx].set_ylabel("Speedup (x)")
+    axes[0, -1].legend(handles=handles, loc="upper left", fontsize=12)
+    axes[1, -1].legend(handles=speedup_handles, loc="upper left", fontsize=12)
+    fig.tight_layout()
+    return save_figure(fig, path)
+
+
+def plot_corpus_comparison(
+    rows_a: list[dict[str, Any]],
+    rows_b: list[dict[str, Any]],
+    path: str,
+    labels: tuple[str, str] = ("normal", "stress"),
+) -> str:
+    """
+    Two corpora side by side (e.g., normal SoC vs SoC stress), one panel per metric:
+    boxes per request count for each corpus, pooling agents, types, timings, and
+    repetitions. Both corpora share their seeds, so each request count compares the
+    same scenarios under the two SoC ranges
+    """
+    from .plotting import draw_grouped_vboxes, save_figure, setup_fig_grid
+
+    rows_a, rows_b = _done(rows_a), _done(rows_b)
+    counts = sorted({r["nr_requests"] for r in rows_a + rows_b})
+    fig, axes = setup_fig_grid(len(CORPUS_COMPARISON_METRICS), 1, 18.0, 3.6 * 5)
+    handles = []
+    for ax, (key, label, log, scale) in zip(axes[:, 0], CORPUS_COMPARISON_METRICS):
+        series = [
+            (
+                corpus_label,
+                color,
+                [
+                    [scale * v for v in values_of(rows, key, nr_requests=n)]
+                    for n in counts
+                ],
+            )
+            for corpus_label, color, rows in (
+                (labels[0], "tab:blue", rows_a),
+                (labels[1], "tab:red", rows_b),
+            )
+        ]
+        handles = draw_grouped_vboxes(ax, counts, series)
+        if log:
+            ax.set_yscale("log")
+        ax.set_ylabel(label)
+    axes[-1, 0].set_xlabel("Requests per scenario")
+    axes[0, 0].legend(handles=handles, loc="upper left", fontsize=12)
+    fig.tight_layout()
+    return save_figure(fig, path)
 
 
 def _write_corpus_comparison_latex(

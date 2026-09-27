@@ -1,7 +1,7 @@
 """
 Tests for modems.alns. Operator tests call each destroy/repair operator directly on
-a greedy solution and check what every ALNS state must keep: feasible journeys, with 
-routed requests equal to the accepted set, and accepted/rejected request partitioning. 
+a greedy solution and check what every ALNS state must keep: feasible journeys, with
+routed requests equal to the accepted set, and accepted/rejected request partitioning.
 Integration tests run the full search through the alns package
 """
 

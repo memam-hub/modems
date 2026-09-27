@@ -6,9 +6,11 @@ import json
 import math
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from enum import StrEnum
 from typing import Any, cast
+
+import numpy as np
 
 from .algorithms import greedy_complete, preprocess
 from .alns import ModemsAlns
@@ -49,6 +51,70 @@ def stable_seed(base_seed: int, *parts: object) -> int:
     key = f"{base_seed}:" + ":".join(str(p) for p in parts)
     digest = hashlib.sha256(key.encode()).hexdigest()
     return int(digest[:8], 16)
+
+
+class ExportFormat(StrEnum):
+    """File formats written by the table builders"""
+
+    csv = "csv"
+    json = "json"
+    tex = "tex"
+
+
+DEFAULT_EXPORT_FORMATS = frozenset({ExportFormat.csv, ExportFormat.json})
+
+
+def resolve_export_formats(
+    formats: str | Iterable[str] | None = None,
+) -> frozenset[ExportFormat]:
+    """
+    Normalize an export-format selection: None -> DEFAULT_EXPORT_FORMATS; otherwise a
+    comma-separated string or an iterable of names; "all" selects every format
+    """
+    if formats is None:
+        return DEFAULT_EXPORT_FORMATS
+    names = formats.split(",") if isinstance(formats, str) else list(formats)
+    names = [str(n).strip().lower() for n in names if str(n).strip()]
+    if "all" in names:
+        return frozenset(ExportFormat)
+    return frozenset(ExportFormat(n) for n in names)
+
+
+def write_table_files(
+    rows: list[dict[str, Any]],
+    outdir: str,
+    table_name: str,
+    fieldnames: list[str],
+    formats: str | Iterable[str] | None = None,
+    write_tex: Callable[[str], None] | None = None,
+    csv_rows: list[dict[str, Any]] | None = None,
+) -> list[str]:
+    """
+    Write rows to {outdir}/{table_name}.{csv,json,tex} for the selected formats (check
+    resolve_export_formats). The tex file is produced by write_tex(path), since every
+    table has its own LaTeX layout; csv_rows optionally replaces rows in the csv only
+    (e.g., display-formatted values). Return the written paths
+    """
+    selected = resolve_export_formats(formats)
+    os.makedirs(outdir, exist_ok=True)
+    paths = []
+    if ExportFormat.csv in selected:
+        path = os.path.join(outdir, f"{table_name}.csv")
+        with open(path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows if csv_rows is None else csv_rows)
+        paths.append(path)
+    if ExportFormat.json in selected:
+        path = os.path.join(outdir, f"{table_name}.json")
+        with open(path, "w") as f:
+            json.dump(rows, f, indent=2, default=str)
+        paths.append(path)
+    if ExportFormat.tex in selected and write_tex is not None:
+        path = os.path.join(outdir, f"{table_name}.tex")
+        write_tex(path)
+        paths.append(path)
+    return paths
 
 
 class ManifestStatus(StrEnum):
@@ -326,7 +392,7 @@ def generate_benchmark_suite(
 
         scenario = None
         for attempt in range(max_feasibility_attempts):
-            seed = stable_seed(base_seed, sc_size, sc_type, i_rep, attempt)
+            seed = stable_seed(base_seed, sc_size, sc_type, sc_timing, i_rep, attempt)
             generator = ModemsScenarioGenerator(seed=seed)
             nr_requests = int(generator.rng.integers(min_requests, max_requests + 1))
             candidate = generator.generate_random_scenario(
@@ -384,6 +450,7 @@ def generate_benchmark_suite(
                     "type": sc_type,
                     "timing": sc_timing,
                     "repetition": i_rep,
+                    "seed": seed,
                     "nr_agents": nr_agents,
                     "nr_requests": nr_requests,
                     "solver_strategy": solver_strategy,
@@ -497,12 +564,17 @@ def _solve_one(
         )
 
 
+def _scenario_seed(row: dict[str, Any]) -> int:
+    """The generation seed stored with a manifest row, defaults to DEFAULT_BASE_SEED"""
+
+    return row["seed"] if row.get("seed") is not None else DEFAULT_BASE_SEED
+
+
 def solve_benchmark_suite(
     outdir: str,
     model_params: dict[str, Any] | None = None,
     milp_timelimit: float = DEFAULT_MILP_TIMELIMIT,
     alns_max_iter: int = DEFAULT_PARAMS_ALNS["max_iter"],
-    seed: int = DEFAULT_BASE_SEED,
     retry_failed: bool = False,
     solver_name: str = DEFAULT_MILP_SOLVER_DATA[0],
     solver_config_type: SolverConfigType = DEFAULT_MILP_SOLVER_DATA[1],
@@ -555,7 +627,7 @@ def solve_benchmark_suite(
                 model_params=model_params,
                 milp_timelimit=milp_timelimit,
                 alns_max_iter=alns_max_iter,
-                seed=stable_seed(seed, scenario_name, solver_strategy),
+                seed=_scenario_seed(row),
                 solver_name=solver_name,
                 solver_config_type=solver_config_type,
                 alns_stats_out=alns_stats,
@@ -720,16 +792,10 @@ def _latex_fmt_s_to_ms(value: Any, spec: str = "{:.2f}") -> str:
     return chk_value if chk_value is not None else spec.format(max(0.0, value * 1_000))
 
 
-def build_benchmark_table(
-    outdir: str,
-    table_name: str = "benchmark_table",
-    rows_per_block: int = MAX_ROWS_PER_BLOCK,
-) -> list[dict[str, Any]]:
+def benchmark_table_rows(outdir: str) -> list[dict[str, Any]]:
     """
-    Build the benchmark summary table from the manifest + result files, write
-    {table_name}.csv, {table_name}.json, and {table_name}.tex to outdir. The tex is a
-    landscape, booktabs/siunitx LaTeX fragment, split into multiple table* blocks if
-    the entries are more than nr_rows_per_block. Return the list of row dicts
+    One row per (scenario, solver) from the manifest + result files, without writing
+    anything; rows that are not done keep their status with empty metrics
     """
     manifest = read_manifest(outdir)
     rows = []
@@ -740,6 +806,7 @@ def build_benchmark_table(
             rows.append(
                 {
                     "scenario": scenario_name,
+                    "size": row["size"],
                     "objective_type": row["objective_type"],
                     "nr_agents": None,
                     "nr_requests": None,
@@ -768,6 +835,7 @@ def build_benchmark_table(
         rows.append(
             {
                 "scenario": scenario_name,
+                "size": row["size"],
                 "objective_type": row["objective_type"],
                 "nr_agents": len(result.final_solution.ctx.agents),
                 "nr_requests": len(result.final_solution.ctx.requests),
@@ -796,13 +864,26 @@ def build_benchmark_table(
             }
         )
 
-    os.makedirs(outdir, exist_ok=True)
-    csv_path = os.path.join(outdir, f"{table_name}.csv")
-    json_path = os.path.join(outdir, f"{table_name}.json")
-    tex_path = os.path.join(outdir, f"{table_name}.tex")
+    return rows
 
+
+def build_benchmark_table(
+    outdir: str,
+    table_name: str = "benchmark_table",
+    rows_per_block: int = MAX_ROWS_PER_BLOCK,
+    formats: str | Iterable[str] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Build the benchmark summary table from the manifest + result files, write
+    {table_name}.{csv,json,tex} (the selected formats, check resolve_export_formats)
+    to outdir. The tex is a
+    landscape, booktabs/siunitx LaTeX fragment, split into multiple table* blocks if
+    the entries are more than nr_rows_per_block. Return the list of row dicts
+    """
+    rows = benchmark_table_rows(outdir)
     fieldnames = [
         "scenario",
+        "size",
         "objective_type",
         "nr_agents",
         "nr_requests",
@@ -819,17 +900,122 @@ def build_benchmark_table(
         "baseline_time",
         "time",
     ]
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        for r in rows:
-            writer.writerow(r)
-
-    with open(json_path, "w") as f:
-        json.dump(rows, f, indent=4, default=str)
-
-    _write_latex_table(rows, tex_path, nr_rows_per_block=rows_per_block)
+    write_table_files(
+        rows,
+        outdir,
+        table_name,
+        fieldnames,
+        formats,
+        write_tex=lambda path: _write_latex_table(
+            rows, path, nr_rows_per_block=rows_per_block
+        ),
+    )
     return rows
+
+
+# --------------------------------------------------------------------------------------
+# Figures
+# --------------------------------------------------------------------------------------
+
+BENCHMARK_STATUS_COLOR = {
+    SolutionStatus.optimal: "tab:green",
+    SolutionStatus.feasible: "tab:blue",
+    SolutionStatus.unknown: "tab:gray",
+    SolutionStatus.infeasible: "tab:red",
+    ManifestStatus.failed: "k",
+}
+
+
+def gap_to_best(rows: list[dict[str, Any]]) -> dict[tuple[str, str], float]:
+    """
+    Per (scenario, solver): 100 * (objective - best) / best, where best is the lowest
+    objective any solver found on that scenario (raw objectives are not comparable
+    across scenarios, gaps to the per-scenario best are)
+    """
+    best: dict[str, float] = {}
+    for row in rows:
+        if row.get("objective") is not None:
+            best[row["scenario"]] = min(
+                best.get(row["scenario"], FLOAT_INF), row["objective"]
+            )
+    return {
+        (row["scenario"], row["solver"]): 100.0
+        * (row["objective"] - best[row["scenario"]])
+        / best[row["scenario"]]
+        for row in rows
+        if row.get("objective") is not None and best[row["scenario"]] > 0
+    }
+
+
+def plot_benchmark_figure(rows: list[dict[str, Any]], path: str) -> str:
+    """
+    One figure summarizing a (static) benchmark suite, by solver and size bucket:
+    gap to the per-scenario best objective, improvement over the constructive
+    baseline, solve time (log scale) as horizontal boxes, and the share of each final
+    status (so the boxes can be read against the runs that have no objective)
+    """
+    from .plotting import draw_hboxes, save_figure, setup_fig_grid
+
+    solvers = [s for s in SolverStrategy if any(row["solver"] == s for row in rows)]
+    sizes = [s for s in ScenarioSize if any(row.get("size") == s for row in rows)]
+    size_color = dict(zip(ScenarioSize, ("tab:blue", "tab:orange", "tab:green")))
+    groups = [(s, w) for s in solvers for w in sizes]
+    labels = [f"{s.upper()} · {w}" for s, w in groups]
+    colors = [size_color[w] for _, w in groups]
+    gaps = gap_to_best(rows)
+
+    def select(value) -> list[list[float]]:
+        return [
+            [
+                v
+                for r in rows
+                if r["solver"] == s and r.get("size") == w
+                for v in [value(r)]
+                if v is not None
+            ]
+            for s, w in groups
+        ]
+
+    fig, axes = setup_fig_grid(2, 2, 18.0, max(8.0, 0.5 * len(groups) * 2 + 4))
+    panels = [
+        (
+            axes[0, 0],
+            "Gap to best found (%)",
+            lambda r: gaps.get((r["scenario"], r["solver"])),
+        ),
+        (
+            axes[0, 1],
+            "Improvement over constructive (%)",
+            lambda r: r.get("improvement_pct"),
+        ),
+        (axes[1, 0], "Solve time (s)", lambda r: r.get("time")),
+    ]
+    for ax, title, value in panels:
+        draw_hboxes(ax, select(value), labels, colors)
+        ax.set_title(title)
+    axes[1, 0].set_xscale("log")
+
+    ax = axes[1, 1]
+    y = list(range(len(solvers), 0, -1))
+    left = np.zeros(len(solvers))
+    for status in list(BENCHMARK_STATUS_COLOR):
+        share = np.array(
+            [
+                100.0
+                * sum(row["status"] == status for row in rows if row["solver"] == s)
+                / max(1, sum(row["solver"] == s for row in rows))
+                for s in solvers
+            ]
+        )
+        ax.barh(y, share, left=left, color=BENCHMARK_STATUS_COLOR[status],
+                label=str(status), height=0.6)  # fmt: skip
+        left += share
+    ax.set_yticks(y, [s.upper() for s in solvers])
+    ax.set_xlim(0, 100)
+    ax.set_title("Final status (% of runs)")
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=3, fontsize=12)
+    fig.tight_layout()
+    return save_figure(fig, path)
 
 
 def _write_latex_table(
@@ -842,8 +1028,8 @@ def _write_latex_table(
 
     parts = []
     parts.append(_latex_begin_doc_block())
-    for b, block in enumerate(blocks, start=1):
-        cont = f" (cont. {b}/{nr_blocks})" if nr_blocks > 1 else ""
+    for idx, block in enumerate(blocks, start=1):
+        cont = f" (cont. {idx}/{nr_blocks})" if nr_blocks > 1 else ""
         parts.append(_latex_table_block(block, cont))
     parts.append(_latex_end_doc_block())
     with open(tex_path, "w") as f:

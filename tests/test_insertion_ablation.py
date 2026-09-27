@@ -9,6 +9,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
 from typing import Any
 
 import pytest
@@ -21,11 +22,14 @@ from modems.insertion_ablation import (
     INSERTION_VARIANT_FCNS,
     InsertionAblationMetric,
     InsertionVariant,
+    ablation_table_rows,
     build_ablation_table,
     build_measurement_scenario,
     compare_route_length_buckets,
     generate_ablation_suite,
     measure_variant,
+    plot_ablation_figure,
+    plot_corpus_comparison,
     read_ablation_manifest,
     solve_ablation_suite,
     write_corpus_comparison,
@@ -248,7 +252,7 @@ def test_pipeline_measures_every_variant_and_builds_the_table(tmp_path) -> None:
 
     rows = {
         r["point_name"]: r
-        for r in build_ablation_table(str(tmp_path), rows_per_block=1)
+        for r in build_ablation_table(str(tmp_path), rows_per_block=1, formats="all")
     }
     small_row, large_row = rows["I0_a1r6RU80_100"], rows["I0_a1r12RU80_100"]
     assert small_row[InsertionAblationMetric.speedup_V0_V3] == pytest.approx(
@@ -261,6 +265,12 @@ def test_pipeline_measures_every_variant_and_builds_the_table(tmp_path) -> None:
     assert (tmp_path / "ablation_table.tex").read_text().count(r"\begin{table") == 2
     with open(tmp_path / "ablation_table.csv") as f:
         assert len(list(csv.DictReader(f))) == 2
+    assert {(r["nr_requests"], r["nr_agents"]) for r in rows.values()} == {
+        (6, 1),
+        (12, 1),
+    }
+    figure = plot_ablation_figure(list(rows.values()), str(tmp_path / "variants.png"))
+    assert os.path.getsize(figure) > 0
 
 
 def test_table_lists_pending_points_without_metrics(tmp_path) -> None:
@@ -361,3 +371,12 @@ def test_corpus_comparison_end_to_end(tmp_path) -> None:
         (tmp_path / "cmp" / "corpus_comparison.json").read_text()
     ) == json.loads(json.dumps(comparison, default=str))
     assert (tmp_path / "cmp" / "corpus_comparison.csv").exists()
+    # the comparison only reads the corpora, it never writes into them
+    for name in ("normal", "stress"):
+        assert not list((tmp_path / name).glob("ablation_table.*"))
+    rows_a = ablation_table_rows(str(tmp_path / "normal"))
+    rows_b = ablation_table_rows(str(tmp_path / "stress"))
+    assert [r["soc_range"] for r in rows_a + rows_b] == ["normal", "stress"]
+    assert (rows_a[0]["nr_requests"], rows_a[0]["nr_agents"]) == (6, 1)
+    figure = plot_corpus_comparison(rows_a, rows_b, str(tmp_path / "cmp" / "c.png"))
+    assert os.path.getsize(figure) > 0

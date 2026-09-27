@@ -1,169 +1,114 @@
 # modems
 
-MILP and ALNS solvers for the **MODEMS** on-campus passenger mobility routing service:
-a dynamic variant of the electric Autonomous Dial-a-Ride Problem, solved either with
-exact methods (three MILP formulations, MILP1/MILP2/MILP3) or heuristically (Adaptive
-Large Neighborhood Search ALNS), with a rolling-horizon workflow for multi-epoch,
-full-workday operation.
-
-
-## Requirements
-
-- Python >= 3.12, pure Python, no compiled components.
-- **MILP Solver:** [CBC](https://github.com/coin-or/Cbc) is the default, installed
-  automatically via `pulp[cbc]` -- no license needed. [HiGHS](https://highs.dev/)
-  and [Gurobi](https://www.gurobi.com/) are also supported and validated.
-  `ModemsMilp.solve()` takes `solver_name` (the string passed to pyomo's
-  `SolverFactory`, e.g., `"cbc"`, `"appsi_highs"`, `"gurobi"`) and `solver_config_type`
-  (a `SolverConfigType` -- for the solver option-key convention/configuration: `cbc`,
-  `gurobi`, or `highs`).
+MILP and ALNS solvers for the **MODEMS** on-campus passenger mobility service: a
+dynamic electric Autonomous Dial-a-Ride Problem, solved exactly (three MILP
+formulations, MILP1/MILP2/MILP3) or heuristically (Adaptive Large Neighborhood Search,
+ALNS), with a rolling-horizon simulator for multi-epoch, full-workday operation.
 
 
 ## Installation
 
+Python >= 3.12, pure Python.
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate        # on Windows: .venv\Scripts\activate
-pip install -e .
+pip install -e .                 # CBC included (via pulp), no license needed
+pip install -e ".[highs]"        # optional: HiGHS, free
+pip install -e ".[gurobi]"       # optional: Gurobi, needs a license (free for academics)
 ```
-
-Optional extras: `pip install -e ".[highs]"` (free, no license) or
-`pip install -e ".[gurobi]"` (needs a license -- free for academics at
-[gurobi.com/academia](https://www.gurobi.com/academia/academic-program-and-licenses/)).
-Everything defaults to CBC and works without either.
 
 
 ## Quickstart
 
 ```python
-from modems import ModemsScenarioGenerator, ModemsMilp, MilpType, \
-    SolverConfigType, ModemsAlns, ProblemType
+from modems import ModemsAlns, ModemsMilp, ModemsScenarioGenerator, resolve_problem_type
 
-generator = ModemsScenarioGenerator(seed=42)
-scenario = generator.generate_random_scenario(nr_agents=2, nr_requests=5)
+scenario = ModemsScenarioGenerator(seed=42).generate_random_scenario(
+    nr_agents=2, nr_requests=5
+)
 
-milp = ModemsMilp(scenario=scenario, milp_type=MilpType.milp3,
-                   problem_type=ProblemType.closed_selective,
-                   milp_params={"eps": 0.01, "zeta": 1.0,
-                                "eta": 100.0, "rho": 2.5,
-                                "big_m": 150.0})
-milp.solve(solver_name="cbc", solver_config_type=SolverConfigType.cbc,
-           solver_options={"timelimit": 60.0})
+milp = ModemsMilp(scenario, "milp3", resolve_problem_type("milp3", "closed"))
+milp.solve(solver_name="cbc", solver_config_type="cbc", solver_options={"timelimit": 60})
+
+alns = ModemsAlns(scenario, resolve_problem_type("alns", "closed"))
+alns.solve(seed=1, max_iter=500)
+
+print(milp.instance.solution_info.objective, alns.instance.solution_info.objective)
 ```
 
-`ModemsAlns` follows analogously: build with `(scenario, problem_type, model_params)`,
-then `.solve(seed=..., max_iter=...)`.
-To get the right `ProblemType` for any solver from an objective (`ObjectiveType`),
-use `resolve_problem_type(strategy, objective)`: `closed` objective includes the
-final return-to-hub leg in the mission time, while `open` excludes it. This does not
-impact the generated routes, all routes end at a reachable hub for energy feasibility.
-All solvers support both routing objectives. In terms of selectivity:
-ALNS is selective only (by design), raising on a non-selective `problem_type`.
-MILP1 is non-selective only, MILP2 is selective only, and MILP3 supports both
-(selective by default). Try `benchmarks/run_suite.py --smoke` for a full
-runnable example across every solver.
+`solver_name` is the name passed to pyomo's `SolverFactory` (`"cbc"`, `"appsi_highs"`,
+`"gurobi"`); `solver_config_type` (`cbc`, `highs`, `gurobi`) selects how generic options
+such as `timelimit` are translated for that solver. Every solved model exposes
+`.instance` (`ModemsInstance`), which round-trips losslessly through
+`to_json()`/`from_json()` and plots everything with `.plot(outdir)`.
 
 
-## Scenario model
+## Concepts
 
-- **Network**: default 3 hubs + 15 stations (18 nodes). All human-facing indices
-  (`h_1`, `s_1..s_15`, `agent_1`, `request_1`) are 1-based. Travel times come from
-  Euclidean coordinate distances at a calibrated shuttle speed.
-- **`ModemsScenario`**: agents + requests + network, with spatial distribution `type`
-  (`ScenarioType`: random/clustered/mixed), `timing` (`ScenarioTiming`: uniform/peaks,
-  the shape of the earliest-pickup times: even, or with two rush-hour plateaus),
-  and a canonical `size` (`ScenarioSize`: small/medium/large, inferred from
-  agent/request counts). These enums also accept their first letter (`"R"`, `"T"`,
-  `"S"`, case-insensitive), which is how they appear in benchmark names.
-- **`ProblemContext(scenario, problem_type, strategy, model_params)`**:
-  precomputed, read-only lookup tables shared by every solver. Default `model_params`:
-  `eps=0.01, zeta=1.0, eta=100.0, rho=2.5` (enforced `eps < zeta < eta`, `rho >= 1`);
-  fixed pickup time-window `omega=5.0` min; MILP `big_m=150`.
-- **`preprocess(ctx, partial_plan=None)`** returns `(base_solution,
-  unassigned_request_names)`; `None` signals solution infeasibility. `partial_plan` is
-  a `ModemsSolution` for the current snapshot that carries over scheduled requests'
-  visit order, service times, and slack decisions under a rolling-horizon replan.
-
-
-## Rolling horizon
-
-`RollingHorizonSimulator`/`WorkdaySimulation` (`rolling_horizon.py`) drive
-epoch-by-epoch replanning. `WorkdaySimulation.run()` returns `list[EpochLog]`;
-`build_workday_log(epoch_log, request_submissions)` aggregates a full day into a
-`WorkdayLog`: every submitted request's outcome/timing as `RequestRecord`s, and
-every agent's full-day node-by-node walk as `AgentNodeVisit`s using physical names
-(`h_2`, `s_5`), both in absolute time offset from clock-start.
-`summarize_workday(epoch_log)` exports the same log into scalar stats:
-acceptance rate, waiting/excess-ride/delay time, energy, and solve time.
-
-`solver_mode="single"` (with `single_solver="milp3"`/`"alns"`) solves and adopts the
-same solver each epoch for a controlled comparison; `solver_mode="operational"` races
-MILP3 and ALNS and adopts whichever is better each epoch; the default `"benchmarking"`
-races all four solvers instead for a full comparison. `compare_solvers_one_workday()`
-runs the identical request submission/arrival stream through two independent
-single-solver simulators; `compare_solvers_over_workdays()` repeats this across
-N seeded workdays. Every `ModemsRequest` carries a persistent `request_id`, and every
-`ModemsAgent` a persistent `agent_id`, to identify them across epochs.
-
-`objective` (`ObjectiveType`, default `closed`, accepted by the simulator and both
-`compare_solvers_*` functions) sets every solver's problem type. With `open`, an
-agent that is available after its last delivery (or while idle) remains stationary
-instead of driving to a hub; it is sent to a hub only when it needs to recharge.
-
-Workday demand comes from `ModemsScenarioGenerator.generate_workday_requests()`: a
-Poisson process over earliest-pickup times in `[15, workday_length]` whose rate is
-`base_rate_per_hour` shaped by the timing (`uniform`, or `peaks` with half the demand
-in two plateaus at 1/3 and 2/3 of the day), plus `nr_surges` 30-minute surges that each
-add one hour of base-rate demand. Surges never overlap each other or the peaks, and
-keep a timing-dependent gap from both (30 minutes for `uniform`, 15 for `peaks`);
-asking for more surges than fit raises a `ValueError` (`max_surges()`). Each request
-is submitted 15–45 minutes before its earliest pickup (never before t=0). After the
-workday, `WorkdaySimulation` keeps replanning (drains) until every accepted request is
-delivered, with a safety cap of `DEFAULT_MAX_DRAIN` minutes.
+- **Scenario** (`ModemsScenario`): agents, requests, and a road network (default: 3
+  hubs, 15 stations). Scenarios are classified by spatial `type` (random, clustered,
+  mixed), `timing` of the pickups (uniform, or two rush-hour peaks), and `size`
+  (small, medium, large). Enums accept their first letter, as in benchmark names.
+- **Objective** (`ObjectiveType`): `closed` counts the final return to a hub in the
+  mission time, `open` does not. Routes always end at a reachable hub either way.
+- **Selectivity**: ALNS and MILP2 may reject requests, MILP1 must serve all of them,
+  MILP3 supports both (selective by default). `resolve_problem_type(strategy,
+  objective)` picks the matching `ProblemType`.
+- **Model parameters** (`ProblemContext`): `eps=0.01`, `zeta=2.0`, `eta=100.0`,
+  `rho=2.5`, `omega=5.0` by default (with `eps < zeta < eta`, `rho >= 1`), plus the
+  MILP `big_m=150`. A scenario that can never be served (e.g., a request larger than
+  every vehicle) is rejected when the `ProblemContext` is built.
+- **Rolling horizon** (`WorkdaySimulation`): replans every epoch as requests arrive
+  during a simulated workday, with either solver or both racing, then keeps replanning
+  after the day ends until every accepted request is delivered. Workday demand is a
+  Poisson process shaped by the timing profile, plus optional surges.
 
 
-## Insertion algorithms
+## Benchmarks
 
-`algorithms.py` implements Algorithm 1 (`preprocess`), Algorithm 2 (`greedy_complete`),
-and Algorithm 3 (`alns_feasible_insertions` for ALNS, `milp_feasible_insertions` for
-MILP warm-starts). Both return `InsertionCandidate`s: a fully propagated `journey`
-plus `delta_obj`, ready for direct adoption with no re-validation needed.
+Three resumable suites live under [`benchmarks/`](benchmarks/README.md) (full CLI
+reference there). Each script generates, solves, and builds its outputs in one
+command, prints live progress, and is safe to interrupt and rerun:
 
+| Script | Evaluates | Main figure |
+|---|---|---|
+| `run_suite.py` | Static scenarios, all four solvers | `solver_comparison.png` |
+| `run_workday_suite.py` | Full simulated workdays, MILP3 vs ALNS | per-workday SoC/acceptance |
+| `run_ablation_suite.py` | Algorithm 3 (V0-V3), normal vs low SoC | `insertion_variants.png`, `normal_vs_stress.png` |
+| `compare_workday_objectives.py` | Two workday suites, closed vs open objective | `var_decision_impact.png`, `var_decision_boxes.png` |
 
-## Plotting
+Result tables are written as `csv,json` by default; add `--export-formats all` (or,
+e.g., `csv,tex`) for LaTeX tables. Seeds depend only on the scenario or workday, never
+on a decision (solver, objective, start time, insertion variant), so every decision is
+compared on identical demand.
 
-`ModemsSolution` supports `plot_timing()`, `plot_soc()`, and `plot_load()`, alongside
-`RoadNetwork`'s network/route plots. `ModemsInstance.plot(outdir, name=)` generates
-all of them in one call and returns a dict of file paths, omitting `soc_plot` for
-MILP1 to avoid confusion, since it has a worst-case (different) SoC consumption model.
-
-
-## Loading results back in
-
-Every solved `ModemsMilp`/`ModemsAlns` exposes `.instance` (`ModemsInstance`), whose
-`to_json()`/`from_json()` round-trip losslessly into a live `ModemsInstance`.
+```bash
+cd benchmarks
+python3 run_suite.py --smoke           # quick sanity checks, a few minutes each
+python3 run_workday_suite.py --smoke
+python3 run_ablation_suite.py --smoke
+bash run_full_benchmark.sh             # results in the paper: takes several hours
+```
 
 
 ## Package layout
 
 ```
 src/modems/
-├── core.py               # ModemsRequest, ModemsAgent, ObjectiveType, ProblemType,
-│                         # SolverStrategy, resolve_problem_type,
-│                         # ScenarioType/Timing/Size, ModemsScenario, ProblemContext
-├── network.py            # RoadNetwork
-├── solution.py           # NodeState, ModemsJourney, ModemsSolution,
-│                         # ModemsSolutionInfo, ModemsInstance
-├── algorithms.py         # preprocess, greedy_complete, alns_feasible_insertions,
-│                         # milp_feasible_insertions (Algorithms 1-3)
-├── milp.py               # MilpType, SolverConfigType, ModemsMilp
-├── alns.py               # ModemsAlns
-├── generator.py          # ModemsScenarioGenerator
-├── rolling_horizon.py    # RollingHorizonSimulator, WorkdaySimulation, EpochLog,
-│                         # RequestRecord, AgentNodeVisit, WorkdayLog
-├── benchmark.py          # static (single-scenario, 4-solver) benchmark suite
-├── workday_benchmark.py  # dynamic (full simulated workday) benchmark suite
-└── insertion_ablation.py # Algorithm 3 (V0-V3) performance ablation suite
+├── core.py                # requests, agents, scenarios, problem types, ProblemContext
+├── network.py             # RoadNetwork
+├── generator.py           # ModemsScenarioGenerator (static scenarios, workday demand)
+├── solution.py            # journeys, solutions, ModemsInstance
+├── algorithms.py          # preprocessing, greedy construction, feasible insertions
+├── milp.py                # ModemsMilp (MILP1-3)
+├── alns.py                # ModemsAlns
+├── rolling_horizon.py     # epoch-by-epoch simulation of a workday
+├── benchmark.py           # static benchmark suite
+├── workday_benchmark.py   # workday benchmark suite
+├── workday_comparison.py  # closed vs open workday comparison
+├── insertion_ablation.py  # Algorithm 3 ablation suite
+└── plotting.py            # shared figure helpers
 ```
 
 
@@ -171,42 +116,8 @@ src/modems/
 
 ```bash
 pip install -e ".[dev]"
-pytest                       # everything
-pytest -m "not integration"  # fast unit tests only
-pytest -m integration        # real CBC/HiGHS/alns solver tests only
-```
-
-
-## Benchmark suite
-
-The three independent suites for evaluation purposes live under `benchmarks/`, check
-[`benchmarks/README.md`](benchmarks/README.md) for the full CLI reference. Each script
-generates + solves + builds (tables) in one command by default, prints live progress,
-and is safe to interrupt/resume:
-
-```bash
-cd benchmarks
-python3 run_suite.py            # static: one scenario, all 4 solvers
-python3 run_workday_suite.py    # dynamic: full simulated day, MILP3 vs ALNS
-python3 run_ablation_suite.py   # Algorithm 3 V0-V3 performance ablation
-```
-
-To run a quick sanity check (<=2 min per script), use the `--smoke` argument:
-
-```bash
-cd benchmarks
-python3 run_suite.py --smoke
-python3 run_workday_suite.py --smoke --plots
-python3 run_ablation_suite.py --smoke
-```
-
-To generate the exact results reported in the paper, run the following script:
-
-**Note that this spans several hours even with high-grade hardware!**
-
-```bash
-cd benchmarks
-bash run_full_benchmark.sh
+pytest                       # everything (about a minute)
+pytest -m "not integration"  # fast unit tests only (seconds)
 ```
 
 
@@ -217,7 +128,4 @@ MIT -- see [`LICENSE`](LICENSE).
 
 ## Citation
 
-Code archived at DOI:
-
-[https://doi.org/10.5281/zenodo.22927939](https://doi.org/10.5281/zenodo.22927939)
-
+Code archived at [https://doi.org/10.5281/zenodo.22927939](https://doi.org/10.5281/zenodo.22927939).

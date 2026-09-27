@@ -1,8 +1,8 @@
 # Benchmark suite
 
 Four core scripts, backed by `modems.benchmark`, `modems.workday_benchmark`, and
-`modems.insertion_ablation`, plus two comparison scripts. `run_*.py` each run 
-generate + solve + build-table in one command by default (`--phase` isolates one part), 
+`modems.insertion_ablation`, plus two comparison scripts. `run_*.py` each run
+generate + solve + build (tables and figures) in one command by default (`--phase` isolates one part),
 printing live progress, and is safe to interrupt/resume.
 
 ```bash
@@ -14,12 +14,27 @@ python3 compare_workday_objectives.py --closed C --open O      # closed vs open 
 ```
 
 `_cli_common.py` is utility to handle shared arguments and progress printing.
+`run_full_benchmark.sh` runs every suite with the paper's settings (several hours).
+
+**Outputs.** Each suite writes figures (PNG) and result tables. Tables are written as
+`csv,json` by default; every script takes `--export-formats` with a comma-separated
+selection of `csv`, `json`, `tex`, or `all` (e.g., `--export-formats all` to also get
+the LaTeX tables).
+
+**Seeds.** A seed depends only on what defines a scenario or workday, never on a
+decision (solver, objective, workday start time, insertion variant), so every decision
+is compared on identical demand. Scenario parameters left out of a seed pair up too:
+static scenarios that differ only in timing (or SoC range) share their agents,
+stations, and loads, and the two ablation corpora share their scenarios.
 
 ## run_suite.py
 
 Generates scenarios (size buckets x spatial types x timings x SoC ranges), solves
 every pending `(scenario, solver)` row (ALNS + MILP1/2/3, each MILP warm-started from
-`greedy_complete`'s baseline), and writes `benchmark_table.{csv,json,tex}`.
+`greedy_complete`'s baseline), and writes `benchmark_table.{csv,json,tex}` plus
+`solver_comparison.png`: per solver and size, the gap to the best objective found on
+each scenario, the improvement over the constructive baseline, the solve time (log
+scale), and the share of each final status.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -31,7 +46,7 @@ every pending `(scenario, solver)` row (ALNS + MILP1/2/3, each MILP warm-started
 | `--soc-test` | `both` | Initial-agent-SoC range(s) `ScenarioSocRange`: `normal`/`stress`/`custom`/`both` |
 | `--soc-custom` | none | `LB UB` custom SoC bounds (`0 < LB <= UB <= 1.0`), with `--soc-test custom` |
 | `--objective` | `closed` | `ObjectiveType`: `closed` (`C`) includes the return-to-hub leg in the mission time, `open` (`O`) does not; case-insensitive, the letter is accepted. Sets every solver's problem type; stored in the manifest at generation |
-| `--nr-repeats` | `2` | Repetitions per combination |
+| `--nr-repeats` | `3` | Repetitions per combination |
 | `--seed` | `42` | Base seed |
 | `--smoke` | off | Small, quick sanity run (<=2 min) |
 | `--retry-failed` | off | Also retry `failed` runs/rows |
@@ -40,6 +55,7 @@ every pending `(scenario, solver)` row (ALNS + MILP1/2/3, each MILP warm-started
 | `--milp-timelimit` | `60.0` | Seconds, MILP solving budget |
 | `--alns-max-iter` | `1000` | ALNS exit criteria, number of `NoImprovement` iterations |
 | `--table-name` | `benchmark_table` | Output file basename |
+| `--export-formats` | `csv,json` | Table formats: any of `csv`,`json`,`tex`, or `all` |
 | `--rows-per-block` | `40` | `.tex` rows per `table*` block |
 | `--plots` | off | Per-result `instance.plot()` + ALNS convergence/operator charts |
 
@@ -88,7 +104,7 @@ workday) plus a per-workday `requests_table.{csv,json,tex}`.
 | `--timings` | `uniform peaks` | `ScenarioTiming`: shape of the base demand over the workday; `peaks` puts half of it in two plateaus at 1/3 and 2/3 of the day |
 | `--start-times` | `normal staggered` | `WorkdayStartTime`: `normal`, all agents start at t=0; `staggered`, agent i (0-indexed) starts at `i * workday/5` |
 | `--base-rates` | `5 8` | Baseline request submissions per hour (integers) |
-| `--nr-surges` | `3` | Surges per workday: 30-minute windows that each add one hour of base-rate demand, never overlapping each other or the peaks, and kept 30 (`uniform`) or 15 (`peaks`) minutes apart from both. Raises if they do not fit: at most 8 (`uniform`) or 5 (`peaks`) in a 480-minute workday |
+| `--nr-surges` | `1` | Surges per workday: 30-minute windows that each add one hour of base-rate demand, never overlapping each other or the peaks, and kept 30 (`uniform`) or 15 (`peaks`) minutes apart from both. Raises if they do not fit: at most 8 (`uniform`) or 5 (`peaks`) in a 480-minute workday |
 | `--objective` | `closed` | Same as above; with `open`, an available agent stays at its last node, going to a hub only to recharge |
 | `--workday` | `480.0` | Workday length (minutes) over which requests are submitted; each simulation then drains until every accepted request is delivered (capped at 240 minutes past the workday) |
 | `--table-name` | `summary_table` | Output file basename for the workday summary |
@@ -98,7 +114,11 @@ workday) plus a per-workday `requests_table.{csv,json,tex}`.
 
 Plus `--nr-repeats` (default **1**) / `--seed`/`--smoke`/`--retry-failed`/
 `--solver-name`/`--solver-config-type`/`--milp-timelimit`/`--alns-max-iter`/
-`--rows-per-block` as `run_suite.py`.
+`--export-formats`/`--rows-per-block` as `run_suite.py`.
+
+The start time is not part of the workday seed: a workday's `normal` and `staggered`
+variants share their requests and fleet (except the agents' start times), and a
+generation attempt is only kept if it is feasible for both.
 
 ### Naming convention
 
@@ -113,10 +133,10 @@ where `obj`, `idx`, `size`, `type`, and `timing` read as in the scenario names, 
 
 Examples:
 
-- `WC0_LMUN5_3`: closed objective, repetition 0, large (3 agents), mixed, uniform,
-  normal start, 5 requests per hour, 3 surges.
-- `WO1_MRPS8_4`: open objective, repetition 1, medium (2 agents), random, peaks,
-  staggered start, 8 requests per hour, 4 surges.
+- `WC0_LMUN5_2`: closed objective, repetition 0, large (3 agents), mixed, uniform,
+  normal start, 5 requests per hour, 2 surges.
+- `WO1_MRPS8_3`: open objective, repetition 1, medium (2 agents), random, peaks,
+  staggered start, 8 requests per hour, 3 surges.
 
 
 ## run_ablation_suite.py
@@ -172,6 +192,13 @@ Examples:
   `[0.8, 1.0]` (normal).
 
 
+Each corpus also gets `insertion_variants.png` (per agent count: time per probe of
+every variant and the V3 speedups, as boxes per request count), and `comparison/`
+gets `normal_vs_stress.png` (one panel per metric: time, speedups, pruned position
+pairs, route length, the two corpora side by side per request count). With figures,
+the default grid (11 request counts x 2 agent counts x 3 types x 2 timings) plus a few
+repetitions stays readable.
+
 ## compare_ablation_corpora.py
 
 Buckets two already-solved ablation corpora by achieved `mean_route_length`, reports
@@ -185,22 +212,26 @@ solving/generating the two corpora.
 | `--outdir` | `results_ablation_comparison/` | Output directory |
 | `--table-name` | `corpus_comparison` | Output file basename (`.csv`/`.json`/`.tex`) |
 
-Plus `--bucket-size` and `--metric` as `run_ablation_suite.py`.
+Plus `--bucket-size`, `--metric`, and `--export-formats` as `run_ablation_suite.py`.
+Also writes `corpus_comparison.png` (same panels as `normal_vs_stress.png`).
 
 ## compare_workday_objectives.py
 
 Compares two solved workday suites, one run with `--objective closed` and one with
 `--objective open`, which were generated with identical arguments and `--seed`.
-Objective type does not impact request generation, so workdays have identical request 
-streams across suites. Each workday is observed four times (MILP3/ALNS x closed/open).
+Objective type does not impact request generation, so workdays have identical request
+streams across suites. Each workday is observed four times (MILP3/ALNS x closed/open),
+and with both start times on the same demand.
 
 Writes `combined_manifest.json` and `combined_summary.{csv,json,tex}` (each workday's
-closed row directly followed by its open row, with demand load and per-served-request 
-travel time/energy) and three figures:
+closed row directly followed by its open row, with demand load and per-served-request
+travel time/energy) and five figures:
 
 | Figure | Content |
 |---|---|
-| `var_decision_impact.png` | Rows: acceptance, mean delay, mean excess ride, travel time and energy per served request. Columns: objective (open - closed, per solver), solver (ALNS - MILP3, per objective), start time (staggered - normal, per solver). Mean difference with its 95% CI |
+| `var_decision_impact.png` | Rows: acceptance, mean delay, mean excess ride, travel time and energy per served request. Columns: objective (open - closed, per solver), solver (ALNS - MILP3, per objective), start time (staggered - normal, per solver). Mean of the per-workday differences on identical demand, with its 95% CI (Student t). Suites generated while the start time was still part of the seed have no start-time pairs: that column then shows n/a |
+| `var_decision_boxes.png` | Same grid as box plots of the actual values: objective x solver, solver x start time, start time x objective (4 boxes each, pooling the third decision) |
+| `demand_param_boxes.png` | Same layout for the demand parameters: base rate x solver, timing x solver, base rate x timing |
 | `demand_vs_accept_delay.png` | Acceptance and mean delay against the demand load (requests per agent-hour): binned means with 95% CI bands per solver x objective, one marker per workday (hollow: with surges) |
 | `most_demand_<name>.png` | The representative workday (highest demand load among workdays with surges): rolling acceptance and agent SoC for its four runs, above the shared demand |
 
@@ -213,6 +244,10 @@ Delay and excess ride time are means over served requests only.
 | `--table-name` | `combined_summary` | Combined table basename (`.csv`/`.json`/`.tex`) |
 | `--all-workdays` | off | Also plot every paired workday into `<outdir>/workdays/` |
 | `--window` | `30` | Minutes of submissions behind each rolling acceptance point |
+| `--export-formats` | `csv,json` | Table formats, as `run_suite.py` |
+
+Manifest paths are resolved relative to each suite's parent folder when needed, so the
+comparison runs from any working directory.
 
 
 ## Manifest format
@@ -232,7 +267,8 @@ single_suite/               # run_suite.py
 ├── scenarios/{scenario_name}.json
 ├── results/{scenario_name}_{solver}.json
 ├── results/{scenario_name}_alns_alns_stats.json   # ALNS runs only
-└── benchmark_table.{csv,json,tex}
+├── benchmark_table.{csv,json,tex}   # the selected --export-formats
+└── solver_comparison.png
 
 workday_suite/              # run_workday_suite.py
 ├── manifest.json
@@ -245,10 +281,12 @@ ablation_suite/             # run_ablation_suite.py
 ├── normal/
 │   ├── manifest.json
 │   ├── results/{point_name}.json
-│   └── ablation_table.{csv,json,tex}
+│   ├── ablation_table.{csv,json,tex}
+│   └── insertion_variants.png
 ├── stress/                # same layout, soc_range=(0.5, 0.7)
 └── comparison/
-    └── corpus_comparison.{csv,json,tex}
+    ├── corpus_comparison.{csv,json,tex}
+    └── normal_vs_stress.png
 ```
 
 ## Extending the suites

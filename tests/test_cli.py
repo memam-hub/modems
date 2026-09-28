@@ -161,11 +161,15 @@ def test_compare_workday_objectives(tmp_path: Path) -> None:
     rows = json.loads((tmp_path / "comparison" / "combined_summary.json").read_text())
     assert [r["objective_type"] for r in rows] == ["closed", "open", "closed", "open"]
     figures = sorted(p.name for p in (tmp_path / "comparison").glob("*.png"))
+    most_demand = sorted(
+        p.name for p in (tmp_path / "comparison" / "most_demand").iterdir()
+    )
     assert "demand_vs_accept_delay.png" in figures
     assert "var_decision_impact.png" in figures
     assert "var_decision_boxes.png" in figures
-    assert "demand_param_boxes.png" in figures
-    assert any([f.startswith("most_demand_") for f in figures])
+    assert any(f.startswith("most_requests_") for f in most_demand)
+    assert any(f.startswith("most_passengers_") for f in most_demand)
+    assert any(f.endswith("_requests_table.tex") for f in most_demand)
 
 
 @pytest.mark.parametrize("script", ["run_suite.py", "run_workday_suite.py"])

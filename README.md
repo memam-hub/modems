@@ -102,6 +102,15 @@ python3 run_ablation_suite.py --smoke
 bash run_full_benchmark.sh             # results in the paper: takes several hours
 ```
 
+The benchmark results achieved with `run_full_benchmark.sh` are stored in
+[`benchmarks/results.zip`](benchmarks/results.zip). The tables/figures can be
+re-generated (*without solving*) simply by extracting the zip file contents into
+[`benchmarks/`](benchmarks/) and running
+
+```bash
+bash run_full_benchmark.sh
+```
+
 
 ## Package layout
 

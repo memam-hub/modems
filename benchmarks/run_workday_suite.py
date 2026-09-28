@@ -51,7 +51,11 @@ from modems.generator import (
     DEFAULT_BASE_RATE_PER_HOUR,
     DEFAULT_WORKDAY_LENGTH,
 )
-from modems.workday_benchmark import WorkdayStartTime, build_workday_requests_table
+from modems.workday_benchmark import (
+    DEFAULT_WALL_CLOCK_ANCHOR,
+    WorkdayStartTime,
+    build_workday_requests_table,
+)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
@@ -130,8 +134,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--clock-display-start",
-        default="08:00",
-        help="Workday starting clock time for formatting clock-time columns",
+        default=DEFAULT_WALL_CLOCK_ANCHOR,
+        help="Workday starting time for formatting clock-time columns, e.g., 08:00",
     )
     parser.add_argument(
         "--plots",

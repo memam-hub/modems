@@ -100,7 +100,13 @@ By default, generates and solves workdays for a 3-agent fleet (`large`) with `mi
 requests, across all 8 combinations of start time x base rate x timing (2x2x2); solves
 every pending workday (`compare_solvers_one_workday`: MILP3 vs. ALNS on the identical
 request submission stream); writes `summary_table.{csv,json,tex}` (one row per
-workday) plus a per-workday `requests_table.{csv,json,tex}`.
+workday) plus a per-workday `requests_table.{csv,json,tex}`. Generation also writes
+each workday's scenario to `scenarios/{workday_name}.json`, in the `ModemsScenario`
+JSON layout plus the workday's parameters (seed included) and each request's
+`submission_time`. The file is for inspection only; the solve phase rebuilds the
+workday from its seed. The objective and start time never change the seed or the
+requests, so `WC0_LMPN5_1`, `WO0_LMPN5_1` and `WO0_LMPS5_1` hold the same requests
+(the start time only shifts the agents' `time_initial`).
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -241,9 +247,14 @@ travel time/energy) and five figures:
 |---|---|
 | `var_decision_impact.png` | Rows: acceptance, mean delay, mean excess ride, travel time and energy per served request. Columns: objective (closed - open, per solver x start time), solver (MILP3 - ALNS, per objective x start time), start time (normal - staggered, per solver x objective). Mean of the per-workday differences on identical demand, with its 95% CI (Student t). Suites generated while the start time was still part of the seed have no start-time pairs: that column then shows n/a |
 | `var_decision_boxes.png` | Same grid as box plots of the actual values: objective x solver, solver x start time, start time x objective (4 boxes each, pooling the third decision) |
-| `demand_param_boxes.png` | Same layout for the demand parameters: base rate x solver, timing x solver, base rate x timing |
-| `demand_vs_accept_delay.png` | Acceptance and mean delay against the demand load (requests per agent-hour): binned means with 95% CI bands per solver x objective, one marker per workday (hollow: with surges) |
-| `most_demand_<name>.png` | The representative workday (highest demand load among workdays with surges; `<name>` is its name without objective and start-time letters): rolling acceptance and agent SoC for its eight runs, rows objective x start time, columns MILP3/ALNS, above the shared demand |
+| `demand_vs_accept_delay.png` | Open objective only: acceptance, mean delay, mean excess ride, travel time and energy per served request against the demand load (requests per hour), one panel each: binned means with 95% CI bands per solver x start time, one marker per workday (circles: normal, squares: staggered; hollow: with surges) |
+| `most_demand/most_requests_<name>.png` | The most stacked workday by requests: the most requests whose earliest pickups fall within any 30-minute window (`<name>` is its name without objective and start-time letters). Rolling acceptance and agent SoC for its eight runs, rows objective x start time, columns MILP3/ALNS, above the shared demand |
+| `most_demand/most_passengers_<name>.png` | Same, for the most stacked workday by passengers (the sum of the request loads in that window); may be a different workday |
+
+`most_demand/` also holds `<name>_requests_table.tex` for each of these workdays
+(always written, whatever `--export-formats`): the per-request table of every run of
+that workday (one section per objective x start time, captioned with the run's name),
+MILP3 and ALNS side by side, as `requests_table.tex` of `run_workday_suite.py`.
 
 Delay and excess ride time are means over served requests only.
 
@@ -252,7 +263,7 @@ Delay and excess ride time are means over served requests only.
 | `--closed` / `--open` | required | Outdirs of the closed and open suites |
 | `--outdir` | `results_workday_comparison/` | Output directory |
 | `--table-name` | `combined_summary` | Combined table basename (`.csv`/`.json`/`.tex`) |
-| `--all-workdays` | off | Also plot every workday (all its runs, same layout as `most_demand_<name>.png`) into `<outdir>/workdays/` |
+| `--all-workdays` | off | Also plot every workday (all its runs, same layout as `most_demand/most_requests_<name>.png`) into `<outdir>/workdays/` |
 | `--window` | `30` | Minutes of submissions behind each rolling acceptance point |
 | `--export-formats` | `csv,json` | Table formats, as `run_suite.py` |
 
@@ -282,6 +293,7 @@ single_suite/               # run_suite.py
 
 workday_suite/              # run_workday_suite.py
 ├── manifest.json
+├── scenarios/{workday_name}.json
 ├── results/{workday_name}.json
 ├── results/{workday_name}_workday_log.json
 ├── requests_tables/{workday_name}_requests_table.{csv,json,tex}

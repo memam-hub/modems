@@ -21,13 +21,19 @@ from modems.workday_benchmark import (
     solve_workday_suite,
 )
 from modems.workday_comparison import (
+    PEAK_WINDOW,
+    PeakMeasure,
     WorkdayRun,
     _check_pairs,
     _load_suite,
     compare_workday_objectives,
+    demand_load,
     impact_estimates,
     mean_ci,
     pair_name,
+    peak_demand,
+    peak_rate,
+    plot_demand,
     representative_group,
     rolling_acceptance,
     start_time_pairs,
@@ -64,6 +70,13 @@ def test_mean_ci_matches_the_t_interval() -> None:
 
 def test_pair_name_drops_only_the_objective_letter() -> None:
     assert pair_name("WC0_SRUN5_0") == pair_name("WO0_SRUN5_0") == "W0_SRUN5_0"
+
+
+def test_demand_load_is_requests_per_hour_regardless_of_fleet_size() -> None:
+    assert demand_load(40, 480.0) == 5.0
+    run = _run("open", 3, "normal", {}, {})  # 8 submissions over 60 minutes
+    run.row["nr_agents"] = 3
+    assert run.demand_load == 8.0
 
 
 def _result(acceptance: float, delay: float, served: int = 4) -> dict:
@@ -232,24 +245,73 @@ def test_workday_groups_gather_every_run_of_one_demand() -> None:
     assert workday_groups({}, {}) == {}
 
 
-def test_representative_group_prefers_complete_busy_groups_with_surges() -> None:
+def test_peak_rate_is_the_densest_window_per_hour() -> None:
+    times = [100.0, 0.0, 10.0, 29.9, 30.0, 31.0]  # unsorted on purpose
+    # [10, 40) holds 10, 29.9, 30, 31; a window excludes its end: [0, 30) holds 3
+    assert peak_rate(times, window=30.0) == 4 * 2.0
+    assert peak_rate([0.0, 30.0], window=30.0) == 2.0
+    weights = [1, 5, 1, 1, 1, 1]  # t=0 carries 5: [0, 30) now weighs 7
+    assert peak_rate(times, weights, window=30.0) == 7 * 2.0
+    assert peak_rate([]) == 0.0
+    assert PEAK_WINDOW == 30.0  # one surge fills exactly one window
+
+
+def _log(*requests: tuple[float, float, int, str]) -> WorkdayLog:
+    """(submission_time, earliest_pickup, load, outcome) per request"""
+    return WorkdayLog.from_dict(
+        {
+            "clock_start": 0.0,
+            "clock_end": 200.0,
+            "agent_node_visits": {},
+            "requests": [
+                {
+                    "request": ModemsRequest(
+                        1, 2, load=load, earliest_pickup=pickup, request_id=f"r{i}"
+                    ).to_dict(),
+                    "submission_time": submit,
+                    "earliest_pickup": pickup,
+                    "outcome": outcome,
+                }
+                for i, (submit, pickup, load, outcome) in enumerate(requests)
+            ],
+        }
+    )
+
+
+def test_peak_demand_counts_requests_and_passengers_by_earliest_pickup() -> None:
+    log = _log(
+        (0.0, 60.0, 1, RequestOutcome.accepted),
+        (1.0, 70.0, 1, RequestOutcome.rejected),  # demand whatever the outcome
+        (2.0, 80.0, 1, RequestOutcome.unresolved),
+        (100.0, 150.0, 5, RequestOutcome.accepted),  # submissions: 0-2 are stacked
+        (110.0, 160.0, 4, RequestOutcome.accepted),
+    )
+    assert peak_demand(log) == {
+        PeakMeasure.requests: 3 * 2.0,  # pickups 60, 70, 80
+        PeakMeasure.passengers: 9 * 2.0,  # loads 5 + 4 at pickups 150, 160
+    }
+
+
+def test_representative_group_is_the_highest_peak_of_complete_groups() -> None:
     closed, opened = _suites()
-    groups = workday_groups(closed, opened)
-    assert representative_group(groups) == "W1_SRU5_0"  # busiest overall
-    assert representative_group({}) is None
-
-    def add(objective: str, start: str, surges: int) -> None:
-        run = _run(objective, 0, start, _result(1, 1), _result(1, 1), surges=surges)
+    groups = workday_groups(closed, opened)  # W0 and W1, both complete
+    assert representative_group(groups, {"W0_SRU5_0": 9.0, "W1_SRU5_0": 4.0}) == (
+        "W0_SRU5_0"
+    )
+    # equal peaks: the higher overall demand load (W1: one more submission) wins
+    assert representative_group(groups, {"W0_SRU5_0": 4.0, "W1_SRU5_0": 4.0}) == (
+        "W1_SRU5_0"
+    )
+    assert representative_group({}, {}) is None
+    # a busier group seen with one start time only comes after complete groups
+    for objective in ("closed", "open"):
+        run = _run(objective, 2, "normal", _result(1, 1), _result(1, 1), surges=2)
         (closed if objective == "closed" else opened)[run.pair] = run
-
-    # with surges but only one start time: complete groups come first
-    for objective in ("closed", "open"):
-        add(objective, "normal", surges=2)
-    assert representative_group(workday_groups(closed, opened)) == "W1_SRU5_0"
-    # complete and with surges: preferred over a busier group without surges
-    for objective in ("closed", "open"):
-        add(objective, "staggered", surges=2)
-    assert representative_group(workday_groups(closed, opened)) == "W0_SRU5_2"
+    groups = workday_groups(closed, opened)
+    peaks = {"W0_SRU5_0": 4.0, "W1_SRU5_0": 6.0, "W2_SRU5_2": 99.0}
+    assert representative_group(groups, peaks) == "W1_SRU5_0"
+    only = {"W2_SRU5_2": groups["W2_SRU5_2"]}
+    assert representative_group(only, peaks) == "W2_SRU5_2"
 
 
 def test_start_times_pair_only_on_identical_demand() -> None:
@@ -272,6 +334,38 @@ def test_pairs_must_share_their_seed() -> None:
     opened["W0_SRUN5_0"].row["seed"] = 99
     with pytest.raises(ValueError, match="different seeds"):
         _check_pairs(closed, opened)
+
+
+def test_demand_figure_plots_every_metric_for_the_open_objective_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import matplotlib.axes
+
+    closed, opened = _suites()
+    for rep, surges in ((2, 1), (3, 0)):  # spread the demand loads, some surges
+        for start in ("normal", "staggered"):
+            run = _run("open", rep, start, _result(0.7, 2.0), _result(0.9, 1.0), surges)
+            opened[run.pair] = run
+    calls: list[dict] = []
+    original = matplotlib.axes.Axes.scatter
+
+    def spy(ax, x, y, **kwargs):
+        calls.append({"x": list(x), **kwargs})
+        return original(ax, x, y, **kwargs)
+
+    monkeypatch.setattr(matplotlib.axes.Axes, "scatter", spy)
+    path = plot_demand([*closed.values(), *opened.values()], str(tmp_path / "d.png"))
+    assert Path(path).stat().st_size > 0
+    # 5 metrics x 2 start times x 2 solvers, filled and hollow markers each
+    assert len(calls) == 5 * 2 * 2 * 2
+    assert {c["marker"] for c in calls} == {"o", "s"}
+    assert {c["s"] for c in calls} == {8.0**2}
+    open_loads = {r.demand_load for r in opened.values()}
+    assert {x for c in calls for x in c["x"]} == open_loads
+    # closed runs alone leave an empty (but valid) figure
+    calls.clear()
+    plot_demand(list(closed.values()), str(tmp_path / "closed.png"))
+    assert calls == []
 
 
 def test_rolling_acceptance_uses_the_trailing_window() -> None:
@@ -357,9 +451,14 @@ def test_comparison_end_to_end(tmp_path: Path, suites: tuple[Path, Path]) -> Non
         "impacts",
         "demand",
         "impact_boxes",
-        "demand_boxes",
-        "workday",
+        "most_requests",
+        "most_passengers",
     }
+    assert not (tmp_path / "demand_param_boxes.png").exists()
+    assert all(
+        r["demand_load"] == pytest.approx(r["nr_submissions"] / (45.0 / 60.0))
+        for r in rows
+    )
     assert result["nr_start_time_pairs"] == 2
     assert all(Path(p).stat().st_size > 0 for p in result["figures"].values())
     # one figure per demand: 2 repetitions, each with both start times
@@ -367,9 +466,30 @@ def test_comparison_end_to_end(tmp_path: Path, suites: tuple[Path, Path]) -> Non
         "W0_SRU8_0.png",
         "W1_SRU8_0.png",
     ]
-    assert Path(result["figures"]["workday"]).name == (
-        f"most_demand_{result['representative']}.png"
+    groups = workday_groups(
+        _load_suite(str(closed_dir), ObjectiveType.closed),
+        _load_suite(str(open_dir), ObjectiveType.open),
     )
+    most_demand = tmp_path / "most_demand"
+    assert not list(tmp_path.glob("most_*.png"))  # only inside most_demand/
+    for measure in PeakMeasure:
+        name = result["representative"][measure]
+        figure = Path(result["figures"][f"most_{measure}"])
+        assert figure == most_demand / f"most_{measure}_{name}.png"
+        table = Path(result["requests_tables"][f"most_{measure}"])
+        assert table == most_demand / f"{name}_requests_table.tex"
+        tex = table.read_text()
+        # one section per run of the group, both solvers side by side
+        for run in groups[name].values():
+            assert run.name.replace("_", r"\_") in tex
+        assert tex.count(r"\begin{table*}") >= len(groups[name])
+        assert "MILP3" in tex and "ALNS" in tex
+        # the chosen group has the highest peak of that measure
+        peaks = {
+            n: peak_demand(next(iter(g.values())).logs()[SolverStrategy.milp3])[measure]
+            for n, g in groups.items()
+        }
+        assert peaks[name] == max(peaks.values())
     assert {e["decision"] for e in result["estimates"]} == {
         "objective",
         "solver",

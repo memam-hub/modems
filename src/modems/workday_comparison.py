@@ -5,12 +5,14 @@ import math
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, Callable
 
 import numpy as np
 
 from .benchmark import ManifestStatus
 from .core import ObjectiveType, SolverStrategy
+from .generator import SURGE_DURATION
 from .network import RoadNetwork
 from .plotting import draw_hboxes, save_figure, setup_fig_grid
 from .rolling_horizon import RequestOutcome, WorkdayLog
@@ -20,7 +22,9 @@ from .workday_benchmark import (
     WorkdayStartTime,
     agent_soc_series,
     read_workday_manifest,
+    workday_requests_rows,
     workday_summary_row,
+    write_requests_latex,
     write_workday_summary_files,
 )
 
@@ -28,10 +32,9 @@ OBJECTIVES = (ObjectiveType.closed, ObjectiveType.open)
 SOLVERS = (SolverStrategy.milp3, SolverStrategy.alns)
 SOLVER_LABEL = {SolverStrategy.milp3: "MILP3", SolverStrategy.alns: "ALNS"}
 SOLVER_COLOR = {SolverStrategy.milp3: "tab:blue", SolverStrategy.alns: "tab:red"}
-OBJECTIVE_STYLE = {ObjectiveType.closed: "-", ObjectiveType.open: "--"}
-OBJECTIVE_MARKER = {ObjectiveType.closed: "o", ObjectiveType.open: "^"}
 DEFAULT_ROLLING_WINDOW = 30.0  # minutes of submissions behind each acceptance point
 DEFAULT_DEMAND_BIN = 15.0  # minutes per bar of the demand strip
+PEAK_WINDOW = SURGE_DURATION  # minutes of the peak-demand window: one surge fills it
 COMBINED_EXTRA_FIELDS = [
     "pair",
     "demand_load",
@@ -113,6 +116,11 @@ def mean_ci(values: list[float]) -> tuple[float, float] | None:
 # --------------------------------------------------------------------------------------
 
 
+def demand_load(nr_submissions: int, workday_length: float) -> float:
+    """Submitted requests per hour of the workday"""
+    return nr_submissions / (workday_length / 60.0)
+
+
 def pair_name(workday_name: str) -> str:
     """Workday name without its objective letter: WC0_SRUN5_0 -> W0_SRUN5_0"""
     n = len(BNCH_WORKDAY_PFX)
@@ -135,9 +143,8 @@ class WorkdayRun:
 
     @property
     def demand_load(self) -> float:
-        """Submitted requests per agent-hour"""
-        nr_hours = self.row["workday_length"] / 60.0
-        return self.nr_submissions / (self.row["nr_agents"] * nr_hours)
+        """Submitted requests per hour"""
+        return demand_load(self.nr_submissions, self.row["workday_length"])
 
     def logs(self) -> dict[SolverStrategy, WorkdayLog]:
         with open(self.row["workday_log_file"]) as f:
@@ -222,13 +229,11 @@ def _combined_rows(closed_dir: str, open_dir: str) -> tuple[list[dict], list[dic
                     summary[f"{metric}_per_served_{s}"] = (
                         value / served if served else None
                     )
-            if summary["nr_submissions"] is not None:
-                nr_hours = row["workday_length"] / 60.0
-                summary["demand_load"] = summary["nr_submissions"] / (
-                    row["nr_agents"] * nr_hours
-                )
-            else:
-                summary["demand_load"] = None
+            summary["demand_load"] = (
+                demand_load(summary["nr_submissions"], row["workday_length"])
+                if summary["nr_submissions"] is not None
+                else None
+            )
             summary_rows.append(summary)
 
     def order(r: dict) -> tuple:
@@ -452,38 +457,54 @@ def plot_impacts(estimates: list[dict[str, Any]], path: str) -> str:
     return save_figure(fig, path)
 
 
+DEMAND_OBJECTIVE = ObjectiveType.open  # the demand figure's (fixed) objective
+START_STYLE = {WorkdayStartTime.normal: "-", WorkdayStartTime.staggered: "--"}
+START_MARKER = {WorkdayStartTime.normal: "o", WorkdayStartTime.staggered: "s"}
+DEMAND_MARKER_SIZE = 8.0  # points, i.e., markersize (scatter takes its square)
+
+
 def plot_demand(runs: list[WorkdayRun], path: str) -> str:
     """
-    Figure 2: acceptance and mean delay against demand load (requests per agent-hour),
-    binned means with 95% CI band per solver x objective; workdays with surges hollow
+    Figure 2: every outcome (METRICS) against demand load (requests per hour) for the
+    open objective, binned means with 95% CI band per solver x start time; one
+    marker per workday (circles normal, squares staggered), hollow with surges.
+    The sixth cell of the 2 x 3 grid holds the legend
     """
-    panels = [METRICS[0], METRICS[1]]
-    fig, axes = setup_fig_grid(1, len(panels), 18.0, 7.0)
+    runs = [r for r in runs if r.objective == DEMAND_OBJECTIVE]
+    nr_cols = 3
+    nr_rows = math.ceil((len(METRICS) + 1) / nr_cols)
+    fig, axes = setup_fig_grid(nr_rows, nr_cols, 20.0, 6.5 * nr_rows)
+    cells = list(axes.flat)
     loads = np.array([r.demand_load for r in runs])
     nr_bins = int(min(6, max(1, len(set(loads.round(6))) // 3)))
-    edges = np.unique(np.quantile(loads, np.linspace(0, 1, nr_bins + 1)))
+    edges = (
+        np.unique(np.quantile(loads, np.linspace(0, 1, nr_bins + 1)))
+        if len(loads)
+        else np.array([])
+    )
+    size = DEMAND_MARKER_SIZE**2
     handles = []
-    for ax, metric in zip(axes[0], panels):
-        for objective in OBJECTIVES:
+    for ax, metric in zip(cells, METRICS):
+        for start in START_TIMES:
             for s in SOLVERS:
-                color, style = SOLVER_COLOR[s], OBJECTIVE_STYLE[objective]
+                color, style = SOLVER_COLOR[s], START_STYLE[start]
                 points = [
                     (r.demand_load, metric.value(r.results[s]), r.row["nr_surges"] > 0)
                     for r in runs
-                    if r.objective == objective
+                    if _start_time(r) == start
                     and metric.value(r.results[s]) is not None
                 ]
                 if not points:
                     continue
                 x, y, surge = (np.array(v) for v in zip(*points))
-                marker = OBJECTIVE_MARKER[objective]
+                marker = START_MARKER[start]
                 ax.scatter(
                     x[~surge],
                     y[~surge],
                     color=color,
                     marker=marker,
                     alpha=0.35,
-                    s=40,
+                    s=size,
                     zorder=2,
                 )
                 ax.scatter(
@@ -493,7 +514,7 @@ def plot_demand(runs: list[WorkdayRun], path: str) -> str:
                     edgecolors=color,
                     marker=marker,
                     alpha=0.6,
-                    s=50,
+                    s=size,
                     zorder=2,
                 )
                 centers, means, halves = [], [], []
@@ -512,26 +533,27 @@ def plot_demand(runs: list[WorkdayRun], path: str) -> str:
                     color=color,
                     linewidth=3,
                     zorder=3,
-                    label=f"{SOLVER_LABEL[s]}, {objective}",
+                    label=f"{SOLVER_LABEL[s]}, {start} start",
                 )
                 low, high = means_a - halves_a, means_a + halves_a
                 if metric.key == "acceptance":
                     low, high = np.clip(low, 0.0, 100.0), np.clip(high, 0.0, 100.0)
                 else:
-                    low = np.maximum(low, 0.0)  # delays are non-negative
+                    low = np.maximum(low, 0.0)  # every other outcome is non-negative
                 ax.fill_between(centers, low, high, color=color, alpha=0.12, zorder=1)
-                if ax is axes[0, 0]:
+                if ax is cells[0]:
                     handles.append(line)
-        ax.set_xlabel("Demand load (requests per agent-hour)")
+        ax.set_xlabel("Demand load (requests per hour)")
         ax.set_ylabel(metric.label.replace("(pp)", "(%)"))
         if metric.key == "acceptance":
             ax.set_ylim(top=102.0)
-    fig.legend(
+    for ax in cells[len(METRICS) :]:
+        ax.axis("off")
+    cells[-1].legend(
         handles=handles,
-        loc="upper center",
-        bbox_to_anchor=(0.5, 0.0),
-        ncol=4,
-        title="circles: closed, triangles: open, hollow: workdays with surges",
+        loc="center",
+        title=f"{DEMAND_OBJECTIVE} objective\ncircles: normal, squares: staggered\n"
+        "hollow markers: workdays with demand surges",
     )
     fig.tight_layout()
     return save_figure(fig, path)
@@ -589,11 +611,22 @@ def workday_groups(
     return dict(sorted(groups.items()))
 
 
+class PeakMeasure(StrEnum):
+    """
+    What peak demand counts: requests (the solver's view, every request is a routing
+    decision) or passengers (the riders' view, the sum of request loads)
+    """
+
+    requests = "requests"
+    passengers = "passengers"
+
+
 def plot_workday(
     group: WorkdayGroup,
     path: str,
     window: float = DEFAULT_ROLLING_WINDOW,
     demand_bin: float = DEFAULT_DEMAND_BIN,
+    measure: PeakMeasure = PeakMeasure.requests,
 ) -> str:
     """
     Figure 3: rows = objective x start time (closed before open, normal before
@@ -603,7 +636,7 @@ def plot_workday(
     """
     import matplotlib.pyplot as plt
 
-    keys = [(o, t) for o in OBJECTIVES for t in START_TIMES if (o, t) in group]
+    keys = _group_keys(group)
     plt.rc("font", family="serif", size=16)
     fig = plt.figure(figsize=(18.0, 4.0 * len(keys) + 4.0))
     grid = fig.add_gridspec(
@@ -663,13 +696,23 @@ def plot_workday(
             ]
             if not handles:
                 handles = [acc, *soc_lines]
-    submissions = [r.submission_time for r in logs[keys[0]][SOLVERS[0]].requests]
+    requests = logs[keys[0]][SOLVERS[0]].requests
     bins = np.arange(0.0, t_end + demand_bin, demand_bin)
-    strip.hist(submissions, bins=bins, color="gray", edgecolor="white")
+    strip.hist(
+        [r.earliest_pickup for r in requests],
+        bins=bins,
+        weights=(
+            [r.request.load for r in requests]
+            if measure == PeakMeasure.passengers
+            else None
+        ),
+        color="gray",
+        edgecolor="white",
+    )
     strip.grid(True, alpha=0.5, zorder=-2)
     strip.set_xlim(0.0, t_end)
     strip.set_xlabel("Time (min)")
-    strip.set_ylabel(f"Requests / {demand_bin:g} min")
+    strip.set_ylabel(f"{measure.value.capitalize()} / {demand_bin:g} min")
     # legend right below the strip's x-axis label, title right above the top row
     fig.legend(
         handles=handles,
@@ -678,37 +721,103 @@ def plot_workday(
         ncol=4,
     )
     first = group[keys[0]]
+    peaks = peak_demand(logs[keys[0]][SOLVERS[0]])
     fig.suptitle(
-        f"{workday_group_name(first)}: demand load {first.demand_load:.1f} requests "
-        "per agent-hour",
+        f"{workday_group_name(first)}: {first.demand_load:.1f} requests/h overall; "
+        f"peak {peaks[PeakMeasure.requests]:.0f} requests/h, "
+        f"{peaks[PeakMeasure.passengers]:.0f} passengers/h ({PEAK_WINDOW:g} min)",
         y=0.965,
     )
     return save_figure(fig, path)
 
 
-def representative_group(groups: dict[str, WorkdayGroup]) -> str | None:
+def peak_rate(
+    times: Iterable[float],
+    weights: Iterable[float] | None = None,
+    window: float = PEAK_WINDOW,
+) -> float:
     """
-    Highest demand load among workday groups with surges (else among all), preferring
-    groups observed with every objective x start time
+    Highest total weight (1 per time by default) within any window [t, t + window),
+    per hour; 0.0 without times. The maximum is attained by a window starting at one
+    of the times, so a two-pointer scan over the sorted times is exact
+    """
+    times = list(times)
+    weights = [1.0] * len(times) if weights is None else list(weights)
+    events = sorted(zip(times, weights))
+    best = inside = 0.0  # inside: total weight of events[start:end]
+    end = 0
+    for start_time, start_weight in events:
+        while end < len(events) and events[end][0] < start_time + window:
+            inside += events[end][1]
+            end += 1
+        best = max(best, inside)
+        inside -= start_weight  # the next window starts after this event
+    return best * 60.0 / window
+
+
+def peak_demand(
+    log: WorkdayLog, window: float = PEAK_WINDOW
+) -> dict[PeakMeasure, float]:
+    """
+    Peak demand of a workday per hour, by the earliest pickups of every submitted
+    request (whatever its outcome: demand does not depend on decisions), per
+    PeakMeasure within the densest window
+    """
+    times = [r.earliest_pickup for r in log.requests]
+    return {
+        PeakMeasure.requests: peak_rate(times, window=window),
+        PeakMeasure.passengers: peak_rate(
+            times, [r.request.load for r in log.requests], window
+        ),
+    }
+
+
+def _group_keys(group: WorkdayGroup) -> list[tuple[ObjectiveType, WorkdayStartTime]]:
+    """A group's (objective, start time) keys in figure order"""
+    return [(o, t) for o in OBJECTIVES for t in START_TIMES if (o, t) in group]
+
+
+def group_peaks(
+    group: WorkdayGroup, window: float = PEAK_WINDOW
+) -> dict[PeakMeasure, float]:
+    """peak_demand() of a group, from its first run (every run shares the demand)"""
+    return peak_demand(group[_group_keys(group)[0]].logs()[SOLVERS[0]], window)
+
+
+def write_group_requests_table(group: WorkdayGroup, path: str) -> str:
+    """
+    LaTeX requests table of a workday group: one section per run (objective x start
+    time, figure order), MILP3 vs ALNS side by side, as build_workday_requests_table
+    """
+    sections = []
+    for objective, start in _group_keys(group):
+        run = group[(objective, start)]
+        label = f"{run.name}: {objective} objective, {start} start".replace("_", r"\_")
+        sections.append((label, workday_requests_rows(run.logs())))
+    return write_requests_latex(sections, path)
+
+
+def representative_group(
+    groups: dict[str, WorkdayGroup], peaks: dict[str, float]
+) -> str | None:
+    """
+    The most stacked workday group: the highest peak (peaks, by group name), preferring
+    groups observed with every objective x start time; ties go to the higher overall
+    demand load, then the name. None without groups
     """
     names = list(groups)
     complete = [
         n for n in names if len(groups[n]) == len(OBJECTIVES) * len(START_TIMES)
     ]
-    candidates = complete or names
-    with_surges = [
-        n for n in candidates if next(iter(groups[n].values())).row["nr_surges"] > 0
-    ]
-    candidates = with_surges or candidates
     return max(
-        candidates,
-        key=lambda n: (next(iter(groups[n].values())).demand_load, n),
+        complete or names,
+        key=lambda n: (peaks[n], next(iter(groups[n].values())).demand_load, n),
         default=None,
     )
 
 
 # --------------------------------------------------------------------------------------
-# Box-plot figures (alternative views of Figures 1 and 2)
+# Box-plot figure (alternative view of Figure 1)
 # --------------------------------------------------------------------------------------
 
 
@@ -804,26 +913,6 @@ def plot_impact_boxes(runs: list[WorkdayRun], path: str) -> str:
     return plot_box_grid(runs, columns, path)
 
 
-def plot_demand_boxes(runs: list[WorkdayRun], path: str) -> str:
-    """
-    Box-plot view of the demand figure: the solver against the demand parameters varied by the
-    suite (base arrival rate and timing profile), pairwise
-    """
-    rates = sorted({r.row["base_rate"] for r in runs})
-    timings = [
-        t for t in ("uniform", "peaks") if any(r.row["timing"] == t for r in runs)
-    ]
-    rate = Factor(
-        "Base rate (req/h)",
-        tuple(str(v) for v in rates),
-        lambda r, s: str(r.row["base_rate"]),
-    )
-    timing = _row_factor("Timing", "timing", timings)
-    solver = _solver_factor()
-    columns = [(rate, solver), (timing, solver), (rate, timing)]
-    return plot_box_grid(runs, columns, path)
-
-
 # --------------------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------------------
@@ -875,17 +964,28 @@ def compare_workday_objectives(
         figures["impact_boxes"] = plot_impact_boxes(
             runs, os.path.join(outdir, "var_decision_boxes.png")
         )
-        figures["demand_boxes"] = plot_demand_boxes(
-            runs, os.path.join(outdir, "demand_param_boxes.png")
-        )
     groups = workday_groups(closed, opened)
-    representative = representative_group(groups)
-    if representative is not None:
-        figures["workday"] = plot_workday(
-            groups[representative],
-            os.path.join(outdir, f"most_demand_{representative}.png"),
-            window=window,
+    peaks = {name: group_peaks(group) for name, group in groups.items()}
+    representative: dict[PeakMeasure, str | None] = {}
+    tables: dict[str, str] = {}
+    most_demand_dir = os.path.join(outdir, "most_demand")
+    for measure in PeakMeasure:
+        name = representative_group(
+            groups, {n: peak[measure] for n, peak in peaks.items()}
         )
+        representative[measure] = name
+        if name is not None:
+            os.makedirs(most_demand_dir, exist_ok=True)
+            figures[f"most_{measure}"] = plot_workday(
+                groups[name],
+                os.path.join(most_demand_dir, f"most_{measure}_{name}.png"),
+                window=window,
+                measure=measure,
+            )
+            tables[f"most_{measure}"] = write_group_requests_table(
+                groups[name],
+                os.path.join(most_demand_dir, f"{name}_requests_table.tex"),
+            )
     if all_workdays:
         workdays_dir = os.path.join(outdir, "workdays")
         os.makedirs(workdays_dir, exist_ok=True)
@@ -898,6 +998,7 @@ def compare_workday_objectives(
         "estimates": estimates,
         "representative": representative,
         "figures": figures,
+        "requests_tables": tables,
         "nr_start_time_pairs": len(start_time_pairs(closed, opened)),
         "nr_paired": len(closed.keys() & opened.keys()),
         "unpaired": sorted(closed.keys() ^ opened.keys()),

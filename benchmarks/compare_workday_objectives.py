@@ -2,9 +2,11 @@
 Compare two workday suites after run_workday_suite: one solved with --objective closed
 and one with --objective open, otherwise generated with identical arguments and --seed
 (so both contain the same workdays and demand). Writes a combined manifest and summary
-table (each workday's closed row directly followed by its open row) and three figures:
-decision effects with 95% CIs, outcomes against demand load, and the eight runs of the
-representative workday (highest demand load among workdays with surges).
+table (each workday's closed row directly followed by its open row) and five figures:
+decision effects with 95% CIs and as box plots, the open-objective outcomes against
+demand load, and the eight runs of the most stacked workday (the most requests, and
+separately the most passengers, with earliest pickups within 30 minutes), written to
+<outdir>/most_demand with each workday's LaTeX requests table.
 Compares only, both suites must already be generated/solved.
 
 Usage:

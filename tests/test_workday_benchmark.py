@@ -12,6 +12,7 @@ import modems.workday_benchmark as workday_benchmark
 from modems.benchmark import ManifestStatus
 from modems.core import (
     ModemsRequest,
+    ModemsScenario,
     ObjectiveType,
     ScenarioSize,
     ScenarioTiming,
@@ -33,6 +34,9 @@ from modems.workday_benchmark import (
     plot_workday_soc_acceptance,
     read_workday_manifest,
     solve_workday_suite,
+    workday_scenario_dict,
+    write_requests_latex,
+    write_workday_scenario,
 )
 
 
@@ -184,6 +188,8 @@ def test_generate_suite_creates_manifest_and_is_resumable(
     }
 
     first = generate_workday_suite(**kwargs)
+    scenario_file = tmp_path / "scenarios" / "WC0_SRUN5_1.json"
+    written = scenario_file.read_text()
     second = generate_workday_suite(**kwargs)
     manifest = read_workday_manifest(str(tmp_path))
 
@@ -191,6 +197,8 @@ def test_generate_suite_creates_manifest_and_is_resumable(
     assert second == [{"workday_name": "WC0_SRUN5_1", "status": "existing"}]
     assert set(manifest) == {"WC0_SRUN5_1"}
     assert manifest["WC0_SRUN5_1"]["status"] == "pending"
+    assert [p.name for p in (tmp_path / "scenarios").iterdir()] == [scenario_file.name]
+    assert scenario_file.read_text() == written
 
 
 def test_generate_suite_bakes_objective_into_name_and_row(
@@ -304,6 +312,91 @@ def test_start_times_share_the_seed_and_the_demand(tmp_path: Path) -> None:
     assert [a.time_initial for a in fleet_n] != [a.time_initial for a in fleet_s]
 
 
+def test_scenario_file_is_the_rebuilt_workday_with_its_seed(tmp_path: Path) -> None:
+    """The exported scenario holds exactly the seed, fleet and requests solved later"""
+    row = _manifest_row()
+    path = Path(write_workday_scenario(row, str(tmp_path / "scenarios")))
+    assert path == tmp_path / "scenarios" / "WC0_SRUN5_1.json"
+    data = json.loads(path.read_text())
+
+    _, agents, submissions = workday_benchmark._build_workday(
+        row["seed"],
+        row["nr_agents"],
+        row["type"],
+        row["timing"],
+        row["workday_length"],
+        row["start_time"],
+        row["base_rate"],
+        row["nr_surges"],
+    )
+    properties = data["properties"]
+    assert properties["seed"] == 123 and properties["workday_name"] == "WC0_SRUN5_1"
+    assert (properties["size"], properties["type"], properties["timing"]) == (
+        "small",
+        "random",
+        "uniform",
+    )
+    assert (properties["start_time"], properties["nr_surges"]) == ("normal", 1)
+    assert len(data["requests"]) == len(submissions) > 0
+    for entry, (t_submit, request) in zip(data["requests"], submissions):
+        assert entry["submission_time"] == t_submit
+        assert {k: entry[k] for k in request.to_dict()} == json.loads(
+            json.dumps(request.to_dict())
+        )
+    assert [a["agent_id"] for a in data["agents"]] == [a.agent_id for a in agents]
+    # still a plain ModemsScenario file
+    scenario = ModemsScenario.from_json(str(path))
+    assert [r.request_id for r in scenario.requests] == [
+        r.request_id for _, r in submissions
+    ]
+
+
+def test_scenario_files_share_seed_and_requests_across_decisions(
+    tmp_path: Path,
+) -> None:
+    """
+    Objective and start time never change a workday's seed or requests: only the
+    name, objective and fleet start times differ between the scenario files
+    """
+    kwargs = {
+        "scenario_sizes": [ScenarioSize.medium],  # 2 agents, so staggering shows
+        "scenario_types": [ScenarioType.random],
+        "scenario_timings": [ScenarioTiming.uniform],
+        "start_times": [WorkdayStartTime.normal, WorkdayStartTime.staggered],
+        "base_rates": [5],
+        "nr_surges": 1,
+        "workday_length": 120.0,
+    }
+    for objective in ("closed", "open"):
+        generate_workday_suite(
+            outdir=str(tmp_path / objective), objective=objective, **kwargs
+        )
+    names = {
+        ("closed", "WC0_MRUN5_1"),
+        ("closed", "WC0_MRUS5_1"),
+        ("open", "WO0_MRUN5_1"),
+        ("open", "WO0_MRUS5_1"),
+    }
+    files = {
+        (p.parent.parent.name, p.stem): json.loads(p.read_text())
+        for p in tmp_path.glob("*/scenarios/*.json")
+    }
+    assert set(files) == names
+    reference = files[("closed", "WC0_MRUN5_1")]
+    for (objective, name), data in files.items():
+        assert data["properties"]["seed"] == reference["properties"]["seed"]
+        assert data["properties"]["objective_type"] == objective
+        assert data["requests"] == reference["requests"]
+        assert data["network"] == reference["network"]
+        manifest = read_workday_manifest(str(tmp_path / objective))
+        assert data == workday_scenario_dict(manifest[name])
+    starts = {
+        name[7]: [a["time_initial"] for a in data["agents"]]
+        for (_, name), data in files.items()
+    }
+    assert starts["N"] != starts["S"]
+
+
 def test_generate_suite_does_not_persist_an_infeasible_combination(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -325,6 +418,7 @@ def test_generate_suite_does_not_persist_an_infeasible_combination(
 
     assert result[0]["status"] == ManifestStatus.infeasible
     assert read_workday_manifest(str(tmp_path)) == {}
+    assert list((tmp_path / "scenarios").glob("*.json")) == []
 
 
 def test_solve_one_workday_forwards_manifest_configuration(
@@ -513,6 +607,40 @@ def test_build_requests_table_requires_a_solved_log(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="run the solve phase first"):
         build_workday_requests_table(str(tmp_path), "WC0_SRUN5_1")
+
+
+def test_requests_latex_labels_every_section_and_its_continuation(
+    tmp_path: Path,
+) -> None:
+    row = {
+        "request_id": "r1",
+        "earliest_pickup": 10.0,
+        "pickup_node": 1,
+        "delivery_node": 2,
+        "load": 1,
+        "outcome_milp3": RequestOutcome.accepted,
+        "outcome_alns": RequestOutcome.rejected,
+        "pickup_time_milp3": 10.0,
+        "pickup_time_alns": None,
+        "delivery_time_milp3": 15.0,
+        "delivery_time_alns": None,
+        "delay_milp3": 0.0,
+        "delay_alns": None,
+        "excess_ride_time_milp3": 0.0,
+        "excess_ride_time_alns": None,
+    }
+    path = write_requests_latex(
+        [("run A", [row] * 3), ("run B", [row])],
+        str(tmp_path / "t.tex"),
+        rows_per_block=2,
+    )
+    tex = Path(path).read_text()
+    assert tex.count(r"\begin{table*}") == 3
+    assert "workday (run A; cont. 1/2)" in tex and "workday (run A; cont. 2/2)" in tex
+    assert "workday (run B)." in tex
+    assert tex.startswith(r"\documentclass") and tex.rstrip().endswith(
+        r"\end{document}"
+    )
 
 
 def test_build_requests_table_joins_by_id_and_preserves_raw_json_times(

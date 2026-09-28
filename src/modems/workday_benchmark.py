@@ -31,6 +31,7 @@ from .core import (
     DEFAULT_BASE_SEED,
     ModemsAgent,
     ModemsRequest,
+    ModemsScenario,
     ObjectiveType,
     ScenarioSize,
     ScenarioTiming,
@@ -62,7 +63,10 @@ class WorkdayStartTime(SmartStrEnum):
 
 
 # Staggered agent i (0-indexed) starts at time = i * (workday_length / STAGGER_DIVISOR)
-STAGGER_DIVISOR = 5.0
+DEFAULT_STAGGER_DIVISOR = 5.0
+
+# Wall-clock anchor "HH:MM" to format workday-relative time (minutes since clock_start)
+DEFAULT_WALL_CLOCK_ANCHOR = "08:00"
 
 
 def _build_fleet(
@@ -79,7 +83,7 @@ def _build_fleet(
     agents: list[ModemsAgent] = []
     for i in range(nr_agents):
         delay = (
-            i * workday_length / STAGGER_DIVISOR
+            i * workday_length / DEFAULT_STAGGER_DIVISOR
             if start_time == WorkdayStartTime.staggered
             else 0.0
         )  # i * (workday_length / STAGGER_DIVISOR)
@@ -119,6 +123,76 @@ def _build_workday(
         scenario_timing=scenario_timing,
     )
     return generator, agents, request_submissions
+
+
+def _rebuild_workday(
+    row: dict[str, Any],
+) -> tuple[
+    ModemsScenarioGenerator, list[ModemsAgent], list[tuple[float, ModemsRequest]]
+]:
+    """
+    Rebuild the fleet and workday requests of a manifest row, the single place both
+    the scenario export and the solve phase reproduce a workday from
+    """
+    return _build_workday(
+        row["seed"],
+        row["nr_agents"],
+        row["type"],
+        row["timing"],
+        row["workday_length"],
+        start_time=WorkdayStartTime(row.get("start_time", WorkdayStartTime.normal)),
+        base_rate_per_hour=row.get("base_rate", DEFAULT_BASE_RATE_PER_HOUR),
+        nr_surges=row["nr_surges"],
+    )
+
+
+# manifest row fields copied into a workday scenario file's properties block
+_SCENARIO_PROPERTY_FIELDS = (
+    "workday_name",
+    "objective_type",
+    "size",
+    "start_time",
+    "base_rate",
+    "nr_surges",
+    "repetition",
+    "nr_agents",
+    "seed",
+    "workday_length",
+)
+
+
+def workday_scenario_dict(row: dict[str, Any]) -> dict[str, Any]:
+    """
+    The scenario of a workday manifest row, rebuilt from its seed: the
+    ModemsScenario.to_dict() layout (so ModemsScenario.from_dict() reads it), with the
+    row's parameters, including its seed, added to the properties block, and each
+    request's submission_time. properties.size is the suite's size bucket, not the one
+    inferred from the (much larger) number of workday requests
+    """
+    generator, agents, request_submissions = _rebuild_workday(row)
+    scenario = ModemsScenario(
+        agents,
+        [request for _, request in request_submissions],
+        generator.network,
+        row["type"],
+        row["timing"],
+    )
+    data = scenario.to_dict()
+    data["properties"].update(
+        {k: row[k] for k in _SCENARIO_PROPERTY_FIELDS if k in row}
+    )
+    for entry, (t_submit, _) in zip(data["requests"], request_submissions):
+        entry["submission_time"] = float(t_submit)
+    return data
+
+
+def write_workday_scenario(row: dict[str, Any], scenarios_dir: str) -> str:
+    """Write {scenarios_dir}/{workday_name}.json (workday_scenario_dict); return it"""
+    os.makedirs(scenarios_dir, exist_ok=True)
+    path = os.path.join(scenarios_dir, f"{row['workday_name']}.json")
+    with open(path, "w") as f:
+        json.dump(workday_scenario_dict(row), f, indent=4, default=str)
+    return path
 
 
 # --------------------------------------------------------------------------------------
@@ -179,7 +253,9 @@ def generate_workday_suite(
 ) -> list[dict[str, Any]]:
     """
     Screen a workday for a feasible initial fleet, i.e., all fleet agents can reach
-    a final hub, same check as RollingHorizonSimulator.__init__; write one "pending"
+    a final hub, same check as RollingHorizonSimulator.__init__; write its scenario to
+    {outdir}/scenarios/{workday_name}.json (write_workday_scenario, for inspection
+    only: the solve phase rebuilds the workday from the seed) and one "pending"
     manifest row per workday, skipping any existing manifest workday rows. When given,
     on_progress is called once before and once after each combo/point is screened.
     Raises ValueError, before generating anything, if nr_surges exceeds max_surges
@@ -198,6 +274,7 @@ def generate_workday_suite(
                 f"{workday_length}-minute {sc_timing} workday"
             )
     model_params = {**DEFAULT_PARAMS_MILP, **(model_params or {})}
+    scenarios_dir = os.path.join(outdir, "scenarios")
     manifest_data = read_workday_manifest(outdir)
 
     summary = []
@@ -295,26 +372,25 @@ def generate_workday_suite(
                 )
             continue
 
-        _update_manifest_row(
-            outdir,
-            {
-                "workday_name": workday_name,
-                "objective_type": objective,
-                "size": sc_size,
-                "type": sc_type,
-                "timing": sc_timing,
-                "start_time": start_time,
-                "base_rate": base_rate,
-                "nr_surges": nr_surges,
-                "repetition": i_rep,
-                "nr_agents": nr_agents,
-                "seed": seed,
-                "workday_length": workday_length,
-                "status": ManifestStatus.pending,
-                "result_file": None,
-                "timestamp": None,
-            },
-        )
+        row = {
+            "workday_name": workday_name,
+            "objective_type": objective,
+            "size": sc_size,
+            "type": sc_type,
+            "timing": sc_timing,
+            "start_time": start_time,
+            "base_rate": base_rate,
+            "nr_surges": nr_surges,
+            "repetition": i_rep,
+            "nr_agents": nr_agents,
+            "seed": seed,
+            "workday_length": workday_length,
+            "status": ManifestStatus.pending,
+            "result_file": None,
+            "timestamp": None,
+        }
+        write_workday_scenario(row, scenarios_dir)
+        _update_manifest_row(outdir, row)
         status = ManifestStatus.created
         summary.append({"workday_name": workday_name, "status": status})
         if on_progress:
@@ -352,16 +428,7 @@ def _solve_one_workday(
     """
     workday_length = row["workday_length"]
     objective = ObjectiveType(row["objective_type"])
-    generator, agents, request_submissions = _build_workday(
-        row["seed"],
-        row["nr_agents"],
-        row["type"],
-        row["timing"],
-        workday_length,
-        start_time=WorkdayStartTime(row.get("start_time", WorkdayStartTime.normal)),
-        base_rate_per_hour=row.get("base_rate", DEFAULT_BASE_RATE_PER_HOUR),
-        nr_surges=row["nr_surges"],
-    )
+    generator, agents, request_submissions = _rebuild_workday(row)
     summaries = compare_solvers_one_workday(
         generator.network,
         agents,
@@ -661,10 +728,9 @@ def build_workday_summary_table(
 
 def _format_clock(minutes: float | None, display_start: str | None) -> str:
     """
-    Format a workday-relative offset (minutes since clock_start=0.0) for
-    display: "HH:MM" wall-clock if display_start (an "HH:MM" anchor, e.g.
-    "08:00") is given, else the plain float. "--" for None (not accepted /
-    no metric). Display-only -- never applied to what gets written to JSON.
+    Format a workday-relative offset (minutes since clock_start=0.0) as "HH:MM"
+    wall-clock if display_start (an "HH:MM" anchor, e.g., "08:00") is given; otherwise,
+    the plain float. "--" for None (not accepted /no metric). For display (latex) only.
     """
     if minutes is None:
         return "--"
@@ -676,35 +742,13 @@ def _format_clock(minutes: float | None, display_start: str | None) -> str:
     return f"{h:02d}:{m:02d}"
 
 
-def build_workday_requests_table(
-    outdir: str,
-    workday_name: str,
-    table_name: str = "requests_table",
-    rows_per_block: int = MAX_ROWS_PER_BLOCK,
-    clock_display_start: str | None = None,
-    formats: str | Iterable[str] | None = None,
+def workday_requests_rows(
+    logs: dict[SolverStrategy, WorkdayLog],
 ) -> list[dict[str, Any]]:
     """
-    Build the per-request table for one workday (one row per submitted request,
-    MILP3 vs ALNS outcome/timing side by side, both against the identical request
-    stream) from the workday_name WorkdayLog. Write {outdir}/requests_tables/
-    {workday_name}_{table_name}.{csv,json,tex} and return the row list with plain
-    float times, matching the exports. If given, clock_display_start (e.g., "08:00")
-    formats every clock-time column (submission/pickup/delivery) as an "HH:MM"
-    wall-clock string in the .csv/.tex output specifically, while the .json output
-    and this function return value always keep raw workday-relative float offsets;
-    a display anchor is a presentation choice, not actual/relevant data
+    One row per submitted request of a workday's {solver: WorkdayLog}, MILP3 vs ALNS
+    outcome/timing side by side (joined by request_id), with plain float times
     """
-    manifest = read_workday_manifest(outdir)
-    row = manifest.get(workday_name)
-    if row is None or row.get("workday_log_file") is None:
-        raise ValueError(
-            f"no solved workday_log for {workday_name!r} in {outdir!r} -- "
-            "run the solve phase first"
-        )
-    with open(row["workday_log_file"]) as f:
-        raw = json.load(f)
-    logs = {SolverStrategy(k): WorkdayLog.from_dict(v) for k, v in raw.items()}
     milp3_log, alns_log = logs[SolverStrategy.milp3], logs[SolverStrategy.alns]
     alns_by_id = {r.request.request_id: r for r in alns_log.requests}
 
@@ -731,6 +775,39 @@ def build_workday_requests_table(
                 "excess_ride_time_alns": o_alns.excess_ride_time if o_alns else None,
             }
         )
+    return rows
+
+
+def build_workday_requests_table(
+    outdir: str,
+    workday_name: str,
+    table_name: str = "requests_table",
+    rows_per_block: int = MAX_ROWS_PER_BLOCK,
+    clock_display_start: str | None = DEFAULT_WALL_CLOCK_ANCHOR,
+    formats: str | Iterable[str] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Build the per-request table for one workday (one row per submitted request,
+    MILP3 vs ALNS outcome/timing side by side, both against the identical request
+    stream) from the workday_name WorkdayLog. Write {outdir}/requests_tables/
+    {workday_name}_{table_name}.{csv,json,tex} and return the row list with plain
+    float times, matching the exports. If given, clock_display_start (e.g., "08:00")
+    formats every clock-time column (submission/pickup/delivery) as an "HH:MM"
+    wall-clock string in the .csv/.tex output specifically, while the .json output
+    and this function return value always keep raw workday-relative float offsets;
+    a display anchor is a presentation choice, not actual/relevant data
+    """
+    manifest = read_workday_manifest(outdir)
+    row = manifest.get(workday_name)
+    if row is None or row.get("workday_log_file") is None:
+        raise ValueError(
+            f"no solved workday_log for {workday_name!r} in {outdir!r} -- "
+            "run the solve phase first"
+        )
+    with open(row["workday_log_file"]) as f:
+        raw = json.load(f)
+    logs = {SolverStrategy(k): WorkdayLog.from_dict(v) for k, v in raw.items()}
+    rows = workday_requests_rows(logs)
 
     tables_dir = os.path.join(outdir, "requests_tables")
     base_name = f"{workday_name}_{table_name}"
@@ -774,29 +851,37 @@ def build_workday_requests_table(
         base_name,
         fieldnames,
         formats,
-        write_tex=lambda path: _write_requests_latex_file(
-            rows, path, rows_per_block, clock_display_start
+        write_tex=lambda path: write_requests_latex(
+            [("", rows)], path, rows_per_block, clock_display_start
         ),
         csv_rows=display_rows,
     )
     return rows
 
 
-def _write_requests_latex_file(
-    rows: list[dict[str, Any]],
+def write_requests_latex(
+    sections: list[tuple[str, list[dict[str, Any]]]],
     tex_path: str,
-    nr_rows_per_block: int,
-    clock_display_start: str | None,
+    rows_per_block: int = MAX_ROWS_PER_BLOCK,
+    clock_display_start: str | None = DEFAULT_WALL_CLOCK_ANCHOR,
 ) -> str:
-    """Write the per-workday requests table latex file, split into table* blocks"""
-    blocks = [
-        rows[i : i + nr_rows_per_block] for i in range(0, len(rows), nr_rows_per_block)
-    ] or [[]]
-    n_blocks = len(blocks)
+    """
+    Write a requests-table latex file: per (label, workday_requests_rows) section,
+    table* blocks of rows_per_block rows, the (LaTeX-ready) label and continuation
+    shown in each caption
+    """
     parts = [_latex_begin_doc_block()]
-    for b, block in enumerate(blocks, start=1):
-        cont = f" (cont. {b}/{n_blocks})" if n_blocks > 1 else ""
-        parts.append(_requests_latex_table_block(block, cont, clock_display_start))
+    for label, rows in sections:
+        blocks = [
+            rows[i : i + rows_per_block] for i in range(0, len(rows), rows_per_block)
+        ] or [[]]
+        n_blocks = len(blocks)
+        for b, block in enumerate(blocks, start=1):
+            notes = [label] if label else []
+            if n_blocks > 1:
+                notes.append(f"cont. {b}/{n_blocks}")
+            note = f" ({'; '.join(notes)})" if notes else ""
+            parts.append(_requests_latex_table_block(block, note, clock_display_start))
     parts.append(_latex_end_doc_block())
     with open(tex_path, "w") as f:
         f.write("\n\n".join(parts) + "\n")

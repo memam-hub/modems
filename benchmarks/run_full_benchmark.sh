@@ -58,7 +58,7 @@ for OBJECTIVE in open closed; do
     --sizes L \
     --types M \
     --timings U P \
-    --base-rates 6 10 \
+    --base-rates 5 8 \
     --nr-surges 1 \
     --nr-repeats 3 \
     --objective "$OBJECTIVE" \

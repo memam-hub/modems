@@ -239,7 +239,7 @@ class ModemsBenchmarkResult:
         with open(file_path) as f:
             return cls.from_dict(json.load(f))
 
-    def improvement_pct(self) -> float | None:
+    def improvement_pct(self, ndigits: int | None = None) -> float | None:
         """100 * (baseline - final) / baseline, negative if final is worse"""
         if self.baseline_info is None:
             return None
@@ -249,9 +249,10 @@ class ModemsBenchmarkResult:
             return None
         if final_obj is None or final_obj == FLOAT_INF or not math.isfinite(final_obj):
             return None
-        return 100.0 * (base_obj - final_obj) / base_obj
+        value = 100.0 * (base_obj - final_obj) / base_obj
+        return value if ndigits is None else round(value, ndigits)
 
-    def gap_pct(self) -> float | None:
+    def gap_pct(self, ndigits: int | None = None) -> float | None:
         """duality gap from upper and lower bounds"""
         info = self.final_info
         if (
@@ -264,7 +265,8 @@ class ModemsBenchmarkResult:
             or not math.isfinite(info.upper_bound)
         ):
             return None
-        return 100.0 * (info.upper_bound - info.lower_bound) / info.upper_bound
+        value = 100.0 * (info.upper_bound - info.lower_bound) / info.upper_bound
+        return value if ndigits is None else round(value, ndigits)
 
 
 # --------------------------------------------------------------------------------------
@@ -849,10 +851,10 @@ def benchmark_table_rows(outdir: str) -> list[dict[str, Any]]:
                     else None
                 ),
                 "objective": info.objective if info.objective != FLOAT_INF else None,
-                "improvement_pct": result.improvement_pct(),
+                "improvement_pct": result.improvement_pct(2),
                 "lower_bound": info.lower_bound,
                 "upper_bound": info.upper_bound,
-                "gap_pct": result.gap_pct(),
+                "gap_pct": result.gap_pct(2),
                 "baseline_time": (
                     result.baseline_info.solution_time
                     if result.baseline_info is not None
@@ -929,9 +931,10 @@ def gap_to_best(rows: list[dict[str, Any]]) -> dict[tuple[str, str], float]:
                 best.get(row["scenario"], FLOAT_INF), row["objective"]
             )
     return {
-        (row["scenario"], row["solver"]): 100.0
-        * (row["objective"] - best[row["scenario"]])
-        / best[row["scenario"]]
+        (row["scenario"], row["solver"]): round(
+            100.0 * (row["objective"] - best[row["scenario"]]) / best[row["scenario"]],
+            2,
+        )
         for row in rows
         if row.get("objective") is not None and best[row["scenario"]] > 0
     }
@@ -996,7 +999,6 @@ def plot_benchmark_figure(rows: list[dict[str, Any]], path: str) -> str:
         [f"{s.upper()} · {w}" for s, w in milp_groups],
         [size_color[w] for _, w in milp_groups],
     )
-    ax.set_xlim(left=0.0)
     ax.set_title("MILP duality gap (%)")
     fig.tight_layout()
     return save_figure(fig, path)

@@ -60,7 +60,7 @@ def draw_hboxes(
         **_horizontal(),
         patch_artist=True,
         medianprops=dict(color="k", linewidth=2),
-        flierprops=dict(marker="o", markersize=4, alpha=0.6),
+        flierprops=dict(marker="o", markersize=8),
     )
     for patch, color in zip(boxes["boxes"], colors):
         patch.set_facecolor(color)
@@ -102,8 +102,8 @@ def draw_grouped_vboxes(
             positions=positions,
             widths=0.85 * width,
             patch_artist=True,
-            medianprops=dict(color="k", linewidth=1.5),
-            flierprops=dict(marker="o", markersize=3, alpha=0.5),
+            medianprops=dict(color="k", linewidth=2),
+            flierprops=dict(marker="o", markersize=8),
         )
         for patch in boxes["boxes"]:
             patch.set_facecolor(color)

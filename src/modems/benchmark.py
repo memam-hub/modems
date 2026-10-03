@@ -918,11 +918,15 @@ def build_benchmark_table(
 # --------------------------------------------------------------------------------------
 
 
-def gap_to_best(rows: list[dict[str, Any]]) -> dict[tuple[str, str], float]:
+def gap_to_best(
+    rows: list[dict[str, Any]], key: str = "objective"
+) -> dict[tuple[str, str], float]:
     """
-    Per (scenario, solver): 100 * (objective - best) / best, where best is the lowest
+    Per (scenario, solver): 100 * (row[key] - best) / best, where best is the lowest
     objective any solver found on that scenario (raw objectives are not comparable
-    across scenarios, gaps to the per-scenario best are)
+    across scenarios, gaps to the per-scenario best are). key="baseline_objective"
+    measures the constructive baseline against that same best, which the baselines
+    themselves never enter
     """
     best: dict[str, float] = {}
     for row in rows:
@@ -932,11 +936,13 @@ def gap_to_best(rows: list[dict[str, Any]]) -> dict[tuple[str, str], float]:
             )
     return {
         (row["scenario"], row["solver"]): round(
-            100.0 * (row["objective"] - best[row["scenario"]]) / best[row["scenario"]],
+            100.0 * (row[key] - best[row["scenario"]]) / best[row["scenario"]],
             2,
         )
         for row in rows
-        if row.get("objective") is not None and best[row["scenario"]] > 0
+        if row.get(key) is not None
+        and row[key] != FLOAT_INF
+        and best.get(row["scenario"], 0.0) > 0
     }
 
 
@@ -945,11 +951,15 @@ def plot_benchmark_figure(rows: list[dict[str, Any]], path: str) -> str:
     One figure summarizing a (static) benchmark suite, by solver and size bucket:
     gap to the per-scenario best objective, improvement over the constructive
     baseline, solve time (log scale), and, for the MILPs only, the duality gap
-    100 x (UB - LB) / UB (gap_pct), all as horizontal boxes. ALNS has no bounds (it
+    100 x (UB - LB) / UB (gap_pct), all as horizontal boxes. The gap and solve-time
+    panels also show the solver's constructive baseline as a hollow box above each
+    (colored) solver box, its gap taken to the same best. ALNS has no bounds (it
     never proves optimality), so it is left out of the gap panel; so is any MILP run
     missing a bound (no incumbent, or a solver such as CBC that reports no lower bound
     when stopped by the time limit), which the per-box n= counts reveal
     """
+    from matplotlib.patches import Patch
+
     from .plotting import draw_hboxes, save_figure, setup_fig_grid
 
     solvers = [s for s in SolverStrategy if any(row["solver"] == s for row in rows)]
@@ -960,6 +970,7 @@ def plot_benchmark_figure(rows: list[dict[str, Any]], path: str) -> str:
     colors = [size_color[w] for _, w in groups]
     milp_groups = [(s, w) for s, w in groups if s != SolverStrategy.alns]
     gaps = gap_to_best(rows)
+    baseline_gaps = gap_to_best(rows, key="baseline_objective")
 
     def select(value, selected=groups) -> list[list[float]]:
         return [
@@ -974,21 +985,34 @@ def plot_benchmark_figure(rows: list[dict[str, Any]], path: str) -> str:
         ]
 
     fig, axes = setup_fig_grid(2, 2, 18.0, max(8.0, 0.5 * len(groups) * 2 + 4))
+    # (axis, title, solver value, constructive baseline value or None)
     panels = [
         (
             axes[0, 0],
             "Gap to best found (%)",
             lambda r: gaps.get((r["scenario"], r["solver"])),
+            lambda r: baseline_gaps.get((r["scenario"], r["solver"])),
         ),
         (
             axes[0, 1],
             "Improvement over constructive (%)",
             lambda r: r.get("improvement_pct"),
+            None,
         ),
-        (axes[1, 0], "Solve time (s)", lambda r: r.get("time")),
+        (
+            axes[1, 0],
+            "Solve time (s)",
+            lambda r: r.get("time"),
+            lambda r: r.get("baseline_time"),
+        ),
     ]
-    for ax, title, value in panels:
-        draw_hboxes(ax, select(value), labels, colors)
+    legend_handles = [
+        Patch(facecolor="none", edgecolor="k", linewidth=2, label="Constructive"),
+        Patch(facecolor="lightgray", edgecolor="k", label="Solver"),
+    ]
+    for ax, title, value, baseline_value in panels:
+        hollow = None if baseline_value is None else select(baseline_value)
+        draw_hboxes(ax, select(value), labels, colors, hollow=hollow)
         ax.set_title(title)
     axes[1, 0].set_xscale("log")
 
@@ -1001,6 +1025,14 @@ def plot_benchmark_figure(rows: list[dict[str, Any]], path: str) -> str:
     )
     ax.set_title("MILP duality gap (%)")
     fig.tight_layout()
+    # below the grid, so it never covers a box; savefig's tight bbox keeps it
+    fig.legend(
+        handles=legend_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.0),
+        ncol=2,
+        fontsize=14,
+    )
     return save_figure(fig, path)
 
 

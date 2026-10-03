@@ -404,6 +404,101 @@ def test_gap_to_best_is_relative_to_each_scenarios_best_objective() -> None:
     }
 
 
+def test_gap_to_best_of_the_baseline_uses_the_solvers_best_only() -> None:
+    """Baselines are measured against the solvers' best, never become the best"""
+    rows = [
+        {
+            "scenario": "A",
+            "solver": "alns",
+            "objective": 100.0,
+            "baseline_objective": 120.0,
+        },
+        {
+            "scenario": "A",
+            "solver": "milp1",
+            "objective": None,
+            "baseline_objective": 90.0,
+        },
+        {
+            "scenario": "B",
+            "solver": "alns",
+            "objective": None,
+            "baseline_objective": 10.0,
+        },  # no solver objective: no best, no gap
+        {
+            "scenario": "C",
+            "solver": "alns",
+            "objective": 10.0,
+            "baseline_objective": None,
+        },
+        {
+            "scenario": "C",
+            "solver": "milp3",
+            "objective": 10.0,
+            "baseline_objective": FLOAT_INF,
+        },
+    ]
+    assert gap_to_best(rows, key="baseline_objective") == {
+        ("A", "alns"): 20.0,
+        ("A", "milp1"): -10.0,
+    }
+    assert gap_to_best(rows) == {
+        ("A", "alns"): 0.0,
+        ("C", "alns"): 0.0,
+        ("C", "milp3"): 0.0,
+    }
+
+
+def test_benchmark_figure_adds_hollow_baseline_boxes_to_gap_and_time_panels(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the gap and solve-time panels pair each solver box with its baseline"""
+    import modems.plotting as plotting_module
+
+    calls: list[dict[str, Any]] = []
+    draw = plotting_module.draw_hboxes
+
+    def spy(ax, groups, labels, colors, show_counts=True, hollow=None):
+        calls.append({"title_ax": ax, "groups": groups, "hollow": hollow})
+        draw(ax, groups, labels, colors, show_counts=show_counts, hollow=hollow)
+
+    monkeypatch.setattr(plotting_module, "draw_hboxes", spy)
+    rows = [
+        {
+            "scenario": s,
+            "size": "small",
+            "solver": solver,
+            "objective": obj,
+            "baseline_objective": base,
+            "improvement_pct": 1.0,
+            "gap_pct": None,
+            "time": t,
+            "baseline_time": bt,
+        }
+        for s, solver, obj, base, t, bt in [
+            ("A", "alns", 100.0, 110.0, 2.0, 0.01),
+            ("A", "milp3", 105.0, 120.0, 5.0, 0.02),
+            ("B", "alns", 50.0, 55.0, 3.0, 0.03),
+            ("B", "milp3", 50.0, 60.0, 6.0, 0.04),
+        ]
+    ]
+    path = plot_benchmark_figure(rows, str(tmp_path / "solver_comparison.png"))
+    assert os.path.getsize(path) > 0
+
+    by_title = {c["title_ax"].get_title(): c for c in calls}
+    gap = by_title["Gap to best found (%)"]
+    # groups in SolverStrategy order: MILP3, then ALNS
+    assert gap["groups"] == [[5.0, 0.0], [0.0, 0.0]]  # unchanged solver boxes
+    assert gap["hollow"] == [[20.0, 20.0], [10.0, 10.0]]
+    time = by_title["Solve time (s)"]
+    assert time["groups"] == [[5.0, 6.0], [2.0, 3.0]]
+    assert time["hollow"] == [[0.02, 0.04], [0.01, 0.03]]
+    assert by_title["Improvement over constructive (%)"]["hollow"] is None
+    assert by_title["MILP duality gap (%)"]["hollow"] is None
+    (legend,) = gap["title_ax"].figure.legends
+    assert [t.get_text() for t in legend.get_texts()] == ["Constructive", "Solver"]
+
+
 def test_alns_seed_is_the_scenario_seed_shared_by_every_decision(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

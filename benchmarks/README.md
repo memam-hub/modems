@@ -39,7 +39,10 @@ every pending `(scenario, solver)` row (ALNS + MILP1/2/3, each MILP warm-started
 `solver_comparison.png`: per solver and size, the gap to the best objective found on
 each scenario, the improvement over the constructive baseline, the solve time (log
 scale), and, for the MILPs only, the duality gap (%) of runs with both bounds (see
-`n=`). HiGHS and Gurobi report a lower bound for time-limited runs; CBC does not, so
+`n=`). The gap and solve-time panels pair each solver's (colored) box with a hollow
+box for its constructive baseline, whose gap is taken to the same best (the solvers'
+best; baselines never set it). 
+HiGHS and Gurobi report a lower bound for time-limited runs; CBC does not, so
 with CBC the gap panel only holds proven optima.
 
 | Flag | Default | Meaning |

@@ -25,7 +25,7 @@ See benchmarks/run_suite.py --smoke for a full runnable example (generate,
 solve, and build a summary table across every solver in one command).
 """
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 # --- algorithms: solver-agnostic construction/completion/insertion (Algorithms 1-3)
 from .algorithms import (

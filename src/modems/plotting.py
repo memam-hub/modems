@@ -46,17 +46,26 @@ def draw_hboxes(
     labels: Sequence[str],
     colors: Sequence[Any],
     show_counts: bool = True,
+    hollow: Sequence[Sequence[float]] | None = None,
 ) -> None:
     """
     One horizontal box-and-whisker per group, the first group on top. Whiskers reach
     the furthest value within 1.5 x IQR (Tukey), with outliers as dots. Empty groups
-    keep their row (and label) with nothing drawn
+    keep their row (and label) with nothing drawn. If given, hollow holds one more
+    group per group (e.g., a baseline), drawn as an unfilled box edged in the group's
+    color just above its filled box, in the same row; each box gets its own n=
     """
+    if hollow is not None and len(hollow) != len(groups):
+        raise ValueError(
+            f"hollow needs one group per group: {len(hollow)} != {len(groups)}"
+        )
     positions = list(range(len(groups), 0, -1))
+    offset, width = (0.0, 0.6) if hollow is None else (0.18, 0.32)
+    filled_positions = [y - offset for y in positions]
     boxes = ax.boxplot(
         [list(g) if len(g) else [math.nan] for g in groups],
-        positions=positions,
-        widths=0.6,
+        positions=filled_positions,
+        widths=width,
         **_horizontal(),
         patch_artist=True,
         medianprops=dict(color="k", linewidth=2),
@@ -64,9 +73,26 @@ def draw_hboxes(
     )
     for patch, color in zip(boxes["boxes"], colors):
         patch.set_facecolor(color)
+    counted = list(zip(filled_positions, groups))
+    if hollow is not None:
+        hollow_positions = [y + offset for y in positions]
+        boxes = ax.boxplot(
+            [list(g) if len(g) else [math.nan] for g in hollow],
+            positions=hollow_positions,
+            widths=width,
+            **_horizontal(),
+            patch_artist=True,
+            medianprops=dict(color="k", linewidth=2),
+            flierprops=dict(marker="o", markersize=8, markerfacecolor="none"),
+        )
+        for patch, color in zip(boxes["boxes"], colors):
+            patch.set_facecolor("none")
+            patch.set_edgecolor(color)
+            patch.set_linewidth(2)
+        counted += list(zip(hollow_positions, hollow))
     ax.set_yticks(positions, labels)
     if show_counts:
-        for y, group in zip(positions, groups):
+        for y, group in counted:
             ax.text(
                 1.0,
                 y,

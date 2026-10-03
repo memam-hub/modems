@@ -614,10 +614,8 @@ def test_requests_latex_labels_every_section_and_its_continuation(
 ) -> None:
     row = {
         "request_id": "r1",
+        "submission_time": 5.0,
         "earliest_pickup": 10.0,
-        "pickup_node": 1,
-        "delivery_node": 2,
-        "load": 1,
         "outcome_milp3": RequestOutcome.accepted,
         "outcome_alns": RequestOutcome.rejected,
         "pickup_time_milp3": 10.0,
@@ -716,6 +714,8 @@ def test_build_requests_table_joins_by_id_and_preserves_raw_json_times(
         tmp_path / "requests_tables" / "WC0_SRUN5_1_requests_table.tex"
     ).read_text()
     assert latex.count(r"\begin{table*}") == 2
+    assert r"RQ\_requ & 08:05 & 08:10 & " in latex
+    assert r"RQ\_requ & 08:10 & 08:20 & " in latex
 
 
 def test_plot_workday_soc_acceptance_creates_nonempty_png(tmp_path: Path) -> None:

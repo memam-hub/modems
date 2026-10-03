@@ -910,14 +910,14 @@ def _requests_latex_table_block(
         "\n"
         r"\hline"
         "\n"
-        r"Key & Earliest & $p^r$ & $d^r$ & $q^r$ & "
+        r"Key & Submission & Earliest &  "
         r"\multicolumn{2}{c}{Accepted?} & "
         r"\multicolumn{2}{c}{Pickup time} & "
         r"\multicolumn{2}{c}{Delivery time} & "
         r"\multicolumn{2}{c}{Delay (min)} & "
         r"\multicolumn{2}{c}{Excess ride (min)} \\"
         "\n"
-        r" & pickup & & & & "
+        r" & time & pickup & "
         r"{MILP3} & {ALNS} & "
         r"{MILP3} & {ALNS} & "
         r"{MILP3} & {ALNS} & "
@@ -938,10 +938,8 @@ def _requests_latex_table_block(
             " & ".join(
                 [
                     r"RQ\_" + str(row["request_id"])[:4].replace("_", r"\_"),
+                    _format_clock(row["submission_time"], clock_display_start),
                     _format_clock(row["earliest_pickup"], clock_display_start),
-                    str(row["pickup_node"]),
-                    str(row["delivery_node"]),
-                    str(row["load"]),
                     fmt_outcome(row["outcome_milp3"]),
                     fmt_outcome(row["outcome_alns"]),
                     _format_clock(row["pickup_time_milp3"], clock_display_start),
